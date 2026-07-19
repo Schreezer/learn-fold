@@ -2344,6 +2344,7 @@ async fn start_ephemeral_thread_for_structured(
     let start_params = upstream::ThreadStartParams {
         model: None,
         model_provider: None,
+        allow_provider_model_fallback: false,
         service_tier: None,
         cwd: None,
         runtime_workspace_roots: None,
@@ -2356,14 +2357,16 @@ async fn start_ephemeral_thread_for_structured(
         base_instructions: None,
         developer_instructions: None,
         personality: None,
+        multi_agent_mode: None,
         ephemeral: Some(true),
+        history_mode: None,
         session_start_source: None,
         thread_source: None,
         environments: None,
         dynamic_tools: None,
         mock_experimental_field: None,
         experimental_raw_events: false,
-        persist_extended_history: false,
+        selected_capability_roots: None,
     };
     let response: upstream::ThreadStartResponse = client
         .request_typed_for_server(
@@ -2392,11 +2395,13 @@ async fn run_structured_turn(
 
     let turn_params = upstream::TurnStartParams {
         thread_id: thread_id.to_string(),
+        client_user_message_id: None,
         input: vec![upstream::UserInput::Text {
             text: prompt.to_string(),
             text_elements: Vec::new(),
         }],
         responsesapi_client_metadata: None,
+        additional_context: None,
         cwd: None,
         runtime_workspace_roots: None,
         approval_policy: None,
@@ -2411,6 +2416,7 @@ async fn run_structured_turn(
         personality: None,
         output_schema: Some(output_schema),
         collaboration_mode: None,
+        multi_agent_mode: None,
     };
     let turn_outcome: Result<upstream::TurnStartResponse, _> = client
         .request_typed_for_server(
@@ -2638,6 +2644,7 @@ async fn perform_update_saved_app(
     let start_params = upstream::ThreadStartParams {
         model: Some(model.clone()),
         model_provider: None,
+        allow_provider_model_fallback: false,
         service_tier: service_tier.clone(),
         cwd: Some(thread_cwd.clone()),
         runtime_workspace_roots: None,
@@ -2650,14 +2657,16 @@ async fn perform_update_saved_app(
         base_instructions: None,
         developer_instructions: Some(developer_instructions),
         personality: None,
+        multi_agent_mode: None,
         ephemeral: Some(false),
+        history_mode: None,
         session_start_source: None,
         thread_source: None,
         environments: None,
         dynamic_tools: None,
         mock_experimental_field: None,
         experimental_raw_events: false,
-        persist_extended_history: false,
+        selected_capability_roots: None,
     };
     let thread_response: upstream::ThreadStartResponse = match client
         .request_typed_for_server(
@@ -2687,11 +2696,13 @@ async fn perform_update_saved_app(
     // 4. Send the user's update prompt on this thread.
     let turn_params = upstream::TurnStartParams {
         thread_id: thread_id.clone(),
+        client_user_message_id: None,
         input: vec![upstream::UserInput::Text {
             text: user_prompt.clone(),
             text_elements: Vec::new(),
         }],
         responsesapi_client_metadata: None,
+        additional_context: None,
         cwd: None,
         runtime_workspace_roots: None,
         approval_policy: Some(upstream::AskForApproval::Never),
@@ -2708,6 +2719,7 @@ async fn perform_update_saved_app(
         personality: None,
         output_schema: None,
         collaboration_mode: None,
+        multi_agent_mode: None,
     };
     let turn_start_outcome: Result<upstream::TurnStartResponse, _> = client
         .request_typed_for_server(
@@ -3360,7 +3372,9 @@ mod tests {
                 composer_icon: None,
                 composer_icon_url: None,
                 logo: None,
+                logo_dark: None,
                 logo_url: None,
+                logo_url_dark: None,
                 screenshots: Vec::new(),
                 screenshot_urls: Vec::new(),
             }
@@ -3377,6 +3391,7 @@ mod tests {
             upstream::PluginSummary {
                 id: id.into(),
                 remote_plugin_id: None,
+                version: None,
                 local_version: None,
                 name: name.into(),
                 share_context: None,
@@ -3384,6 +3399,7 @@ mod tests {
                 installed,
                 enabled,
                 install_policy,
+                install_policy_source: None,
                 auth_policy: upstream::PluginAuthPolicy::OnUse,
                 availability: upstream::PluginAvailability::default(),
                 interface: display.map(|d| iface(d, "")),

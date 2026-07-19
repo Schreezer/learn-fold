@@ -28,6 +28,7 @@ indirect enum JSONSchema: Encodable {
     case array(items: JSONSchema)
     case string(description: String? = nil)
     case stringEnum(values: [String], description: String? = nil)
+    case integer(description: String? = nil)
     case number(description: String? = nil)
     case boolean(description: String? = nil)
 
@@ -49,6 +50,9 @@ indirect enum JSONSchema: Encodable {
         case .stringEnum(let values, let description):
             try container.encode("string", forKey: .type)
             try container.encode(values, forKey: .enum_)
+            if let description { try container.encode(description, forKey: .description) }
+        case .integer(let description):
+            try container.encode("integer", forKey: .type)
             if let description { try container.encode(description, forKey: .description) }
         case .number(let description):
             try container.encode("number", forKey: .type)

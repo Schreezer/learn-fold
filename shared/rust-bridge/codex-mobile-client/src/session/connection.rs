@@ -582,7 +582,7 @@ impl ServerSession {
         use codex_app_server::in_process::InProcessStartArgs;
         use codex_app_server_protocol::{ClientInfo, InitializeCapabilities, InitializeParams};
         use codex_arg0::Arg0DispatchPaths;
-        use codex_cloud_requirements::cloud_requirements_loader;
+        use codex_cloud_config::cloud_config_bundle_loader;
         use codex_config::LoaderOverrides;
         use codex_core::config::ConfigBuilder;
         use codex_feedback::CodexFeedback;
@@ -648,15 +648,9 @@ impl ServerSession {
             .await
             .map_err(|e| TransportError::ConnectionFailed(format!("config build failed: {e}")))?;
 
-        let auth_manager = AuthManager::shared(
-            base_config.codex_home.to_path_buf(),
-            false,
-            base_config.cli_auth_credentials_store_mode,
-            Some(base_config.chatgpt_base_url.clone()),
-        )
-        .await;
+        let auth_manager = AuthManager::shared_from_config(&base_config, false).await;
 
-        let cloud_requirements = cloud_requirements_loader(
+        let cloud_config_bundle = cloud_config_bundle_loader(
             auth_manager.clone(),
             base_config.chatgpt_base_url.clone(),
             base_config.codex_home.to_path_buf(),
@@ -664,7 +658,7 @@ impl ServerSession {
 
         let mut resolved_builder = ConfigBuilder::default()
             .cli_overrides(cli_overrides.clone())
-            .cloud_requirements(cloud_requirements.clone());
+            .cloud_config_bundle(cloud_config_bundle.clone());
         if let Some(ref codex_home) = in_process.codex_home {
             resolved_builder = resolved_builder.codex_home(codex_home.clone());
         }
@@ -683,7 +677,7 @@ impl ServerSession {
             cli_overrides,
             loader_overrides: LoaderOverrides::default(),
             strict_config: false,
-            cloud_requirements,
+            cloud_config_bundle,
             feedback,
             log_db: None,
             state_db: None,
@@ -703,6 +697,7 @@ impl ServerSession {
                 capabilities: Some(InitializeCapabilities {
                     experimental_api: true,
                     request_attestation: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             },
@@ -1178,6 +1173,7 @@ pub(crate) fn remote_connect_args(config: &ServerConfig) -> (String, RemoteAppSe
         client_name: "Litter".to_string(),
         client_version: "1.0".to_string(),
         experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: 256,
     };
@@ -1962,6 +1958,7 @@ mod tests {
             client_name: "LitterTest".to_string(),
             client_version: "0".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,
         }

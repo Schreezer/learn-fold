@@ -4909,6 +4909,7 @@ mod tests {
 
         let upstream_item = upstream::ThreadItem::UserMessage {
             id: "server-user-item".to_string(),
+            client_id: None,
             content: inputs.clone(),
         };
         let server_user_item = crate::store::actions::conversation_item_from_upstream_with_turn(
@@ -4953,13 +4954,17 @@ mod tests {
         // helper apply_thread_read_response uses, then upsert.
         let upstream_thread = upstream::Thread {
             id: "thread-1".to_string(),
+            extra: None,
             session_id: "session-1".to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: "run some tools im testing".to_string(),
             ephemeral: false,
+            history_mode: Default::default(),
             model_provider: "openai".to_string(),
             created_at: 1,
             updated_at: 2,
+            recency_at: None,
             status: upstream::ThreadStatus::Idle,
             path: Some(std::path::PathBuf::from("/tmp/thread.jsonl")),
             cwd: codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path_checked("/tmp")
@@ -4976,6 +4981,7 @@ mod tests {
                 status: upstream::TurnStatus::Completed,
                 items: vec![upstream::ThreadItem::UserMessage {
                     id: "server-user-item".to_string(),
+                    client_id: None,
                     content: inputs.clone(),
                 }],
                 items_view: upstream::TurnItemsView::Full,

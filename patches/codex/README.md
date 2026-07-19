@@ -2,6 +2,21 @@
 
 Patches applied to `shared/third_party/codex` by `apps/ios/scripts/sync-codex.sh` during build.
 
+The active compatibility patch is `mobile-0.144.6.patch`, based on Codex tag
+`rust-v0.144.6` (`5d1fbf26c43abc65a203928b2e31561cb039e06d`). It consolidates the mobile and
+Litter transport extensions described below into one atomically applicable patch. The older split
+patches remain as intent/history for future rebases, but the sync script does not apply them.
+
+The consolidated patch also follows upstream's renamed `client_managed_handoffs` contract and its
+new namespaced dynamic-tool model. This avoids restoring the older parallel handoff channel design
+on top of Codex's current realtime implementation.
+
+For the combined Litter dependency graph, the active patch selects Clatter's PQClean ML-KEM backend
+instead of the RustCrypto backend. Both implement Clatter's same `Kem` interface; PQClean avoids a
+pre-release `kem`/`sha2` version collision with Litter's SSH stack. The bridge also vendors narrow
+compatibility copies of Iroh 0.98.1 and SQLx 0.9.0 under `shared/rust-bridge/vendor/`; see the vendor
+README for the exact manifest-only compatibility changes.
+
 The patches are tightly coupled to the upstream codex source tree, so each codex tag bump tends to require a refresh. This README captures *intent* — what each patch does and which downstream code in this repo depends on it — so the next bump doesn't have to re-derive that from a 900-line diff.
 
 When a patch fails to apply, prefer `git apply --3way` first (handles line-number drift). If that conflicts on real semantic changes, refresh the affected hunks against the new upstream by editing the file directly, regenerating the patch with `git diff HEAD -- <file>`, and verifying with `git -C shared/third_party/codex apply --reverse --check`.

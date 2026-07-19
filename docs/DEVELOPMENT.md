@@ -72,9 +72,10 @@ Upstream Codex is vendored as a submodule at `shared/third_party/codex`.
 
 Current local patch set (applied by `sync-codex.sh`):
 
-- `patches/codex/ios-exec-hook.patch`
-- `patches/codex/client-controlled-handoff.patch`
-- `patches/codex/mobile-code-mode-stub.patch`
+- `patches/codex/mobile-0.144.6.patch`
+
+The consolidated patch is based on Codex `rust-v0.144.6`. The older split patches remain in the
+repository as rebase history and design documentation, but the build no longer applies them.
 
 Additional patches (not auto-applied):
 

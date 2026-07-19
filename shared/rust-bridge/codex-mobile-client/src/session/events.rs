@@ -599,7 +599,7 @@ impl EventProcessor {
                     params.command.clone(),
                     None,
                     None,
-                    params.cwd.as_ref().map(|p| p.display().to_string()),
+                    params.cwd.as_ref().map(|p| p.render_for_ui()),
                     params.reason.clone(),
                     request_id,
                     raw,
@@ -915,6 +915,21 @@ fn mcp_elicitation_questions(
                 }
             }
             questions
+        }
+        codex_app_server_protocol::McpServerElicitationRequest::OpenAiForm { message, .. } => {
+            vec![PendingUserInputQuestion {
+                id: MCP_URL_ACTION_FIELD_ID.to_string(),
+                header: Some(format!("MCP: {}", params.server_name)),
+                question: format!(
+                    "{message}\n\nThis extended form is not supported by this Litter build."
+                ),
+                is_other_allowed: false,
+                is_secret: false,
+                options: vec![PendingUserInputOption {
+                    label: MCP_APPROVAL_CANCEL_LABEL.to_string(),
+                    description: Some("Cancel this request.".to_string()),
+                }],
+            }]
         }
         codex_app_server_protocol::McpServerElicitationRequest::Url { message, url, .. } => {
             let prompt = if message.trim().is_empty() {
@@ -1281,24 +1296,7 @@ mod tests {
     }
 
     fn upstream_item_id(item: &proto::ThreadItem) -> &str {
-        match item {
-            proto::ThreadItem::UserMessage { id, .. }
-            | proto::ThreadItem::HookPrompt { id, .. }
-            | proto::ThreadItem::AgentMessage { id, .. }
-            | proto::ThreadItem::Plan { id, .. }
-            | proto::ThreadItem::Reasoning { id, .. }
-            | proto::ThreadItem::CommandExecution { id, .. }
-            | proto::ThreadItem::FileChange { id, .. }
-            | proto::ThreadItem::McpToolCall { id, .. }
-            | proto::ThreadItem::DynamicToolCall { id, .. }
-            | proto::ThreadItem::CollabAgentToolCall { id, .. }
-            | proto::ThreadItem::WebSearch { id, .. }
-            | proto::ThreadItem::ImageView { id, .. }
-            | proto::ThreadItem::ImageGeneration { id, .. }
-            | proto::ThreadItem::EnteredReviewMode { id, .. }
-            | proto::ThreadItem::ExitedReviewMode { id, .. }
-            | proto::ThreadItem::ContextCompaction { id, .. } => id,
-        }
+        item.id()
     }
 
     // ── EventProcessor basics ──────────────────────────────────────────
@@ -1328,13 +1326,17 @@ mod tests {
         let notification = ServerNotification::ThreadStarted(proto::ThreadStartedNotification {
             thread: proto::Thread {
                 id: "thr_1".to_string(),
+                extra: None,
                 session_id: "session_1".to_string(),
                 forked_from_id: None,
+                parent_thread_id: None,
                 preview: "Preview".to_string(),
                 ephemeral: false,
+                history_mode: Default::default(),
                 model_provider: "openai".to_string(),
                 created_at: 1,
                 updated_at: 2,
+                recency_at: None,
                 status: proto::ThreadStatus::Idle,
                 path: None,
                 cwd: test_abs_path("/tmp"),
@@ -1861,6 +1863,7 @@ mod tests {
                         unlimited: false,
                         balance: Some("5.00".to_string()),
                     }),
+                    individual_limit: None,
                     plan_type: Some(codex_protocol::account::PlanType::Plus),
                     rate_limit_reached_type: None,
                 },
@@ -1915,13 +1918,17 @@ mod tests {
             ServerNotification::ThreadStarted(proto::ThreadStartedNotification {
                 thread: proto::Thread {
                     id: "thr_1".to_string(),
+                    extra: None,
                     session_id: "session_1".to_string(),
                     forked_from_id: None,
+                    parent_thread_id: None,
                     preview: String::new(),
                     ephemeral: false,
+                    history_mode: Default::default(),
                     model_provider: "openai".to_string(),
                     created_at: 1,
                     updated_at: 1,
+                    recency_at: None,
                     status: proto::ThreadStatus::Idle,
                     path: None,
                     cwd: test_abs_path("/tmp"),
@@ -2047,6 +2054,7 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
+                environment_id: None,
                 started_at_ms: 0,
                 approval_id: None,
                 reason: None,
@@ -2103,6 +2111,7 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
+                environment_id: None,
                 started_at_ms: 0,
                 cwd: test_abs_path("/tmp"),
                 reason: Some("need network access".to_string()),
@@ -2174,6 +2183,7 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
+                auto_resolution_ms: None,
                 questions: vec![proto::ToolRequestUserInputQuestion {
                     id: "q1".to_string(),
                     header: "Mode".to_string(),
@@ -2218,6 +2228,7 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
+                auto_resolution_ms: None,
                 questions: vec![
                     proto::ToolRequestUserInputQuestion {
                         id: "".to_string(),
@@ -2316,6 +2327,7 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
+                environment_id: None,
                 started_at_ms: 0,
                 approval_id: None,
                 reason: None,
@@ -2354,6 +2366,7 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
+                environment_id: None,
                 started_at_ms: 0,
                 approval_id: None,
                 reason: None,

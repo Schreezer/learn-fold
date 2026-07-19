@@ -1288,7 +1288,7 @@ private struct SettingsConnectionAccountSection: View {
             authError = "Base URL can only be saved for the local server."
             return
         }
-        guard let baseURL = normalizedOpenAIBaseURL(rawBaseURL) else {
+        guard let baseURL = OpenAICompatibleProviderConfiguration.normalizedBaseURL(rawBaseURL) else {
             authError = "Enter a valid http or https base URL."
             return
         }
@@ -1321,17 +1321,6 @@ private struct SettingsConnectionAccountSection: View {
         } catch {
             authError = error.localizedDescription
         }
-    }
-
-    private func normalizedOpenAIBaseURL(_ rawValue: String) -> String? {
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https",
-              url.host != nil else {
-            return nil
-        }
-        return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     private func logout() async {

@@ -1,6 +1,40 @@
 import Foundation
 import Security
 
+enum OpenAICompatibleProviderConfiguration {
+    static func normalizedBaseURL(_ rawValue: String) -> String? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else {
+            return nil
+        }
+        return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    static func normalizedModelID(_ rawValue: String) -> String? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func resolvedModelID(
+        requestedModelID: String?,
+        catalogMatchID: String?,
+        fallbackModelID: String?,
+        customEndpointEnabled: Bool
+    ) -> String? {
+        if let catalogMatchID {
+            return catalogMatchID
+        }
+        if customEndpointEnabled,
+           let requestedModelID = normalizedModelID(requestedModelID ?? "") {
+            return requestedModelID
+        }
+        return fallbackModelID
+    }
+}
+
 final class OpenAIApiKeyStore {
     static let shared = OpenAIApiKeyStore()
 

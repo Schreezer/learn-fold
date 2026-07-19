@@ -51,7 +51,9 @@ mod tests {
             status: upstream::McpToolCallStatus::Completed,
             arguments: serde_json::from_value(json!({"path": "/tmp/file.txt"}))
                 .expect("json value should convert"),
+            app_context: None,
             mcp_app_resource_uri: None,
+            plugin_id: None,
             result: None,
             error: None,
             duration_ms: Some(42),

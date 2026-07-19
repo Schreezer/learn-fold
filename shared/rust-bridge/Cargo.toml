@@ -23,9 +23,10 @@ codex-shell-command = { path = "../third_party/codex/codex-rs/shell-command" }
 codex-apply-patch = { path = "../third_party/codex/codex-rs/apply-patch" }
 codex-arg0 = { path = "../third_party/codex/codex-rs/arg0" }
 codex-feedback = { path = "../third_party/codex/codex-rs/feedback" }
-codex-cloud-requirements = { path = "../third_party/codex/codex-rs/cloud-requirements" }
+codex-cloud-config = { path = "../third_party/codex/codex-rs/cloud-config" }
 codex-config = { path = "../third_party/codex/codex-rs/config" }
 codex-utils-absolute-path = { path = "../third_party/codex/codex-rs/utils/absolute-path" }
+codex-utils-path-uri = { path = "../third_party/codex/codex-rs/utils/path-uri" }
 codex-git-utils = { path = "../third_party/codex/codex-rs/git-utils" }
 alleycat-bridge-core = { git = "https://github.com/dnakov/alleycat.git", branch = "main" }
 alleycat-pi-bridge = { git = "https://github.com/dnakov/alleycat.git", branch = "main" }
@@ -86,6 +87,8 @@ debug = 0
 codegen-units = 16
 
 [patch.crates-io]
+sqlx = { path = "vendor/sqlx-0.9.0" }
+sqlx-macros-core = { path = "vendor/sqlx-macros-core-0.9.0" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
 crossterm = { git = "https://github.com/nornagon/crossterm", branch = "nornagon/color-query" }

@@ -43,6 +43,9 @@ packages:
   Hairball:
     url: https://github.com/dnakov/hairball.git
     branch: main
+  RemodexTextKit:
+    url: https://github.com/Emanuele-web04/RemodexTextKit.git
+    exactVersion: "0.4.2"
   WebRTC:
     url: https://github.com/stasel/WebRTC.git
     exactVersion: "147.0.0"
@@ -113,6 +116,8 @@ targets:
       - sdk: Network.framework
       - package: Hairball
         product: HairballUI
+      - package: RemodexTextKit
+        product: RemodexTextKit
       - package: WebRTC
         product: WebRTC
       - package: Nuke
@@ -215,6 +220,8 @@ targets:
       - sdk: Network.framework
       - package: Hairball
         product: HairballUI
+      - package: RemodexTextKit
+        product: RemodexTextKit
       - package: Nuke
         product: Nuke
       - package: Nuke

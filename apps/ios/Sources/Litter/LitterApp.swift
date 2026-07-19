@@ -437,9 +437,11 @@ struct ContentView: View {
     @State private var appState = AppState()
     @State private var stableSafeAreaInsets = StableSafeAreaInsets()
     @State private var conversationWarmup = ConversationWarmupCoordinator()
+    @State private var courseStore = CourseExperienceStore()
     @State private var petOverlay = PetOverlayController.shared
     @State private var composerBottomInset: CGFloat = 0
     @State private var splashDismissed = false
+    @State private var showsClassicLitter = false
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("conversationTextSizeStep") private var textSizeStep = ConversationTextSize.large.rawValue
@@ -453,35 +455,46 @@ struct ContentView: View {
 
         GeometryReader { geometry in
             ZStack {
-                LitterTheme.backgroundGradient.ignoresSafeArea()
+                if showsClassicLitter {
+                    LitterTheme.backgroundGradient.ignoresSafeArea()
+                } else {
+                    Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
+                }
 
                 #if DEBUG
                 if ConversationDisplayUITestHarnessView.isEnabled {
                     ConversationDisplayUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
+                } else if showsClassicLitter {
                     standardHomeNavigationView(
                         topInset: geometry.safeAreaInsets.top,
                         bottomInset: composerBottomInset
                     )
+                } else {
+                    courseExperienceRoot
                 }
                 #else
-                standardHomeNavigationView(
-                    topInset: geometry.safeAreaInsets.top,
-                    bottomInset: composerBottomInset
-                )
+                if showsClassicLitter {
+                    standardHomeNavigationView(
+                        topInset: geometry.safeAreaInsets.top,
+                        bottomInset: composerBottomInset
+                    )
+                } else {
+                    courseExperienceRoot
+                }
                 #endif
 
                 #if DEBUG
-                if !ConversationDisplayUITestHarnessView.isEnabled {
+                if !ConversationDisplayUITestHarnessView.isEnabled, showsClassicLitter {
                     standardOverlays
                 }
                 #else
-                standardOverlays
+                if showsClassicLitter {
+                    standardOverlays
+                }
                 #endif
 
             }
-            .ignoresSafeArea(.container)
             .task {
                 if composerBottomInset <= 0, geometry.safeAreaInsets.bottom > 0 {
                     composerBottomInset = geometry.safeAreaInsets.bottom
@@ -497,6 +510,7 @@ struct ContentView: View {
         }
         .environment(appState)
         .environment(conversationWarmup)
+        .environment(courseStore)
         .environment(\.textScale, textScale)
         .preferredColorScheme(themeManager.appearanceMode.preferredColorScheme)
         .background {
@@ -571,6 +585,20 @@ struct ContentView: View {
             appState.showSettings = true
         }
         #endif
+    }
+
+    private var courseExperienceRoot: some View {
+        CourseExperienceRootView(
+            store: courseStore,
+            onOpenClassicLitter: { showsClassicLitter = true }
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            if !splashDismissed {
+                splashDismissed = true
+                (UIApplication.shared.delegate as? AppDelegate)?.signalContentReady()
+            }
+        }
     }
 
     private func standardHomeNavigationView(topInset: CGFloat, bottomInset: CGFloat) -> some View {

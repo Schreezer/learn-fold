@@ -552,6 +552,7 @@ pub async fn connect_app_server_client(
         client_name: "Litter".to_string(),
         client_version: "1.0".to_string(),
         experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: 256,
     };

@@ -68,7 +68,137 @@ pub(super) async fn execute_dynamic_tool_call(
             crate::widget_guidelines::handle_visualize_read_me(&params.arguments)
         }
         "show_widget" => crate::widget_guidelines::handle_show_widget(&params.arguments),
+        "present_course_plan" => handle_present_course_plan(&params.arguments),
         tool => Err(format!("Unknown dynamic tool: {tool}")),
+    }
+}
+
+fn handle_present_course_plan(arguments: &serde_json::Value) -> Result<String, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "Course plan arguments must be a JSON object.".to_string())?;
+    for field in [
+        "plan_id",
+        "title",
+        "summary",
+        "outcome",
+        "starting_point",
+        "focus_gap",
+        "estimated_duration",
+    ] {
+        let valid = object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !valid {
+            return Err(format!(
+                "Course plan field '{field}' must be a non-empty string."
+            ));
+        }
+    }
+
+    let revision = object
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Course plan revision must be a positive integer.".to_string())?;
+    let chapters = object
+        .get("chapters")
+        .and_then(serde_json::Value::as_array)
+        .filter(|chapters| !chapters.is_empty())
+        .ok_or_else(|| "Course plan must contain at least one chapter.".to_string())?;
+
+    for (index, chapter) in chapters.iter().enumerate() {
+        let chapter = chapter
+            .as_object()
+            .ok_or_else(|| format!("Chapter {} must be a JSON object.", index + 1))?;
+        for field in ["id", "title", "objective"] {
+            let valid = chapter
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            if !valid {
+                return Err(format!(
+                    "Chapter {} field '{field}' must be a non-empty string.",
+                    index + 1
+                ));
+            }
+        }
+        let deliverables = chapter
+            .get("deliverables")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("Chapter {} deliverables must be an array.", index + 1))?;
+        if deliverables.iter().any(|deliverable| {
+            deliverable
+                .as_str()
+                .map_or(true, |value| value.trim().is_empty())
+        }) {
+            return Err(format!(
+                "Chapter {} deliverables must contain only non-empty strings.",
+                index + 1
+            ));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": "presented",
+        "plan_id": object.get("plan_id"),
+        "revision": revision,
+        "message": "Course plan rendered in the native conversation. Wait for the learner to approve it or request changes."
+    })
+    .to_string())
+}
+
+#[cfg(test)]
+mod course_plan_tests {
+    use super::handle_present_course_plan;
+    use serde_json::json;
+
+    fn valid_plan() -> serde_json::Value {
+        json!({
+            "plan_id": "diffusion-models",
+            "revision": 2,
+            "title": "Diffusion Models",
+            "summary": "Learn the complete denoising process.",
+            "outcome": "Build a small image sampler.",
+            "starting_point": "Python and neural network basics.",
+            "focus_gap": "Connect the math to implementation.",
+            "estimated_duration": "4h",
+            "chapters": [{
+                "id": "first-principles",
+                "title": "First principles",
+                "objective": "Understand forward and reverse diffusion.",
+                "deliverables": ["lesson", "exercise"]
+            }]
+        })
+    }
+
+    #[test]
+    fn accepts_a_complete_semantic_course_plan() {
+        let output = handle_present_course_plan(&valid_plan()).expect("valid plan");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("JSON response");
+        assert_eq!(value["status"], "presented");
+        assert_eq!(value["plan_id"], "diffusion-models");
+        assert_eq!(value["revision"], 2);
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_plan_content() {
+        let mut plan = valid_plan();
+        plan["revision"] = json!(0);
+        assert!(
+            handle_present_course_plan(&plan)
+                .expect_err("revision zero must fail")
+                .contains("positive integer")
+        );
+
+        let mut plan = valid_plan();
+        plan["chapters"][0]["deliverables"] = json!([""]);
+        assert!(
+            handle_present_course_plan(&plan)
+                .expect_err("blank deliverable must fail")
+                .contains("non-empty strings")
+        );
     }
 }
 
@@ -265,6 +395,8 @@ pub(super) async fn list_sessions_tool_output(
                 cwd: None,
                 search_term: None,
                 use_state_db_only: false,
+                parent_thread_id: None,
+                ancestor_thread_id: None,
             },
         )
         .await;

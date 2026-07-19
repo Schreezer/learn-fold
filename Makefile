@@ -153,10 +153,7 @@ KITTYLITTER_ARGS := $(strip $(KITTYLITTER_GOAL_ARGS) $(ARGS))
 UPDATE_ALLEYCAT_MAIN := $(ROOT)/tools/scripts/update-alleycat-main.sh
 
 PATCH_FILES := \
-	$(PATCHES_DIR)/ios-exec-hook.patch \
-	$(PATCHES_DIR)/client-controlled-handoff.patch \
-	$(PATCHES_DIR)/mobile-code-mode-stub.patch \
-	$(PATCHES_DIR)/thread-read-permissions.patch
+	$(PATCHES_DIR)/mobile-0.144.6.patch
 
 BOUNDARY_SOURCES := \
 	$(RUST_DIR)/codex-mobile-client/Cargo.toml \
@@ -542,7 +539,7 @@ help:
 		'make rust-test          host cargo test for shared crates'
 
 sync: $(STAMP_SYNC)
-$(STAMP_SYNC):
+$(STAMP_SYNC): $(PATCH_FILES) $(IOS_SCRIPTS)/sync-codex.sh Makefile
 	@echo "==> Syncing codex submodule..."
 	@$(IOS_SCRIPTS)/sync-codex.sh --preserve-current
 	@touch $@

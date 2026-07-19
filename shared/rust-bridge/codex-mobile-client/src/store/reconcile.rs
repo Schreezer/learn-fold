@@ -229,6 +229,7 @@ impl MobileClient {
             Some(response.model.clone()),
             response
                 .reasoning_effort
+                .clone()
                 .map(Into::into)
                 .map(crate::reasoning_effort_string),
             Some(response.approval_policy.clone().into()),
@@ -293,6 +294,7 @@ impl MobileClient {
             Some(response.model.clone()),
             response
                 .reasoning_effort
+                .clone()
                 .map(Into::into)
                 .map(crate::reasoning_effort_string),
             Some(response.approval_policy.clone().into()),
@@ -318,6 +320,7 @@ impl MobileClient {
             Some(response.model.clone()),
             response
                 .reasoning_effort
+                .clone()
                 .map(Into::into)
                 .map(crate::reasoning_effort_string),
             Some(response.approval_policy.clone().into()),
@@ -702,13 +705,17 @@ mod tests {
     fn test_upstream_thread(id: &str) -> upstream::Thread {
         upstream::Thread {
             id: id.to_string(),
+            extra: None,
             session_id: format!("session-{id}"),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: "hello".to_string(),
             ephemeral: false,
+            history_mode: Default::default(),
             model_provider: "openai".to_string(),
             created_at: 1,
             updated_at: 2,
+            recency_at: None,
             status: upstream::ThreadStatus::Idle,
             path: Some(PathBuf::from("/tmp/thread.jsonl")),
             cwd: test_abs_path("/tmp"),
@@ -741,7 +748,7 @@ mod tests {
 
         let response = upstream::GetAccountResponse {
             account: Some(upstream::Account::Chatgpt {
-                email: "user@example.com".into(),
+                email: Some("user@example.com".into()),
                 plan_type: codex_protocol::account::PlanType::Pro,
             }),
             requires_openai_auth: true,
@@ -792,10 +799,12 @@ mod tests {
                     unlimited: false,
                     balance: Some("5.00".to_string()),
                 }),
+                individual_limit: None,
                 plan_type: Some(codex_protocol::account::PlanType::Plus),
                 rate_limit_reached_type: None,
             },
             rate_limits_by_limit_id: None,
+            rate_limit_reset_credits: None,
         };
 
         client
@@ -852,6 +861,7 @@ mod tests {
                 supports_personality: true,
                 additional_speed_tiers: Vec::new(),
                 service_tiers: Vec::new(),
+                default_service_tier: None,
                 is_default: true,
                 availability_nux: None,
                 upgrade_info: None,
@@ -1306,6 +1316,7 @@ mod tests {
             sandbox: upstream::SandboxPolicy::DangerFullAccess,
             active_permission_profile: None,
             reasoning_effort: None,
+            multi_agent_mode: Default::default(),
         };
         let key = client
             .apply_thread_start_response("srv", &response)
@@ -1400,6 +1411,7 @@ mod tests {
             status: upstream::TurnStatus::Completed,
             items: vec![upstream::ThreadItem::UserMessage {
                 id: "server-user-item".to_string(),
+                client_id: None,
                 content: vec![upstream::UserInput::Text {
                     text: "hi".to_string(),
                     text_elements: Vec::new(),
