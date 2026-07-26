@@ -238,7 +238,7 @@ jobs:
           set -euo pipefail
 
           SCHEME="Litter"
-          APP_BUNDLE_ID="com.sigkitten.litter"
+          APP_BUNDLE_ID="com.chirag.learnfold"
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             BETA_GROUP_NAMES="${{ inputs.beta_group_names }}"
@@ -261,7 +261,7 @@ jobs:
         env:
           SCHEME: ${{ env.SCHEME }}
           APP_BUNDLE_ID: ${{ env.APP_BUNDLE_ID }}
-          LIVE_ACTIVITY_BUNDLE_ID: com.sigkitten.litter.liveactivity
+          LIVE_ACTIVITY_BUNDLE_ID: com.chirag.learnfold.liveactivity
           APP_STORE_APP_ID: ${{ secrets.IOS_APP_STORE_APP_ID }}
           TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
           APP_PROVISIONING_PROFILE_SPECIFIER: ${{ env.APP_PROVISIONING_PROFILE_SPECIFIER }}
@@ -281,7 +281,7 @@ jobs:
         env:
           SCHEME: ${{ env.SCHEME }}
           APP_BUNDLE_ID: ${{ env.APP_BUNDLE_ID }}
-          LIVE_ACTIVITY_BUNDLE_ID: com.sigkitten.litter.liveactivity
+          LIVE_ACTIVITY_BUNDLE_ID: com.chirag.learnfold.liveactivity
           APP_STORE_APP_ID: ${{ secrets.IOS_APP_STORE_APP_ID }}
           TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
           APP_PROVISIONING_PROFILE_SPECIFIER: ${{ env.APP_PROVISIONING_PROFILE_SPECIFIER }}

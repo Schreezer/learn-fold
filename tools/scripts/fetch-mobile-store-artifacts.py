@@ -37,7 +37,7 @@ from typing import Any
 
 UTC = dt.timezone.utc
 
-DEFAULT_IOS_BUNDLE_ID = "com.sigkitten.litter"
+DEFAULT_IOS_BUNDLE_ID = "com.chirag.learnfold"
 DEFAULT_ANDROID_PACKAGE = "com.sigkitten.litter.android"
 DEFAULT_OUTPUT_BASE = pathlib.Path("/tmp/mobile-store-artifacts")
 DEFAULT_PLAY_ENV_FILE = pathlib.Path.home() / ".config/litter/play-upload.env"

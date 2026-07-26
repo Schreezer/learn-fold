@@ -752,7 +752,7 @@ jobs:
           set -euo pipefail
 
           SCHEME="Litter"
-          APP_BUNDLE_ID="com.sigkitten.litter"
+          APP_BUNDLE_ID="com.chirag.learnfold"
           BETA_GROUP_NAMES="Internal Testers,Beta Testers"
           WAIT_FOR_PROCESSING="1"
 
@@ -765,7 +765,7 @@ jobs:
         env:
           SCHEME: ${{ env.SCHEME }}
           APP_BUNDLE_ID: ${{ env.APP_BUNDLE_ID }}
-          LIVE_ACTIVITY_BUNDLE_ID: com.sigkitten.litter.liveactivity
+          LIVE_ACTIVITY_BUNDLE_ID: com.chirag.learnfold.liveactivity
           APP_STORE_APP_ID: ${{ secrets.IOS_APP_STORE_APP_ID }}
           TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
           APP_PROVISIONING_PROFILE_SPECIFIER: ${{ env.APP_PROVISIONING_PROFILE_SPECIFIER }}
@@ -787,7 +787,7 @@ jobs:
         env:
           SCHEME: ${{ env.SCHEME }}
           APP_BUNDLE_ID: ${{ env.APP_BUNDLE_ID }}
-          LIVE_ACTIVITY_BUNDLE_ID: com.sigkitten.litter.liveactivity
+          LIVE_ACTIVITY_BUNDLE_ID: com.chirag.learnfold.liveactivity
           APP_STORE_APP_ID: ${{ secrets.IOS_APP_STORE_APP_ID }}
           TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
           APP_PROVISIONING_PROFILE_SPECIFIER: ${{ env.APP_PROVISIONING_PROFILE_SPECIFIER }}
@@ -1034,7 +1034,7 @@ jobs:
           set -euo pipefail
 
           SCHEME="LitterMac"
-          APP_BUNDLE_ID="com.sigkitten.litter"
+          APP_BUNDLE_ID="com.chirag.learnfold"
           BETA_GROUP_NAMES="Internal Testers,Beta Testers"
           WAIT_FOR_PROCESSING="1"
 
@@ -1202,7 +1202,7 @@ jobs:
         if: steps.gate.outputs.configured == 'true'
         env:
           SCHEME: LitterMac
-          APP_BUNDLE_ID: com.sigkitten.litter
+          APP_BUNDLE_ID: com.chirag.learnfold
           TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
           APP_PROVISIONING_PROFILE_SPECIFIER: ${{ env.APP_PROVISIONING_PROFILE_SPECIFIER }}
           EXPORT_SIGNING_STYLE: ${{ env.EXPORT_SIGNING_STYLE }}
