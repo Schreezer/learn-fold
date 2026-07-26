@@ -146,7 +146,7 @@ internal class ChatGPTOAuthLoopbackServer private constructor(
             <head>
               <meta charset="utf-8">
               <meta name="viewport" content="width=device-width, initial-scale=1">
-              <title>Litter Login Complete</title>
+              <title>Learnfold Login Complete</title>
               <meta http-equiv="refresh" content="0;url=$appReturnUri">
               <style>
                 body {
@@ -183,7 +183,7 @@ internal class ChatGPTOAuthLoopbackServer private constructor(
             <body>
               <main>
                 <h1>Login complete</h1>
-                <p>Returning to Litter. If nothing happens, <a href="$appReturnUri">tap here</a>.</p>
+                <p>Returning to Learnfold. If nothing happens, <a href="$appReturnUri">tap here</a>.</p>
               </main>
             </body>
             </html>

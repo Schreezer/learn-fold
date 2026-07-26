@@ -55,7 +55,7 @@ class ChatGPTOAuthLoopbackServerTest {
     @Test
     fun successHtml_mentionsReturnToApp() {
         val html = ChatGPTOAuthLoopbackServer.successHtml("litterauth://chatgpt-auth-complete")
-        assertTrue(html.contains("Returning to Litter"))
+        assertTrue(html.contains("Returning to Learnfold"))
         assertTrue(html.contains("litterauth://chatgpt-auth-complete"))
     }
 }

@@ -338,7 +338,7 @@ private fun PetActionMenu(
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        PetActionMenuItem(label = "Open Litter", onClick = onOpenLitter)
+        PetActionMenuItem(label = "Open Learnfold", onClick = onOpenLitter)
         PetActionMenuItem(label = "Hide Pet", onClick = onHidePet)
         PetActionMenuItem(label = "Pet Settings", onClick = onOpenPetSettings)
     }

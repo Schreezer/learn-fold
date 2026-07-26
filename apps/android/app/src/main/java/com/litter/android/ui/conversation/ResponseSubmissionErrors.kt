@@ -3,7 +3,7 @@ package com.litter.android.ui.conversation
 internal fun responseSubmissionErrorMessage(error: Throwable): String {
     val message = error.message?.trim().orEmpty()
     return if (error.isDisconnectedTransportError()) {
-        "Connection lost. Try again after Litter reconnects."
+        "Connection lost. Try again after Learnfold reconnects."
     } else {
         message.ifEmpty { "Failed to submit response." }
     }

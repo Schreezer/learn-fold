@@ -272,7 +272,7 @@ fun TipJarScreen(onBack: () -> Unit) {
             }
             Spacer(Modifier.weight(1f))
             Text(
-                "Tip the Kitty",
+                "Support Learnfold",
                 color = LitterTheme.textPrimary,
                 fontSize = 17.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -313,7 +313,7 @@ fun TipJarScreen(onBack: () -> Unit) {
                         Spacer(Modifier.height(8.dp))
                     }
                     Text(
-                        "If you enjoy Litter, consider leaving a tip. Tips help support ongoing development and are entirely optional.",
+                        "If you enjoy Learnfold, consider leaving a tip. Tips help support ongoing development and are entirely optional.",
                         color = LitterTheme.textSecondary,
                         fontSize = 13.sp,
                         textAlign = TextAlign.Center,

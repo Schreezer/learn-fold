@@ -12,7 +12,7 @@ class ResponseSubmissionErrorsTest {
 
         assertTrue(error.isDisconnectedTransportError())
         assertEquals(
-            "Connection lost. Try again after Litter reconnects.",
+            "Connection lost. Try again after Learnfold reconnects.",
             responseSubmissionErrorMessage(error),
         )
     }
@@ -23,7 +23,7 @@ class ResponseSubmissionErrorsTest {
 
         assertTrue(error.isDisconnectedTransportError())
         assertEquals(
-            "Connection lost. Try again after Litter reconnects.",
+            "Connection lost. Try again after Learnfold reconnects.",
             responseSubmissionErrorMessage(error),
         )
     }

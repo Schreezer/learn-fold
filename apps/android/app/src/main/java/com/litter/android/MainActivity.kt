@@ -83,7 +83,7 @@ class MainActivity : ComponentActivity() {
                         )
                     } else {
                         Text(
-                            text = "Litter couldn't finish starting.",
+                            text = "Learnfold couldn't finish starting.",
                             modifier = Modifier.padding(horizontal = 24.dp),
                         )
                     }

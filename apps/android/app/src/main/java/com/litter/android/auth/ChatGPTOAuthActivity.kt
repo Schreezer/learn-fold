@@ -382,7 +382,7 @@ private fun ChatGPTOAuthActivityScreen(
                 text = if (browserOpened) {
                     "After the login finishes, this screen will complete automatically. If the browser closed early, you can open it again below."
                 } else {
-                    "Google blocks sign-in inside embedded web views, so Litter uses your browser for this flow."
+                    "Google blocks sign-in inside embedded web views, so Learnfold uses your browser for this flow."
                 },
                 color = LitterTheme.textSecondary,
                 fontSize = 13.sp,

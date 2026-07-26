@@ -317,7 +317,7 @@ private fun LitterThemePreview() {
     LitterAppTheme {
         Surface(color = LitterTheme.background) {
             Text(
-                text = "Litter Theme",
+                text = "Learnfold Theme",
                 color = MaterialTheme.colorScheme.onBackground,
                 style = MaterialTheme.typography.titleMedium,
             )

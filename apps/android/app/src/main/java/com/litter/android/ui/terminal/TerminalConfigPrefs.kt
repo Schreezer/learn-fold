@@ -10,7 +10,7 @@ import uniffi.codex_mobile_client.TerminalCursorStyle
 import uniffi.codex_mobile_client.TerminalThemePreset
 
 enum class TerminalThemeChoice(val id: String, val title: String) {
-    LITTER_DARK("litter-dark", "Litter Dark"),
+    LITTER_DARK("litter-dark", "Learnfold Dark"),
     CATPPUCCIN_FRAPPE("catppuccin-frappe", "Catppuccin Frappé"),
     CATPPUCCIN_FRAPPE_LIGHT("catppuccin-frappe-light", "Catppuccin Frappé Light"),
     SOLARIZED_DARK("solarized-dark", "Solarized Dark"),

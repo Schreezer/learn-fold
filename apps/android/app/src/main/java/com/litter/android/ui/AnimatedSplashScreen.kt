@@ -4,7 +4,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -32,7 +34,9 @@ import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sigkitten.litter.android.R
@@ -43,10 +47,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
-/**
- * Animated splash screen matching the iOS version.
- * Time-driven animation: bobbing kittens, blinking, ear twitches, meowing.
- */
+/** Learnfold's short brand reveal, shared with the system splash palette. */
 @Composable
 fun AnimatedSplashScreen() {
     // Frame clock for continuous animation
@@ -66,45 +67,70 @@ fun AnimatedSplashScreen() {
     val currentFrame = frameTime.longValue
     val elapsed = (System.nanoTime() - startTime) / 1_000_000_000.0
 
+    val pulse = (1.0 + sin(elapsed * 2.4) * 0.012).toFloat()
+    val rise = (sin(elapsed * 1.7) * 2.5).toFloat()
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(LitterTheme.background),
+            .background(LearnfoldIndigo),
         contentAlignment = Alignment.Center,
     ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val s = min(size.width, size.height) * 0.55f
-            val scale = s / 500f
-            val ox = (size.width - s) / 2f
-            val oy = (size.height - s) / 2f - size.height * 0.05f
-            val anim = KittenAnimState(elapsed)
-
-            drawLeftKitten(scale, ox, oy, anim)
-            drawRightKitten(scale, ox, oy, anim)
-            drawCenterKitten(scale, ox, oy, anim)
-            drawBox(scale, ox, oy)
-            drawPaws(scale, ox, oy)
-        }
-
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 80.dp),
-            verticalAlignment = Alignment.CenterVertically,
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            SpinningProviderCarousel(elapsed = elapsed)
+            Image(
+                painter = painterResource(R.drawable.brand_logo),
+                contentDescription = null,
+                modifier = Modifier
+                    .size(248.dp)
+                    .graphicsLayer(
+                        scaleX = pulse,
+                        scaleY = pulse,
+                        translationY = rise,
+                    ),
+            )
+
             Text(
-                text = " on your phone",
-                color = LitterTheme.textMuted,
+                text = "Learnfold",
+                color = LearnfoldPaper,
                 style = TextStyle(
-                    fontFamily = LitterTheme.monoFont,
-                    fontWeight = FontWeight.Normal,
-                    fontSize = 14.sp,
+                    fontFamily = FontFamily.SansSerif,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 36.sp,
+                    letterSpacing = (-1.1).sp,
+                    textAlign = TextAlign.Center,
                 ),
+            )
+
+            Spacer(Modifier.height(9.dp))
+
+            Text(
+                text = "Turn anything into a course.",
+                color = LearnfoldPaper.copy(alpha = 0.74f),
+                style = TextStyle(
+                    fontFamily = FontFamily.SansSerif,
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 15.sp,
+                    textAlign = TextAlign.Center,
+                ),
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            Box(
+                Modifier
+                    .width(34.dp)
+                    .height(4.dp)
+                    .background(LearnfoldChartreuse),
             )
         }
     }
 }
+
+private val LearnfoldIndigo = Color(0xFF4B3CF0)
+private val LearnfoldChartreuse = Color(0xFFD7FF45)
+private val LearnfoldPaper = Color(0xFFFFF9E8)
 
 private data class SplashProvider(
     val label: String,

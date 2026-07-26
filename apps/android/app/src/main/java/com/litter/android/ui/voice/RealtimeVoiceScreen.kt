@@ -492,7 +492,7 @@ private fun RealtimeApiKeyPrompt(
             )
 
             Text(
-                text = "Enter your OpenAI API key for this device. Litter will store it in the local Codex environment as OPENAI_API_KEY.",
+                text = "Enter your OpenAI API key for this device. Learnfold will store it in the local Codex environment as OPENAI_API_KEY.",
                 color = Color.White.copy(alpha = 0.78f),
                 fontSize = 12.sp,
                 lineHeight = 18.sp,

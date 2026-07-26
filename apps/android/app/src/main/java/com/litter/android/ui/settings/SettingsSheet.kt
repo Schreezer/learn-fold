@@ -213,7 +213,7 @@ private fun SettingsTopLevel(
         // ── Support ──
         item { SectionHeader("Support") }
         item {
-            NavRow(icon = Icons.Default.Pets, label = "Tip the Kitty", onClick = onOpenTipJar)
+            NavRow(icon = Icons.Default.Pets, label = "Support Learnfold", onClick = onOpenTipJar)
         }
 
         // ── Theme ──
@@ -1128,7 +1128,7 @@ private fun AppearanceScreen(onBack: () -> Unit) {
             }
             item {
                 Text(
-                    "Match the device setting, or keep Litter fixed in light or dark mode.",
+                    "Match the device setting, or keep Learnfold fixed in light or dark mode.",
                     color = LitterTheme.textMuted,
                     fontSize = 11.sp,
                     modifier = Modifier.padding(start = 4.dp),
