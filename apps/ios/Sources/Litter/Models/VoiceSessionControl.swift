@@ -3,7 +3,7 @@ import Foundation
 
 enum VoiceSessionControl {
     static let realtimeFeatureName = "realtime_conversation"
-    static let defaultPrompt = "You are Codex in a live voice conversation inside Litter. Keep responses short, spoken, and conversational. Avoid markdown and code formatting unless explicitly asked."
+    static let defaultPrompt = "You are Codex in a live voice conversation inside Learnfold. Keep responses short, spoken, and conversational. Avoid markdown and code formatting unless explicitly asked."
 
     /// Build a voice prompt that includes awareness of available servers.
     static func buildPrompt(remoteServers: [(name: String, hostname: String)]) -> String {
@@ -26,7 +26,7 @@ enum VoiceSessionControl {
 
     private static let appGroupSuite = LitterPalette.appGroupSuite
     private static let endRequestKey = "voice_session.end_request_token"
-    static let endRequestDarwinNotification = "com.sigkitten.litter.voice_session.end_request"
+    static let endRequestDarwinNotification = "com.chirag.learnfold.voice_session.end_request"
 
     static func requestEnd() {
         let token = UUID().uuidString

@@ -818,9 +818,13 @@ struct MessageBubbleView: View {
 
 // MARK: - Litter Markdown Themes
 
-private func litterContentTheme(bodySize: CGFloat, codeSize: CGFloat) -> MarkdownTheme {
+private func litterContentTheme(
+    bodySize: CGFloat,
+    codeSize: CGFloat,
+    fontFamilyOverride: FontFamilyOption?
+) -> MarkdownTheme {
     var theme = MarkdownTheme.default
-    theme.bodyFont = .custom(LitterFont.markdownFontName, size: bodySize)
+    theme.bodyFont = .custom(LitterFont.markdownFontName(for: fontFamilyOverride), size: bodySize)
     theme.bodyFontSize = bodySize
     theme.foregroundColor = LitterTheme.textBody
     theme.paragraphSpacing = 8
@@ -889,9 +893,13 @@ private func litterContentTheme(bodySize: CGFloat, codeSize: CGFloat) -> Markdow
     return theme
 }
 
-private func litterSystemTheme(bodySize: CGFloat, codeSize: CGFloat) -> MarkdownTheme {
+private func litterSystemTheme(
+    bodySize: CGFloat,
+    codeSize: CGFloat,
+    fontFamilyOverride: FontFamilyOption?
+) -> MarkdownTheme {
     var theme = MarkdownTheme.default
-    theme.bodyFont = .custom(LitterFont.markdownFontName, size: bodySize)
+    theme.bodyFont = .custom(LitterFont.markdownFontName(for: fontFamilyOverride), size: bodySize)
     theme.bodyFontSize = bodySize
     theme.foregroundColor = LitterTheme.textSystem
     theme.paragraphSpacing = 6
@@ -1133,6 +1141,7 @@ private func syncHighlighterTheme(for colorScheme: ColorScheme) {
 private struct ScaledContentMarkdownModifier: ViewModifier {
     @Environment(\.textScale) private var textScale
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.litterFontFamilyOverride) private var fontFamilyOverride
     let baseBodySize: CGFloat
     let baseCodeSize: CGFloat
     let selectionEnabled: Bool
@@ -1142,7 +1151,13 @@ private struct ScaledContentMarkdownModifier: ViewModifier {
         let scaledCode = baseCodeSize * textScale
         let _ = syncHighlighterTheme(for: colorScheme)
         let themed = content
-            .markdownTheme(litterContentTheme(bodySize: scaledBody, codeSize: scaledCode))
+            .markdownTheme(
+                litterContentTheme(
+                    bodySize: scaledBody,
+                    codeSize: scaledCode,
+                    fontFamilyOverride: fontFamilyOverride
+                )
+            )
             .codeSyntaxHighlighter(sharedHighlighter)
             .codeBlockRenderer(LitterCodeBlockRenderer())
         if selectionEnabled {
@@ -1156,6 +1171,7 @@ private struct ScaledContentMarkdownModifier: ViewModifier {
 private struct ScaledSystemMarkdownModifier: ViewModifier {
     @Environment(\.textScale) private var textScale
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.litterFontFamilyOverride) private var fontFamilyOverride
     let baseBodySize: CGFloat
     let baseCodeSize: CGFloat
     let selectionEnabled: Bool
@@ -1165,7 +1181,13 @@ private struct ScaledSystemMarkdownModifier: ViewModifier {
         let scaledCode = baseCodeSize * textScale
         let _ = syncHighlighterTheme(for: colorScheme)
         let themed = content
-            .markdownTheme(litterSystemTheme(bodySize: scaledBody, codeSize: scaledCode))
+            .markdownTheme(
+                litterSystemTheme(
+                    bodySize: scaledBody,
+                    codeSize: scaledCode,
+                    fontFamilyOverride: fontFamilyOverride
+                )
+            )
             .codeSyntaxHighlighter(sharedHighlighter)
             .codeBlockRenderer(LitterCodeBlockRenderer())
         if selectionEnabled {

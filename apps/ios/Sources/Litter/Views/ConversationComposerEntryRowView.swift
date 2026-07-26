@@ -107,7 +107,7 @@ struct ConversationComposerEntryRowView: View {
                     )
 
                     if inputText.isEmpty {
-                        Text("Message litter...")
+                        Text("Message Learnfold...")
                             .font(LitterFont.styled(size: 17))
                             .foregroundColor(LitterTheme.textMuted)
                             .padding(.leading, 16)

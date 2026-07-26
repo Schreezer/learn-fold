@@ -35,7 +35,7 @@ struct HomeScreen: View {
             }
             WatchEmptyState(
                 icon: store.isReachable ? "iphone.gen3" : "iphone.slash",
-                title: store.isReachable ? "syncing…" : "open litter on iphone",
+                title: store.isReachable ? "syncing…" : "open learnfold on iphone",
                 subtitle: store.isReachable ? nil : "the watch shows what the phone knows."
             )
         }

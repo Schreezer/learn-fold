@@ -8,7 +8,14 @@ struct CourseExperienceRootView: View {
 
     var body: some View {
         Group {
-            if store.setupComplete {
+            if !store.hasCompletedIntro {
+                LearnfoldIntroView {
+                    withAnimation(.easeInOut(duration: 0.28)) {
+                        store.completeIntro()
+                    }
+                }
+                .transition(.opacity)
+            } else if store.setupComplete {
                 NavigationStack(path: $store.navigationPath) {
                     CourseHomeView(
                         store: store,
@@ -41,6 +48,7 @@ struct CourseExperienceRootView: View {
                                     course: course,
                                     relativePath: relativePath,
                                     rootURL: rootURL,
+                                    store: store,
                                     onOpenRelativePath: { linkedPath in
                                         store.openCourseFile(courseID: courseID, relativePath: linkedPath)
                                     }
@@ -50,6 +58,20 @@ struct CourseExperienceRootView: View {
                                     "File unavailable",
                                     systemImage: "doc.questionmark",
                                     description: Text("This course’s files are no longer on this device.")
+                                )
+                            }
+                        case .coursePage(let courseID, let pageID):
+                            if let course = store.course(withID: courseID) {
+                                CoursePageEditorView(
+                                    course: course,
+                                    pageID: pageID,
+                                    store: store
+                                )
+                            } else {
+                                ContentUnavailableView(
+                                    "Page unavailable",
+                                    systemImage: "doc.questionmark",
+                                    description: Text("This course is no longer on this device.")
                                 )
                             }
                         }
@@ -62,6 +84,8 @@ struct CourseExperienceRootView: View {
         }
         .preferredColorScheme(.light)
         .task {
+            store.installDocumentToolRouterIfNeeded(appModel: appModel)
+            await store.recoverReadyCourses()
             if store.setupComplete, store.connectionState != .connected {
                 await store.connectLocalAgent(appModel: appModel, agentID: store.selectedAgentID ?? "codex")
             }
@@ -72,10 +96,15 @@ struct CourseExperienceRootView: View {
 private struct CourseAgentSetupView: View {
     @Environment(AppModel.self) private var appModel
     @Bindable var store: CourseExperienceStore
-    @State private var selectedAgent = "codex"
+    @State private var selectedAgent: String
     @State private var selectedModelID = ""
     @State private var showsOpenAICompatibleSetup = false
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
+
+    init(store: CourseExperienceStore) {
+        self.store = store
+        _selectedAgent = State(initialValue: store.preferredSetupAgentID)
+    }
 
     var body: some View {
         ZStack {
@@ -103,7 +132,7 @@ private struct CourseAgentSetupView: View {
                             .font(.system(size: 38, weight: .bold, design: .rounded))
                             .tracking(-1.1)
 
-                        Text("Your course workspace and source files stay on this device. Your selected agent securely sends requests to its model provider.")
+                        Text("Choose Apple On‑Device, Apple Private Cloud Compute, or Codex. Each course keeps the provider family it starts with.")
                             .font(.system(size: 18))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -180,12 +209,13 @@ private struct CourseAgentSetupView: View {
                             .background(.blue, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("course-agent-connect")
                         .disabled(
                             store.connectionState == .connecting
                                 || store.agentOptions.first(where: { $0.id == selectedAgent })?.available != true
                         )
 
-                        Label("Agents come from Litter’s runtime registry. Only runtimes installed on this iPhone can access its local course folders.", systemImage: "lock.shield")
+                        Label("Private Cloud Compute is preferred when Apple makes it available. On older iPhones, Codex remains available.", systemImage: "lock.shield")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -203,11 +233,21 @@ private struct CourseAgentSetupView: View {
             }
         }
         .task {
-            await store.prepareLocalAgentCatalog(appModel: appModel)
             selectedModelID = store.selectedModelID ?? ""
-            if store.agentOptions.first(where: { $0.id == selectedAgent })?.available != true,
-               let firstAvailable = store.agentOptions.first(where: \.available) {
-                selectedAgent = firstAvailable.id
+            if let saved = store.selectedAgentID,
+               store.agentOptions.first(where: { $0.id == saved })?.available == true {
+                selectedAgent = saved
+            } else {
+                selectedAgent = store.preferredSetupAgentID
+            }
+            if !CourseAgentProvider.isApple(selectedAgent) {
+                await store.prepareLocalAgentCatalog(appModel: appModel)
+            }
+        }
+        .onChange(of: selectedAgent) { _, agentID in
+            guard !CourseAgentProvider.isApple(agentID) else { return }
+            Task {
+                await store.prepareLocalAgentCatalog(appModel: appModel)
             }
         }
         .sheet(isPresented: $showsOpenAICompatibleSetup) {
@@ -354,6 +394,7 @@ private struct CourseAgentSettingsView: View {
     @State private var selectedEffort: String
     @State private var showsOpenAICompatibleSetup = false
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
+    @State private var cloudSyncAvailability: CourseCloudSyncAvailability = .missingEntitlement
 
     init(store: CourseExperienceStore, onOpenClassicLitter: @escaping () -> Void) {
         self.store = store
@@ -374,6 +415,25 @@ private struct CourseAgentSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    LabeledContent {
+                        Text(cloudSyncAvailability.label)
+                            .foregroundStyle(cloudSyncAvailability.tint)
+                    } label: {
+                        Label("Course iCloud Sync", systemImage: "icloud")
+                    }
+                    if cloudSyncAvailability.canRetry {
+                        Button("Retry iCloud Connection") {
+                            Task {
+                                await CourseCloudSyncEngine.shared.startIfAvailable()
+                                cloudSyncAvailability = await CourseCloudSyncEngine.shared.availability
+                            }
+                        }
+                    }
+                } footer: {
+                    Text(cloudSyncAvailability.explanation)
+                }
+
                 Section {
                     ForEach(store.agentOptions) { option in
                         Button {
@@ -405,10 +465,11 @@ private struct CourseAgentSettingsView: View {
                 } header: {
                     Text("Course agent")
                 } footer: {
-                    Text("Litter detects these runtimes dynamically. Claude, OpenCode, Pi, Amp, Droid, and future agents become selectable here when their local runtime is available.")
+                    Text("Learnfold detects these runtimes dynamically. Claude, OpenCode, Pi, Amp, Droid, and future agents become selectable here when their local runtime is available.")
                 }
 
-                Section("Model") {
+                if !CourseAgentProvider.isApple(selectedAgent) {
+                    Section("Model") {
                     if store.isLoadingAgentCatalog {
                         HStack {
                             ProgressView()
@@ -448,6 +509,7 @@ private struct CourseAgentSettingsView: View {
                             }
                         }
                     }
+                }
                 }
 
                 if let selectedModelInfo, !selectedModelInfo.supportedReasoningEfforts.isEmpty {
@@ -492,18 +554,18 @@ private struct CourseAgentSettingsView: View {
                     } header: {
                         Text("Custom provider")
                     } footer: {
-                        Text("Uses Litter’s existing local Codex runtime. Endpoint changes are app-wide and affect existing Codex conversations too.")
+                        Text("Uses Learnfold’s existing local Codex runtime. Endpoint changes are app-wide and affect existing Codex conversations too.")
                     }
                 }
 
                 Section {
-                    Text("This changes the default for new courses. Existing courses stay attached to the agent, model, and thread that created them.")
+                    Text("This changes the default for new courses. Existing Codex and Apple courses cannot cross provider families. An Apple course can switch between On‑Device and Private Cloud Compute from its chat.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Litter") {
-                    Button("Open Classic Litter", systemImage: "terminal") {
+                Section("Learnfold") {
+                    Button("Open Classic Learnfold", systemImage: "terminal") {
                         dismiss()
                         onOpenClassicLitter()
                     }
@@ -515,6 +577,9 @@ private struct CourseAgentSettingsView: View {
                             .foregroundStyle(.red)
                     }
                 }
+            }
+            .task {
+                cloudSyncAvailability = await CourseCloudSyncEngine.shared.availability
             }
             .navigationTitle("Course Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -552,6 +617,45 @@ private struct CourseAgentSettingsView: View {
                 }
                 .environment(appModel)
             }
+        }
+    }
+}
+
+private extension CourseCloudSyncAvailability {
+    var label: String {
+        switch self {
+        case .available: "Synced"
+        case .missingEntitlement: "On This Device"
+        case .noAccount: "Sign In Required"
+        case .failed: "Needs Attention"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .available:
+            "Generated courses and later edits are synced through your private iCloud database."
+        case .missingEntitlement:
+            "Courses remain on this device because the Learnfold iCloud container is not enabled in this build."
+        case .noAccount:
+            "Sign in to iCloud in Settings to sync generated courses."
+        case .failed(let message):
+            "Course sync paused without changing local data. \(message)"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .available: .green
+        case .missingEntitlement: .secondary
+        case .noAccount, .failed: .orange
+        }
+    }
+
+    var canRetry: Bool {
+        switch self {
+        case .noAccount, .failed: true
+        case .available, .missingEntitlement: false
         }
     }
 }
@@ -844,6 +948,7 @@ private struct CourseDetailView: View {
 
     @State private var selectedSection: CourseDetailSection
     @State private var workspaceSnapshot: CourseWorkspaceSnapshot?
+    @State private var documentOutline: CourseDocumentOutline?
     @State private var structureError: String?
     @State private var expandedLearningNodeIDs: Set<String> = []
 
@@ -873,7 +978,9 @@ private struct CourseDetailView: View {
 
     private var learningNodes: [CourseLearningNode] {
         let resolved: [CourseLearningNode]
-        if let loaded = store.courseBrief(for: course) {
+        if let documentOutline, !documentOutline.learningPages.isEmpty {
+            resolved = documentOutline.learningPages
+        } else if let loaded = store.courseBrief(for: course) {
             resolved = CourseLearningPathResolver.resolve(brief: loaded, snapshot: workspaceSnapshot)
         } else {
             resolved = chapters.map {
@@ -938,6 +1045,9 @@ private struct CourseDetailView: View {
         .navigationTitle("Course")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear(perform: refreshWorkspace)
+        .task(id: store.courseWorkspaceRefreshVersion) {
+            await refreshDocumentOutline()
+        }
         .onChange(of: store.courseWorkspaceRefreshVersion) { _, _ in
             refreshWorkspace()
         }
@@ -1002,8 +1112,8 @@ private struct CourseDetailView: View {
                 nodes: learningNodes,
                 expandedNodeIDs: $expandedLearningNodeIDs,
                 generationDisabled: isBackgroundGenerationActive,
-                onOpenMarkdown: { path in
-                    store.openCourseFile(courseID: course.id, relativePath: path)
+                onOpenMarkdown: { pageID in
+                    store.openCoursePage(courseID: course.id, pageID: pageID)
                 },
                 onGenerate: { node in
                     store.generateCourseNodeInBackground(
@@ -1033,14 +1143,29 @@ private struct CourseDetailView: View {
 
     @ViewBuilder
     private var structureSection: some View {
-        if let workspaceSnapshot {
-            CourseStructureBrowser(
-                snapshot: workspaceSnapshot,
-                recommendedFilePath: workspaceSnapshot.firstLessonPath,
-                onOpenFile: { node in
-                    store.openCourseFile(courseID: course.id, relativePath: node.relativePath)
+        if let documentOutline {
+            VStack(alignment: .leading, spacing: 24) {
+                CoursePageStructureBrowser(
+                    nodes: documentOutline.allPages,
+                    onOpenPage: { pageID in
+                        store.openCoursePage(courseID: course.id, pageID: pageID)
+                    }
+                )
+
+                if let workspaceSnapshot,
+                   workspaceSnapshot.nodes.contains(where: { $0.relativePath == "sources" || $0.relativePath == "assets" }) {
+                    Divider()
+                    Text("Source files and assets")
+                        .font(.system(size: 23, weight: .bold, design: .rounded))
+                    CourseStructureBrowser(
+                        snapshot: workspaceSnapshot,
+                        recommendedFilePath: nil,
+                        onOpenFile: { node in
+                            store.openCourseFile(courseID: course.id, relativePath: node.relativePath)
+                        }
+                    )
                 }
-            )
+            }
         } else if let structureError {
             ContentUnavailableView(
                 "Course structure unavailable",
@@ -1086,6 +1211,17 @@ private struct CourseDetailView: View {
             structureError = nil
         } catch {
             workspaceSnapshot = nil
+            structureError = error.localizedDescription
+        }
+    }
+
+    private func refreshDocumentOutline() async {
+        do {
+            let repository = try await store.documentRepository(for: course)
+            documentOutline = try await repository.outline()
+            structureError = nil
+        } catch {
+            documentOutline = nil
             structureError = error.localizedDescription
         }
     }
@@ -1144,6 +1280,8 @@ private struct CourseAgentChoiceRow: View {
         }
         .buttonStyle(.plain)
         .disabled(!available)
+        .accessibilityIdentifier("course-agent-option-\(id)")
+        .accessibilityValue(selected ? "Selected" : "Not selected")
     }
 
     @ViewBuilder
@@ -1333,8 +1471,8 @@ private struct CourseLearningTreeNodeView: View {
             }
         } else if node.kind == .markdown,
                   node.status == .generated,
-                  let relativePath = node.relativePath {
-            onOpenMarkdown(relativePath)
+                  let pageID = node.pageID {
+            onOpenMarkdown(pageID)
         }
     }
 }

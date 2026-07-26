@@ -295,7 +295,7 @@ struct SettingsView: View {
                     Image(systemName: "pawprint.fill")
                         .foregroundColor(LitterTheme.accent)
                         .frame(width: 20)
-                    Text("Tip the Kitty")
+                    Text("Support Learnfold")
                         .litterFont(.subheadline)
                         .foregroundColor(LitterTheme.textPrimary)
                 }

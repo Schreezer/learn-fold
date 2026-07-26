@@ -35,7 +35,7 @@ extension WCSession: WatchTransport {}
 final class WatchCompanionBridge: NSObject {
     static let shared = WatchCompanionBridge()
 
-    private static let appGroupSuite = "group.com.sigkitten.litter"
+    private static let appGroupSuite = "group.com.chirag.learnfold"
     private static let snapshotKey = "watch.snapshot.v1"
     private static let snapshotTimestampKey = "watch.snapshot.v1.timestamp"
     private static let complicationSnapshotKey = "complication.snapshot.v1"
@@ -56,6 +56,7 @@ final class WatchCompanionBridge: NSObject {
     private var lastPushedPayload: WatchSnapshotPayload?
     private var lastPushedComplication: Data?
     private var pushThrottle: Task<Void, Never>?
+    private var complicationRefreshTask: Task<Void, Never>?
     private var themeObserver: NSObjectProtocol?
     private var preferencesObserver: NSObjectProtocol?
     /// Request ids the bridge has already scheduled an approval push for.
@@ -126,6 +127,8 @@ final class WatchCompanionBridge: NSObject {
     }
 
     deinit {
+        pushThrottle?.cancel()
+        complicationRefreshTask?.cancel()
         if let themeObserver {
             NotificationCenter.default.removeObserver(themeObserver)
         }
@@ -167,16 +170,8 @@ final class WatchCompanionBridge: NSObject {
         }
 
         if complication != lastPushedComplication {
-            lastPushedComplication = complication
-            writeComplication(complication)
+            scheduleComplicationRefresh()
         }
-
-        // Per-server complication slices + server picker list. These power
-        // the watch face configuration intent (Task #7). They're cheap to
-        // compute and small, so just re-publish on every change rather
-        // than diffing — keeps the bridge state surface from growing.
-        writePerServerComplicationSnapshots()
-        writeServerListPayload()
 
         scheduleApprovalNotificationsIfNeeded()
     }
@@ -598,6 +593,28 @@ final class WatchCompanionBridge: NSObject {
             WidgetCenter.shared.reloadTimelines(ofKind: kind)
         }
         #endif
+    }
+
+    /// Streaming turns can mutate the canonical snapshot many times per
+    /// second. WidgetKit reloads and App Group writes are main-thread work, so
+    /// performing them for every token can starve the visible conversation.
+    /// Use a fixed-window throttle: each window publishes the newest snapshot
+    /// without postponing refresh indefinitely during a long stream.
+    private func scheduleComplicationRefresh() {
+        guard complicationRefreshTask == nil else { return }
+        complicationRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            guard !Task.isCancelled, let self else { return }
+
+            let complication = self.currentComplicationSnapshot()
+            if complication != self.lastPushedComplication {
+                self.lastPushedComplication = complication
+                self.writeComplication(complication)
+            }
+            self.writePerServerComplicationSnapshots()
+            self.writeServerListPayload()
+            self.complicationRefreshTask = nil
+        }
     }
 
     // MARK: - Inbound

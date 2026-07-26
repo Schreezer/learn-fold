@@ -46,7 +46,7 @@ enum ChatGPTOAuthError: LocalizedError {
         case .cancelled:
             return "ChatGPT login was cancelled."
         case .callbackTimedOut:
-            return "ChatGPT login timed out before returning to Litter."
+            return "ChatGPT login timed out before returning to Learnfold."
         case .missingRefreshToken:
             return "No ChatGPT refresh token is available."
         case .missingStoredTokens:
@@ -71,7 +71,7 @@ enum ChatGPTOAuthError: LocalizedError {
 final class ChatGPTOAuthTokenStore {
     static let shared = ChatGPTOAuthTokenStore()
 
-    private let service = "com.sigkitten.litter.chatgpt.tokens"
+    private let service = "com.chirag.learnfold.chatgpt.tokens"
     private let account = "default"
     private let accessibility = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
@@ -869,7 +869,7 @@ private final class ChatGPTOAuthLoopbackServer: @unchecked Sendable {
     private let port: UInt16
     private let path: String
     private let timeout: Duration
-    private let queue = DispatchQueue(label: "com.sigkitten.litter.chatgpt-oauth")
+    private let queue = DispatchQueue(label: "com.chirag.learnfold.chatgpt-oauth")
     private let stateLock = NSLock()
 
     private var listener: NWListener?
@@ -1038,7 +1038,7 @@ private final class ChatGPTOAuthLoopbackServer: @unchecked Sendable {
 
         sendResponse(
             statusLine: "HTTP/1.1 200 OK",
-            body: "<html><body><h3>Login complete</h3><p>You can return to Litter.</p></body></html>",
+            body: "<html><body><h3>Login complete</h3><p>You can return to Learnfold.</p></body></html>",
             on: connection
         )
         LLog.info("auth", "ChatGPT auth callback accepted", fields: [

@@ -38,7 +38,7 @@ enum OpenAICompatibleProviderConfiguration {
 final class OpenAIApiKeyStore {
     static let shared = OpenAIApiKeyStore()
 
-    private let service = "com.sigkitten.litter.openai-api-key"
+    private let service = "com.chirag.learnfold.openai-api-key"
     private let apiKeyAccount = "default"
     private let baseURLAccount = "openai-base-url"
     private let apiKeyEnvKey = "OPENAI_API_KEY"

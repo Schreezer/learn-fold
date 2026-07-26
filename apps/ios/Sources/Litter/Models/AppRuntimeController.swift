@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UIKit
 
 @MainActor
 @Observable
@@ -11,12 +12,23 @@ final class AppRuntimeController {
     @ObservationIgnored private let lifecycle = AppLifecycleController()
     @ObservationIgnored private let liveActivities = TurnLiveActivityController()
     @ObservationIgnored private let reachability = NetworkReachabilityObserver()
+    @ObservationIgnored private var continuedTurnBackground: (any ContinuedTurnBackgroundControlling)?
     @ObservationIgnored private var pendingLiveActivitySync = false
     @ObservationIgnored private var lastLiveActivitySyncTime: CFAbsoluteTime = 0
 
     func bind(appModel: AppModel, voiceRuntime: VoiceRuntimeController) {
         self.appModel = appModel
         self.voiceRuntime = voiceRuntime
+        if #available(iOS 26.0, *), continuedTurnBackground == nil {
+            continuedTurnBackground = ContinuedTurnBackgroundController(
+                snapshotProvider: { [weak self] in self?.appModel?.snapshot },
+                onExpiration: { [weak self] key in
+                    guard let self else { return }
+                    self.updateLiveActivityOwnership(snapshot: self.appModel?.snapshot)
+                    self.interruptTurnAfterBackgroundExpiration(key: key)
+                }
+            )
+        }
         lifecycle.requestNotificationPermissionIfNeeded()
         reachability.bind(appModel: appModel)
         reachability.start()
@@ -117,6 +129,9 @@ final class AppRuntimeController {
     }
 
     func handleSnapshot(_ snapshot: AppSnapshotRecord?) {
+        continuedTurnBackground?.handleSnapshot(snapshot)
+        updateLiveActivityOwnership(snapshot: snapshot)
+
         let now = CFAbsoluteTimeGetCurrent()
         let elapsed = now - lastLiveActivitySyncTime
         if elapsed >= 3.0 {
@@ -133,6 +148,31 @@ final class AppRuntimeController {
                 self.liveActivities.sync(self.appModel?.snapshot)
             }
         }
+    }
+
+    /// Called synchronously with the user action that starts a Codex turn.
+    /// This is intentionally separate from snapshot observation because iOS 26
+    /// only permits continued-processing requests that directly follow a
+    /// person's action.
+    func beginUserInitiatedTurn(key: ThreadKey, appModel: AppModel) -> UUID? {
+        guard self.appModel === appModel else { return nil }
+        guard UIApplication.shared.applicationState == .active else { return nil }
+        let title = appModel.threadSnapshot(for: key)?.displayTitle ?? "Codex task"
+        let token = continuedTurnBackground?.beginUserInitiatedTurn(key: key, title: title)
+        updateLiveActivityOwnership(snapshot: appModel.snapshot)
+        return token
+    }
+
+    func markUserInitiatedTurnAccepted(_ token: UUID?) {
+        guard let token else { return }
+        continuedTurnBackground?.markTurnAccepted(token)
+        updateLiveActivityOwnership(snapshot: appModel?.snapshot)
+    }
+
+    func markUserInitiatedTurnStartFailed(_ token: UUID?) {
+        guard let token else { return }
+        continuedTurnBackground?.markTurnStartFailed(token)
+        updateLiveActivityOwnership(snapshot: appModel?.snapshot)
     }
 
     func appDidEnterBackground() {
@@ -170,5 +210,38 @@ final class AppRuntimeController {
             liveActivities: liveActivities
         )
         LLog.info("push", "runtime finished background push")
+    }
+
+    private func updateLiveActivityOwnership(snapshot: AppSnapshotRecord?) {
+        liveActivities.setSystemContinuedProcessingActive(
+            continuedTurnBackground?.hasScheduledOrRunningTasks == true,
+            snapshot: snapshot
+        )
+    }
+
+    private func interruptTurnAfterBackgroundExpiration(key: ThreadKey) {
+        guard let appModel,
+              let turnID = appModel.threadSnapshot(for: key)?.activeTurnId?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !turnID.isEmpty else {
+            return
+        }
+
+        Task {
+            do {
+                _ = try await appModel.client.interruptTurn(
+                    serverId: key.serverId,
+                    params: AppInterruptTurnRequest(threadId: key.threadId, turnId: turnID)
+                )
+                await appModel.refreshThreadSnapshot(key: key)
+            } catch {
+                LLog.error(
+                    "background-turn",
+                    "failed to interrupt an expired continued-processing turn",
+                    error: error,
+                    fields: ["thread": "\(key.serverId)|\(key.threadId)"]
+                )
+            }
+        }
     }
 }

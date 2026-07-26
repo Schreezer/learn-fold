@@ -100,6 +100,9 @@ final class AppRuntimeController {
     }
 
     func handleSnapshot(_ snapshot: AppSnapshotRecord?) {}
+    func beginUserInitiatedTurn(key: ThreadKey, appModel: AppModel) -> UUID? { nil }
+    func markUserInitiatedTurnAccepted(_ token: UUID?) {}
+    func markUserInitiatedTurnStartFailed(_ token: UUID?) {}
     func appDidEnterBackground() {
         lastBackgroundedAt = Date()
     }

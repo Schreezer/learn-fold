@@ -4,10 +4,12 @@
 <dict>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>com.sigkitten.litter.turn-check</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).codex-turn.*</string>
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Learnfold</string>
 	<key>CFBundleIdentifier</key>
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleName</key>
@@ -18,7 +20,7 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>com.sigkitten.litter.auth</string>
+			<string>com.chirag.learnfold.auth</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>litterauth</string>
@@ -30,6 +32,8 @@
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LearnfoldCourseCloudSyncEnabled</key>
 	<false/>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
@@ -61,13 +65,13 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Codex discovers coding agents and SSH servers on your local network.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Litter uses the camera to capture photos for conversations.</string>
+	<string>Learnfold uses the camera to capture photos for conversations.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Litter uses the microphone for voice-to-text input.</string>
+	<string>Learnfold uses the microphone for voice-to-text input.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Litter uses Bluetooth to detect when your iPhone is near your paired Mac.</string>
+	<string>Learnfold uses Bluetooth to detect when your iPhone is near your paired Mac.</string>
 	<key>NSNearbyInteractionUsageDescription</key>
-	<string>Litter uses Nearby Interaction to confirm your iPhone and Mac are close before pairing.</string>
+	<string>Learnfold uses Nearby Interaction to confirm your iPhone and Mac are close before pairing.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>NSSupportsLiveActivitiesFrequentUpdates</key>

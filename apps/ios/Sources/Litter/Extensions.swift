@@ -136,7 +136,11 @@ enum LitterFont {
     }
 
     static var markdownFontName: String {
-        switch storedFamily {
+        markdownFontName(for: nil)
+    }
+
+    static func markdownFontName(for familyOverride: FontFamilyOption?) -> String {
+        switch familyOverride ?? storedFamily {
         case .mono:
             return preferredMonoFontName(weight: .regular) ?? "SFMono-Regular"
         case .system:
@@ -147,14 +151,20 @@ enum LitterFont {
     static func styled(
         _ style: Font.TextStyle,
         weight: Font.Weight = .regular,
-        scale: CGFloat = 1.0
+        scale: CGFloat = 1.0,
+        familyOverride: FontFamilyOption? = nil
     ) -> Font {
         let pointSize = UIFont.preferredFont(forTextStyle: style.uiTextStyle).pointSize * scale
-        return styled(size: pointSize, weight: weight, relativeTo: style)
+        return styled(size: pointSize, weight: weight, relativeTo: style, familyOverride: familyOverride)
     }
 
-    static func styled(size: CGFloat, weight: Font.Weight = .regular, scale: CGFloat = 1.0) -> Font {
-        styled(size: size * scale, weight: weight, relativeTo: nil)
+    static func styled(
+        size: CGFloat,
+        weight: Font.Weight = .regular,
+        scale: CGFloat = 1.0,
+        familyOverride: FontFamilyOption? = nil
+    ) -> Font {
+        styled(size: size * scale, weight: weight, relativeTo: nil, familyOverride: familyOverride)
     }
 
     static func monospaced(
@@ -170,8 +180,13 @@ enum LitterFont {
         monoFont(size: size * scale, weight: weight, relativeTo: nil)
     }
 
-    private static func styled(size: CGFloat, weight: Font.Weight, relativeTo style: Font.TextStyle?) -> Font {
-        if storedFamily.isMono {
+    private static func styled(
+        size: CGFloat,
+        weight: Font.Weight,
+        relativeTo style: Font.TextStyle?,
+        familyOverride: FontFamilyOption?
+    ) -> Font {
+        if (familyOverride ?? storedFamily).isMono {
             return monoFont(size: size, weight: weight, relativeTo: style)
         }
         return .system(size: size, weight: weight)
@@ -275,16 +290,29 @@ private struct TextScaleKey: EnvironmentKey {
     static let defaultValue: CGFloat = 1.0
 }
 
+private struct LitterFontFamilyOverrideKey: EnvironmentKey {
+    static let defaultValue: FontFamilyOption? = nil
+}
+
 extension EnvironmentValues {
     var textScale: CGFloat {
         get { self[TextScaleKey.self] }
         set { self[TextScaleKey.self] = newValue }
+    }
+
+    var litterFontFamilyOverride: FontFamilyOption? {
+        get { self[LitterFontFamilyOverrideKey.self] }
+        set { self[LitterFontFamilyOverrideKey.self] = newValue }
     }
 }
 
 // MARK: - Auto-Scaling Font View Modifiers
 
 extension View {
+    func litterFontFamily(_ family: FontFamilyOption?) -> some View {
+        environment(\.litterFontFamilyOverride, family)
+    }
+
     func litterFont(size: CGFloat, weight: Font.Weight = .regular) -> some View {
         modifier(ScaledSizeFontModifier(size: size, weight: weight))
     }
@@ -300,21 +328,37 @@ extension View {
 
 private struct ScaledSizeFontModifier: ViewModifier {
     @Environment(\.textScale) private var textScale
+    @Environment(\.litterFontFamilyOverride) private var fontFamilyOverride
     let size: CGFloat
     let weight: Font.Weight
 
     func body(content: Content) -> some View {
-        content.font(LitterFont.styled(size: size, weight: weight, scale: textScale))
+        content.font(
+            LitterFont.styled(
+                size: size,
+                weight: weight,
+                scale: textScale,
+                familyOverride: fontFamilyOverride
+            )
+        )
     }
 }
 
 private struct ScaledStyleFontModifier: ViewModifier {
     @Environment(\.textScale) private var textScale
+    @Environment(\.litterFontFamilyOverride) private var fontFamilyOverride
     let style: Font.TextStyle
     let weight: Font.Weight
 
     func body(content: Content) -> some View {
-        content.font(LitterFont.styled(style, weight: weight, scale: textScale))
+        content.font(
+            LitterFont.styled(
+                style,
+                weight: weight,
+                scale: textScale,
+                familyOverride: fontFamilyOverride
+            )
+        )
     }
 }
 

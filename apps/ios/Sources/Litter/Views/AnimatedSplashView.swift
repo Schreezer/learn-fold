@@ -25,6 +25,10 @@ struct AnimatedSplashView: View {
     // ~12 Color structs per frame. At 120Hz that's several thousand Color
     // allocations per second across all kittens.
     private enum Palette {
+        static let learnfoldIndigo = Color(red: 0.294, green: 0.235, blue: 0.941)
+        static let learnfoldIndigoDeep = Color(red: 0.122, green: 0.102, blue: 0.420)
+        static let learnfoldChartreuse = Color(red: 0.843, green: 1.000, blue: 0.271)
+        static let learnfoldPaper = Color(red: 1.000, green: 0.976, blue: 0.910)
         static let leftGray     = Color(red: 0.898, green: 0.906, blue: 0.922)
         static let leftInk      = Color(red: 0.122, green: 0.161, blue: 0.216)
         static let leftWhisker  = Color(red: 0.753, green: 0.769, blue: 0.792)
@@ -41,39 +45,81 @@ struct AnimatedSplashView: View {
     }
 
     var body: some View {
-        ZStack {
-            if !compact {
-                LitterTheme.backgroundGradient.ignoresSafeArea()
-            }
+        GeometryReader { geometry in
+            ZStack {
+                if !compact {
+                    LinearGradient(
+                        colors: [Palette.learnfoldIndigo, Palette.learnfoldIndigoDeep],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .ignoresSafeArea()
 
-            TimelineView(.periodic(from: startDate, by: Self.frameInterval)) { timeline in
-                let t = timeline.date.timeIntervalSince(startDate)
+                    Circle()
+                        .fill(Palette.learnfoldChartreuse.opacity(0.13))
+                        .frame(width: geometry.size.width * 1.15)
+                        .blur(radius: 70)
+                        .offset(x: geometry.size.width * 0.34, y: geometry.size.height * 0.36)
+                }
 
-                Canvas { context, size in
-                    let factor: CGFloat = compact ? 1.0 : 0.55
-                    let s = min(size.width, size.height) * factor
-                    let scale = s / 500
-                    let ox = (size.width - s) / 2
-                    let oy = compact ? (size.height - s) / 2 : (size.height - s) / 2 - size.height * 0.05
-                    let anim = KittenAnimState(t: t, amplified: compact)
+                TimelineView(.periodic(from: startDate, by: Self.frameInterval)) { timeline in
+                    let t = timeline.date.timeIntervalSince(startDate)
+                    let pulse = 1 + CGFloat(sin(t * 2.4)) * (compact ? 0.025 : 0.012)
+                    let rise = CGFloat(sin(t * 1.7)) * (compact ? 0.8 : 2.5)
 
-                    drawLeftKitten(context: context, scale: scale, ox: ox, oy: oy, anim: anim)
-                    drawRightKitten(context: context, scale: scale, ox: ox, oy: oy, anim: anim)
-                    drawCenterKitten(context: context, scale: scale, ox: ox, oy: oy, anim: anim)
-                    drawBox(context: context, scale: scale, ox: ox, oy: oy)
-                    drawPaws(context: context, scale: scale, ox: ox, oy: oy)
+                    if compact {
+                        Image("brand_logo")
+                            .resizable()
+                            .scaledToFit()
+                            .scaleEffect(pulse)
+                            .offset(y: rise)
+                    } else {
+                        VStack(spacing: 0) {
+                            Spacer()
+
+                            Image("brand_logo")
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: min(geometry.size.width * 0.64, 260))
+                                .scaleEffect(pulse)
+                                // The mark's visible pixels sit slightly right of the
+                                // square asset's center, so center it optically with
+                                // the wordmark and tagline below.
+                                .offset(x: -8, y: rise)
+                                .shadow(color: Palette.learnfoldChartreuse.opacity(0.22), radius: 24)
+
+                            Text("Learnfold")
+                                .font(.system(size: 36, weight: .bold, design: .rounded))
+                                .tracking(-1.1)
+                                .foregroundStyle(Palette.learnfoldPaper)
+                                .padding(.top, 18)
+
+                            Text("Turn anything into a course.")
+                                .font(.system(size: 15, weight: .medium, design: .rounded))
+                                .foregroundStyle(Palette.learnfoldPaper.opacity(0.74))
+                                .padding(.top, 9)
+
+                            Capsule()
+                                .fill(Palette.learnfoldChartreuse)
+                                .frame(width: 34, height: 4)
+                                .padding(.top, 24)
+
+                            Spacer()
+                            Spacer()
+                                .frame(height: 36)
+                        }
+                    }
                 }
             }
-
-            if !compact {
-                VStack {
-                    Spacer()
-                    SplashCarouselText()
-                        .padding(.bottom, 80)
-                }
-            }
+            // Keep oversized decorative elements (the 115%-wide glow above)
+            // from expanding the ZStack's layout bounds and shifting the
+            // foreground content away from the physical screen center.
+            .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .onAppear { startDate = .now }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(compact ? "" : "Learnfold. Turn anything into a course.")
+        .accessibilityHidden(compact)
     }
 
     // MARK: - All animation state computed from elapsed time

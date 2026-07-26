@@ -6,6 +6,129 @@ final class LitterUITests: XCTestCase {
     }
 
     @MainActor
+    func testFirstLaunchIntroContinuesToCourseAgentSetup() throws {
+        let app = appleCourseSetupApp(onDeviceAvailable: true, privateCloudAvailable: true)
+        app.launch()
+
+        XCTAssertTrue(
+            app.staticTexts["learnfold-intro-title"].waitForExistence(timeout: 15)
+        )
+        XCTAssertTrue(app.staticTexts["Start with anything"].exists)
+
+        let continueButton = app.buttons["learnfold-intro-continue"]
+        XCTAssertTrue(
+            waitUntilHittable(continueButton, timeout: 10),
+            "Intro CTA remained covered or outside the tappable viewport"
+        )
+        attachScreenshot(named: "Learnfold first launch intro", app: app)
+        continueButton.tap()
+
+        XCTAssertTrue(app.staticTexts["Choose your course agent"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.staticTexts["learnfold-intro-title"].exists)
+        attachScreenshot(named: "Learnfold course agent setup after intro", app: app)
+    }
+
+    @MainActor
+    func testCourseAgentSetupDefaultsToPrivateCloudAndKeepsAppleThreadInAppleFamily() throws {
+        let app = appleCourseSetupApp(onDeviceAvailable: true, privateCloudAvailable: true)
+        app.launch()
+
+        continuePastIntroIfNeeded(in: app)
+        XCTAssertTrue(
+            app.staticTexts["Choose your course agent"].waitForExistence(timeout: 15)
+        )
+        let privateCloud = identifiedElement(
+            "course-agent-option-apple-private-cloud",
+            in: app
+        )
+        XCTAssertTrue(privateCloud.exists)
+        XCTAssertTrue(privateCloud.isEnabled)
+        XCTAssertEqual(privateCloud.value as? String, "Selected")
+
+        let connect = identifiedElement("course-agent-connect", in: app)
+        XCTAssertTrue(scrollUntilHittable(connect, in: app))
+        XCTAssertEqual(connect.label, "Connect Apple Private Cloud")
+        connect.tap()
+
+        XCTAssertTrue(app.staticTexts["My Courses"].waitForExistence(timeout: 8))
+        let newCourse = identifiedElement("new-course-button", in: app)
+        XCTAssertTrue(newCourse.waitForExistence(timeout: 5))
+        newCourse.tap()
+
+        XCTAssertTrue(
+            app.staticTexts
+                .matching(
+                    NSPredicate(
+                        format: "label CONTAINS %@",
+                        "Your Apple course agent can answer questions"
+                    )
+                )
+                .firstMatch
+                .waitForExistence(timeout: 8)
+        )
+        let providerSwitch = identifiedElement("course-chat-apple-provider-switch", in: app)
+        XCTAssertTrue(providerSwitch.waitForExistence(timeout: 5))
+        // SwiftUI combines the model menu and adjacent status icon into one
+        // toolbar accessibility container. Target the menu side of that
+        // container, whose own identifier remains stable.
+        providerSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
+        let privateCloudAction = elementLabeled("Private Cloud Compute", in: app)
+        let onDeviceAction = elementLabeled("On‑Device", in: app)
+        XCTAssertTrue(privateCloudAction.waitForExistence(timeout: 3))
+        XCTAssertTrue(onDeviceAction.exists)
+        XCTAssertFalse(elementLabeled("Codex", in: app).exists)
+        onDeviceAction.tap()
+        XCTAssertTrue(
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "label == %@", "Apple On-Device connected"))
+                .firstMatch
+                .waitForExistence(timeout: 5)
+        )
+
+        let sourceMenu = identifiedElement("course-chat-add-source", in: app)
+        XCTAssertTrue(sourceMenu.waitForExistence(timeout: 3))
+        sourceMenu.tap()
+        XCTAssertTrue(app.buttons["Paste Link"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["Photo"].exists)
+        XCTAssertFalse(app.buttons["File"].exists)
+        attachScreenshot(named: "Apple course switched to on-device with link-only sources", app: app)
+    }
+
+    @MainActor
+    func testCourseAgentSetupFallsBackToCodexWhenAppleModelsAreUnavailable() throws {
+        let app = appleCourseSetupApp(onDeviceAvailable: false, privateCloudAvailable: false)
+        app.launch()
+
+        continuePastIntroIfNeeded(in: app)
+        XCTAssertTrue(
+            app.staticTexts["Choose your course agent"].waitForExistence(timeout: 15)
+        )
+        let privateCloud = identifiedElement(
+            "course-agent-option-apple-private-cloud",
+            in: app
+        )
+        let onDevice = identifiedElement(
+            "course-agent-option-apple-on-device",
+            in: app
+        )
+        let codex = identifiedElement(
+            "course-agent-option-codex",
+            in: app
+        )
+        XCTAssertTrue(privateCloud.exists)
+        XCTAssertFalse(privateCloud.isEnabled)
+        XCTAssertTrue(onDevice.exists)
+        XCTAssertFalse(onDevice.isEnabled)
+        XCTAssertTrue(codex.isEnabled)
+        XCTAssertEqual(codex.value as? String, "Selected")
+
+        let connect = identifiedElement("course-agent-connect", in: app)
+        XCTAssertTrue(scrollUntilHittable(connect, in: app))
+        XCTAssertEqual(connect.label, "Connect Codex")
+        attachScreenshot(named: "Codex-only course setup on unsupported device", app: app)
+    }
+
+    @MainActor
     func testConversationDisplaySettingsRowsAreReachable() throws {
         let app = conversationDisplayHarnessApp()
         app.launch()
@@ -356,6 +479,33 @@ final class LitterUITests: XCTestCase {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
     }
 
+    private func elementLabeled(_ label: String, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", label))
+            .firstMatch
+    }
+
+    private func scrollUntilHittable(
+        _ element: XCUIElement,
+        in app: XCUIApplication,
+        attempts: Int = 6
+    ) -> Bool {
+        for _ in 0..<attempts {
+            if element.exists && element.isHittable {
+                return true
+            }
+            app.swipeUp()
+        }
+        return element.exists && element.isHittable
+    }
+
+    private func attachScreenshot(named name: String, app: XCUIApplication) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     private func codexDiscoveryRows(in app: XCUIApplication) -> XCUIElementQuery {
         app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "discovery.server.codex."))
     }
@@ -376,6 +526,37 @@ final class LitterUITests: XCTestCase {
         app.launchEnvironment["CODEXIOS_UI_TEST_COMMAND_MODE"] = commands
         app.launchEnvironment["CODEXIOS_UI_TEST_TOOL_MODE"] = tools
         return app
+    }
+
+    private func appleCourseSetupApp(
+        onDeviceAvailable: Bool,
+        privateCloudAvailable: Bool
+    ) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchEnvironment["SNAPPY_RESET_ONBOARDING"] = "1"
+        app.launchEnvironment["SNAPPY_APPLE_ON_DEVICE_AVAILABLE"] = onDeviceAvailable ? "1" : "0"
+        app.launchEnvironment["SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE"] =
+            privateCloudAvailable ? "1" : "0"
+        return app
+    }
+
+    private func continuePastIntroIfNeeded(in app: XCUIApplication) {
+        let continueButton = app.buttons["learnfold-intro-continue"]
+        if continueButton.waitForExistence(timeout: 4),
+           waitUntilHittable(continueButton, timeout: 10) {
+            continueButton.tap()
+        }
+    }
+
+    private func waitUntilHittable(
+        _ element: XCUIElement,
+        timeout: TimeInterval
+    ) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"),
+            object: element
+        )
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
     private func findStaticText(_ label: String, in app: XCUIApplication) -> Bool {

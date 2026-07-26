@@ -1,6 +1,118 @@
-import RemodexTextKit
 import SwiftUI
 import UIKit
+
+struct CoursePageStructureBrowser: View {
+    let nodes: [CourseLearningNode]
+    let onOpenPage: (String) -> Void
+
+    @State private var expandedNodeIDs: Set<String> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Course structure")
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                Text("Every lesson and note is an editable page")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(spacing: 0) {
+                ForEach(nodes) { node in
+                    CoursePageStructureNode(
+                        node: node,
+                        depth: 0,
+                        expandedNodeIDs: $expandedNodeIDs,
+                        onOpenPage: onOpenPage
+                    )
+                }
+            }
+            .background(.background, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        }
+        .onAppear {
+            if expandedNodeIDs.isEmpty {
+                expandedNodeIDs = Set(nodes.filter { !$0.children.isEmpty }.map(\.id))
+            }
+        }
+    }
+}
+
+private struct CoursePageStructureNode: View {
+    let node: CourseLearningNode
+    let depth: Int
+    @Binding var expandedNodeIDs: Set<String>
+    let onOpenPage: (String) -> Void
+
+    private var isExpanded: Bool { expandedNodeIDs.contains(node.id) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Button {
+                    guard !node.children.isEmpty else { return }
+                    withAnimation(.snappy(duration: 0.22)) {
+                        if isExpanded { expandedNodeIDs.remove(node.id) }
+                        else { expandedNodeIDs.insert(node.id) }
+                    }
+                } label: {
+                    Image(systemName: node.children.isEmpty ? "doc.text.fill" : (isExpanded ? "chevron.down" : "chevron.right"))
+                        .font(node.children.isEmpty ? .body : .caption.weight(.bold))
+                        .foregroundStyle(node.status == .pendingGeneration ? Color.secondary : Color.blue)
+                        .frame(width: 24, height: 40)
+                }
+                .buttonStyle(.plain)
+                .disabled(node.children.isEmpty)
+
+                Button {
+                    if let pageID = node.pageID { onOpenPage(pageID) }
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(node.title)
+                                .font(.system(size: 15, weight: depth == 0 ? .semibold : .medium))
+                                .foregroundStyle(.primary)
+                            Text(statusLabel)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "square.and.pencil")
+                            .font(.subheadline)
+                            .foregroundStyle(.blue)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.leading, CGFloat(depth) * 22 + 10)
+            .padding(.trailing, 12)
+            .padding(.vertical, 8)
+
+            if isExpanded {
+                ForEach(node.children) { child in
+                    CoursePageStructureNode(
+                        node: child,
+                        depth: depth + 1,
+                        expandedNodeIDs: $expandedNodeIDs,
+                        onOpenPage: onOpenPage
+                    )
+                }
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Divider().padding(.leading, CGFloat(depth) * 22 + 44)
+        }
+    }
+
+    private var statusLabel: String {
+        switch node.status {
+        case .pendingGeneration: "Pending generation"
+        case .generating: "Generating"
+        case .partiallyGenerated: "Partially generated"
+        case .generated: "Editable page"
+        }
+    }
+}
 
 struct CourseStructureBrowser: View {
     let snapshot: CourseWorkspaceSnapshot
@@ -226,6 +338,7 @@ struct CourseFileViewerView: View {
     let course: LearningCourse
     let relativePath: String
     let rootURL: URL
+    @Bindable var store: CourseExperienceStore
     let onOpenRelativePath: (String) -> Void
 
     @State private var loadState: LoadState = .loading
@@ -247,10 +360,10 @@ struct CourseFileViewerView: View {
             case .text(let text):
                 if isMarkdown {
                     ScrollView {
-                        CourseMarkdownDocumentView(
-                            markdown: text,
-                            baseURL: fileURL?.deletingLastPathComponent()
-                        )
+                        Text(text)
+                            .font(.body)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 20)
                         .padding(.top, 22)
                         .padding(.bottom, 44)
@@ -310,6 +423,9 @@ struct CourseFileViewerView: View {
         .task(id: relativePath) {
             loadFile()
         }
+        .onChange(of: store.courseWorkspaceRefreshVersion) { _, _ in
+            loadFile()
+        }
     }
 
     private var isMarkdown: Bool {
@@ -340,30 +456,5 @@ struct CourseFileViewerView: View {
             loadState = .failed(error.localizedDescription)
         }
     }
-}
 
-struct CourseMarkdownDocumentView: View {
-    let markdown: String
-    let baseURL: URL?
-
-    var body: some View {
-        StructuredText(markdown, parser: CourseMarkdownRenderer.parser(baseURL: baseURL))
-            .font(.system(size: 17, weight: .regular, design: .default))
-            .remodex.structuredTextStyle(.default)
-            .remodex.overflowMode(.scroll)
-            .remodex.textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .fixedSize(horizontal: false, vertical: true)
-    }
-}
-
-@MainActor
-enum CourseMarkdownRenderer {
-    static func parser(baseURL: URL? = nil) -> AttributedStringMarkdownParser {
-        .markdown(baseURL: baseURL)
-    }
-
-    static func attributedString(markdown: String, baseURL: URL? = nil) throws -> AttributedString {
-        try parser(baseURL: baseURL).attributedString(for: markdown)
-    }
 }

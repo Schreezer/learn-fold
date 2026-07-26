@@ -1,15 +1,6 @@
 {
-  "originHash" : "2a5206d30e4c6381978902d35cd17118204f8ca1a06dcc98daf90f55740ed7f9",
+  "originHash" : "71c64104fe0562c52c06ae705d23990feccbbd16bdfc37b7e31f8081025e03da",
   "pins" : [
-    {
-      "identity" : "hairball",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/dnakov/hairball.git",
-      "state" : {
-        "branch" : "main",
-        "revision" : "42d52f5a5aa788b49b02f96c682949478cf01e91"
-      }
-    },
     {
       "identity" : "highlightr",
       "kind" : "remoteSourceControl",
@@ -29,30 +20,12 @@
       }
     },
     {
-      "identity" : "remodextextkit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/Emanuele-web04/RemodexTextKit.git",
-      "state" : {
-        "revision" : "57c580f0c7cb8cb4fc2e73b5a841f85303235979",
-        "version" : "0.4.2"
-      }
-    },
-    {
       "identity" : "swift-cmark",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/swiftlang/swift-cmark.git",
       "state" : {
         "revision" : "5d9bdaa4228b381639fff09403e39a04926e2dbe",
         "version" : "0.7.1"
-      }
-    },
-    {
-      "identity" : "swift-concurrency-extras",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/pointfreeco/swift-concurrency-extras",
-      "state" : {
-        "revision" : "a90e2e40a7a840a853dd29e57cbef5dbb72c9d5b",
-        "version" : "1.4.0"
       }
     },
     {
@@ -71,15 +44,6 @@
       "state" : {
         "revision" : "fa8244ed032f4a1ade4cb0571bf87d2f1a9fd2d7",
         "version" : "1.7.3"
-      }
-    },
-    {
-      "identity" : "swiftui-math",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/gonzalezreal/swiftui-math",
-      "state" : {
-        "revision" : "0b5c2cfaaec8d6193db206f675048eeb5ce95f71",
-        "version" : "0.1.0"
       }
     },
     {

@@ -10,35 +10,223 @@ enum CourseChatTimelinePolicy {
         hasLiveThread ? [] : messages
     }
 
+    static func projectLiveItems(
+        _ items: [ConversationItem],
+        hidesSelectionEnvelope: Bool = false
+    ) -> [ConversationItem] {
+        items.compactMap {
+            projectLiveItem($0, hidesSelectionEnvelope: hidesSelectionEnvelope)
+        }
+    }
+
     static func isAgentWorking(requestPending: Bool, threadHasActiveTurn: Bool) -> Bool {
         requestPending || threadHasActiveTurn
+    }
+
+    private static func projectLiveItem(
+        _ item: ConversationItem,
+        hidesSelectionEnvelope: Bool
+    ) -> ConversationItem? {
+        switch item.content {
+        case .mcpToolCall(let data) where isInternalCourseServer(data.server):
+            return data.status == .failed
+                ? learnerFacingFailure(for: item, tool: data.tool)
+                : nil
+        case .dynamicToolCall(let data) where isInternalCourseDynamicTool(data):
+            return data.status == .failed
+                ? learnerFacingFailure(for: item, tool: data.tool)
+                : nil
+        case .user(let data) where hidesSelectionEnvelope:
+            guard let question = selectionQuestion(from: data.text) else { return item }
+            return ConversationItem(
+                id: item.id,
+                content: .user(ConversationUserMessageData(text: question, images: data.images)),
+                sourceTurnId: item.sourceTurnId,
+                sourceTurnIndex: item.sourceTurnIndex,
+                timestamp: item.timestamp,
+                isFromUserTurnBoundary: item.isFromUserTurnBoundary
+            )
+        default:
+            return item
+        }
+    }
+
+    static func selectionQuestion(from prompt: String) -> String? {
+        guard prompt.contains("<selected_course_passage"),
+              let marker = prompt.range(of: "\nMy question: ") else { return nil }
+        let question = prompt[marker.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return question.isEmpty ? nil : question
+    }
+
+    private static func isInternalCourseServer(_ server: String) -> Bool {
+        server == CourseAgentTools.mcpServerName ||
+            server == CourseAgentTools.mcpDirectNamespace
+    }
+
+    private static func isInternalCourseDynamicTool(
+        _ data: ConversationDynamicToolCallData
+    ) -> Bool {
+        if data.tool == CourseAgentTools.presentPlan ||
+            CourseAgentTools.isEditorTool(data.tool) {
+            return true
+        }
+
+        if let namespace = data.namespace,
+           namespace == CourseAgentTools.mcpServerName ||
+               namespace == CourseAgentTools.mcpDirectNamespace {
+            return true
+        }
+
+        return data.tool.hasPrefix("\(CourseAgentTools.mcpDirectNamespace)__")
+    }
+
+    private static func learnerFacingFailure(
+        for item: ConversationItem,
+        tool: String
+    ) -> ConversationItem {
+        let message = tool == CourseAgentTools.presentPlan
+            ? "The course plan couldn’t be prepared. Please try again."
+            : "The course couldn’t be updated. Please try again."
+
+        return ConversationItem(
+            id: item.id,
+            content: .error(
+                ConversationSystemErrorData(
+                    title: "Course action failed",
+                    message: message,
+                    details: nil
+                )
+            ),
+            sourceTurnId: item.sourceTurnId,
+            sourceTurnIndex: item.sourceTurnIndex,
+            timestamp: item.timestamp,
+            isFromUserTurnBoundary: item.isFromUserTurnBoundary
+        )
+    }
+}
+
+enum CourseChatScrollPolicy {
+    static let nearBottomDistance: CGFloat = 12
+
+    static func shouldFollow(
+        autoFollowEnabled: Bool,
+        userIsDragging: Bool
+    ) -> Bool {
+        autoFollowEnabled && !userIsDragging
+    }
+
+    static func updatedAutoFollow(
+        currentValue: Bool,
+        distanceFromBottom: CGFloat,
+        userIsDragging: Bool,
+        isAgentWorking: Bool
+    ) -> Bool {
+        if distanceFromBottom <= nearBottomDistance {
+            return true
+        }
+        if userIsDragging && isAgentWorking {
+            return false
+        }
+        return currentValue
+    }
+}
+
+enum CourseChatAuthPolicy {
+    static func needsSignIn(
+        isCodex: Bool,
+        requiresOpenAIAuth: Bool,
+        hasAccount: Bool,
+        explicitlyRequired: Bool
+    ) -> Bool {
+        isCodex && (explicitlyRequired || (requiresOpenAIAuth && !hasAccount))
+    }
+
+    static func isReady(
+        isCodex: Bool,
+        transportConnected: Bool,
+        requiresOpenAIAuth: Bool,
+        hasAccount: Bool
+    ) -> Bool {
+        guard transportConnected else { return false }
+        return !isCodex || !requiresOpenAIAuth || hasAccount
     }
 }
 
 struct CourseChatView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(AppState.self) private var appState
+    @Environment(\.dismiss) private var dismiss
     @Bindable var store: CourseExperienceStore
+    let selectionContext: CourseTextReference?
+    let selectionDiscussionID: UUID?
+    let showsDismissButton: Bool
     @State private var inputText = ""
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var showsFileImporter = false
     @State private var attachmentError: String?
+    @State private var hasSentSelectionContext = false
+    @State private var isNearBottom = true
+    @State private var autoFollowStreaming = true
+    @State private var userIsDraggingScroll = false
+    @State private var followScrollScheduled = false
+    @State private var isResolvingDiscussion = false
+    @State private var resolveError: String?
     @FocusState private var composerFocused: Bool
 
+    init(
+        store: CourseExperienceStore,
+        selectionContext: CourseTextReference? = nil,
+        selectionDiscussionID: UUID? = nil,
+        showsDismissButton: Bool = false
+    ) {
+        self.store = store
+        self.selectionContext = selectionContext
+        self.selectionDiscussionID = selectionDiscussionID
+        self.showsDismissButton = showsDismissButton
+    }
+
+    private var activeThreadKey: ThreadKey? {
+        if let selectionDiscussionID {
+            return store.selectionDiscussionThreadKey(id: selectionDiscussionID)
+        }
+        return store.agentThreadKey
+    }
+
     private var liveThread: AppThreadSnapshot? {
-        guard let key = store.agentThreadKey else { return nil }
+        guard let key = activeThreadKey else { return nil }
         return appModel.threadSnapshot(for: key)
     }
 
     private var liveConversationItems: [ConversationItem] {
-        liveThread?.hydratedConversationItems.map(\.conversationItem) ?? []
+        CourseChatTimelinePolicy.projectLiveItems(
+            liveThread?.hydratedConversationItems.map(\.conversationItem) ?? [],
+            hidesSelectionEnvelope: selectionDiscussionID != nil
+        )
     }
 
     private var localMessages: [CourseChatMessage] {
         CourseChatTimelinePolicy.localMessages(
-            store.messages,
-            hasLiveThread: liveThread != nil
+            store.localMessages(for: selectionDiscussionID),
+            hasLiveThread: !liveConversationItems.isEmpty
         )
+    }
+
+    private var localStreamingTextLength: Int {
+        localMessages.last(where: { $0.role == .agent })?.text.utf16.count ?? 0
+    }
+
+    private var isPreparingSelectionDiscussion: Bool {
+        selectionDiscussionID.map {
+            store.preparingSelectionDiscussionIDs.contains($0)
+        } ?? false
+    }
+
+    private var displayedAgentError: String? {
+        if let selectionDiscussionID {
+            return store.selectionDiscussionErrors[selectionDiscussionID]
+        }
+        return store.agentError
     }
 
     private var isAgentWorking: Bool {
@@ -48,14 +236,32 @@ struct CourseChatView: View {
         )
     }
 
-    private var liveTimelineDigest: Int {
-        var hasher = Hasher()
-        for item in liveConversationItems {
-            hasher.combine(item.id)
-            hasher.combine(item.renderDigest)
+    private var courseServer: AppServerSnapshot? {
+        if let serverID = activeThreadKey?.serverId {
+            return appModel.snapshot?.serverSnapshot(for: serverID)
         }
-        hasher.combine(isAgentWorking)
-        return hasher.finalize()
+        return appModel.snapshot?.servers.first(where: \.isLocal)
+    }
+
+    private var codexNeedsSignIn: Bool {
+        CourseChatAuthPolicy.needsSignIn(
+            isCodex: store.activeAgentID == .codex,
+            requiresOpenAIAuth: courseServer?.requiresOpenaiAuth == true,
+            hasAccount: courseServer?.account != nil,
+            explicitlyRequired: store.agentNeedsAuthentication
+        )
+    }
+
+    private var isAgentReady: Bool {
+        if CourseAgentProvider.isApple(store.activeAgentID) {
+            return store.connectionState == .connected
+        }
+        return CourseChatAuthPolicy.isReady(
+            isCodex: store.activeAgentID == .codex,
+            transportConnected: courseServer?.isConnected == true,
+            requiresOpenAIAuth: courseServer?.requiresOpenaiAuth == true,
+            hasAccount: courseServer?.account != nil
+        )
     }
 
     var body: some View {
@@ -65,10 +271,35 @@ struct CourseChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 18) {
-                        CourseChatIntro()
+                        if let selectionContext {
+                            CourseSelectionContextCard(reference: selectionContext)
+                        } else {
+                            CourseChatIntro(
+                                supportsBinarySources: !CourseAgentProvider.isApple(
+                                    store.activeAgentID
+                                )
+                            )
+                        }
+
+                        if isPreparingSelectionDiscussion {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Starting a focused discussion…")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                            .padding(.horizontal, 4)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Starting a focused discussion")
+                        }
 
                         ForEach(localMessages) { message in
-                            CourseMessageRow(message: message)
+                            CourseMessageRow(
+                                message: message,
+                                agentID: store.activeAgentID
+                            )
                                 .id(message.id)
                         }
 
@@ -81,10 +312,10 @@ struct CourseChatView: View {
                                 agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
                                 messageActionsDisabled: true,
                                 onStreamingSnapshotRendered: {
-                                    followLiveAgent(proxy)
+                                    requestFollowScrollAfterLayout(proxy)
                                 },
                                 onLiveContentLayoutChanged: {
-                                    followLiveAgent(proxy)
+                                    requestFollowScrollAfterLayout(proxy)
                                 },
                                 resolveTargetLabel: { target in
                                     appModel.snapshot?.resolvedAgentTargetLabel(
@@ -126,12 +357,15 @@ struct CourseChatView: View {
                                 .id("course-brief")
                         }
 
-                        if let agentError = store.agentError {
-                            Label("\(store.activeAgentID.displayLabel) couldn’t continue. \(agentError)", systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.red)
-                                .padding(12)
-                                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        if let agentError = displayedAgentError {
+                            CourseAgentErrorCard(
+                                agentName: store.activeAgentID.displayLabel,
+                                message: agentError,
+                                needsAuthentication: codexNeedsSignIn,
+                                isConnecting: store.connectionState == .connecting,
+                                onReconnect: reconnectAgent,
+                                onDismiss: dismissDisplayedError
+                            )
                         }
 
                         Color.clear
@@ -143,28 +377,57 @@ struct CourseChatView: View {
                     .padding(.bottom, 22)
                 }
                 .scrollDismissesKeyboard(.interactively)
-                .onChange(of: store.messages.count) { _, _ in
+                .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    max(0, geometry.contentSize.height - geometry.visibleRect.maxY)
+                } action: { _, distance in
+                    updateDistanceFromBottom(distance)
+                }
+                .onScrollPhaseChange { _, newPhase in
+                    switch newPhase {
+                    case .tracking, .interacting:
+                        userIsDraggingScroll = true
+                        if isAgentWorking {
+                            autoFollowStreaming = false
+                        }
+                    case .decelerating:
+                        userIsDraggingScroll = true
+                    default:
+                        userIsDraggingScroll = false
+                        if isNearBottom {
+                            autoFollowStreaming = true
+                        }
+                    }
+                }
+                .onChange(of: localMessages.count) { _, _ in
+                    // Once the Rust-backed thread exists, these local messages
+                    // are hidden. Its timeline callbacks own follow scrolling.
+                    guard liveConversationItems.isEmpty else { return }
                     withAnimation(.easeOut(duration: 0.3)) {
                         if store.showsBrief {
                             proxy.scrollTo("course-brief", anchor: .bottom)
-                        } else if let last = store.messages.last {
+                        } else if let last = localMessages.last {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
                 }
+                .onChange(of: localStreamingTextLength) { _, _ in
+                    guard CourseAgentProvider.isApple(store.activeAgentID),
+                          isAgentWorking else { return }
+                    requestFollowScrollAfterLayout(proxy)
+                }
                 .onChange(of: store.showsBrief) { _, isShown in
-                    guard isShown else { return }
+                    guard isShown,
+                          CourseChatScrollPolicy.shouldFollow(
+                              autoFollowEnabled: autoFollowStreaming,
+                              userIsDragging: userIsDraggingScroll
+                          ) else { return }
                     withAnimation(.easeOut(duration: 0.35)) {
                         proxy.scrollTo("course-brief", anchor: .top)
                     }
                 }
-                .onChange(of: liveTimelineDigest) { _, _ in
-                    guard isAgentWorking else { return }
-                    followLiveAgent(proxy)
-                }
-                .onChange(of: isAgentWorking) { _, working in
-                    if working {
-                        followLiveAgent(proxy)
+                .onChange(of: isAgentWorking) { wasWorking, working in
+                    if wasWorking || working {
+                        requestFollowScrollAfterLayout(proxy)
                     }
                 }
             }
@@ -177,34 +440,126 @@ struct CourseChatView: View {
                 onRemoveSource: store.removeSource,
                 onSend: sendCurrentMessage,
                 isAgentWorking: isAgentWorking,
-                onStop: { store.interruptAgent(appModel: appModel) },
+                isPreparing: isPreparingSelectionDiscussion,
+                onStop: {
+                    store.interruptAgent(
+                        appModel: appModel,
+                        selectionDiscussionID: selectionDiscussionID
+                    )
+                },
+                supportsBinarySources: !CourseAgentProvider.isApple(store.activeAgentID),
                 selectedPhoto: $selectedPhoto,
                 onChooseFile: { showsFileImporter = true },
                 onPasteLink: pasteLink
             )
         }
-        .navigationTitle(store.generatedCourseID == nil ? "New Course" : "Course Agent")
+        .litterFontFamily(.system)
+        // Course surfaces use native Dynamic Type. The classic conversation
+        // zoom is a separate preference and otherwise makes this screen's
+        // messages larger than its surrounding controls and guidance.
+        .environment(\.textScale, 1.0)
+        .navigationTitle(selectionContext == nil ? (store.generatedCourseID == nil ? "New Course" : "Course Agent") : "Ask Course Agent")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            if let draft = store.courseChatDraft {
+            if let draft = store.takeDraft(for: selectionDiscussionID) {
                 inputText = draft
-                store.courseChatDraft = nil
                 composerFocused = true
+            }
+            hasSentSelectionContext =
+                selectionDiscussionID.map {
+                    store.selectionDiscussionHasSubmittedQuestion(id: $0)
+                } ?? false
+        }
+        .onDisappear {
+            store.saveDraft(inputText, for: selectionDiscussionID)
+        }
+        .onChange(of: store.lastAcceptedSelectionContextID) { _, acceptedID in
+            if acceptedID == selectionContext?.id {
+                hasSentSelectionContext = true
             }
         }
         .task {
-            await store.hydrateCourseThread(appModel: appModel, appState: appState)
+            await store.refreshAgentReadiness(appModel: appModel)
+            if let selectionDiscussionID {
+                await store.prepareSelectionDiscussionThread(
+                    id: selectionDiscussionID,
+                    appModel: appModel,
+                    appState: appState
+                )
+                hasSentSelectionContext =
+                    store.selectionDiscussionHasSubmittedQuestion(
+                        id: selectionDiscussionID
+                    )
+            } else {
+                await store.hydrateCourseThread(appModel: appModel, appState: appState)
+            }
         }
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 7) {
-                    Circle().fill(.green).frame(width: 7, height: 7)
-                    AgentIconView(kind: store.activeAgentID, size: 23)
+            if showsDismissButton {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done") { dismiss() }
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(.thinMaterial, in: Capsule())
-                .accessibilityLabel("\(store.activeAgentID.displayLabel) connected")
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                HStack(spacing: 6) {
+                    if selectionDiscussionID != nil {
+                        Button("Resolve") {
+                            resolveDiscussion()
+                        }
+                        .font(.subheadline.weight(.semibold))
+                        .disabled(
+                            isResolvingDiscussion ||
+                                isPreparingSelectionDiscussion ||
+                                isAgentWorking
+                        )
+                        .accessibilityIdentifier("course-chat-resolve")
+                    }
+                    if CourseAgentProvider.isApple(store.activeAgentID) {
+                        Menu {
+                            Button {
+                                store.switchCurrentAppleProvider(
+                                    to: CourseAgentProvider.applePrivateCloud
+                                )
+                            } label: {
+                                Label(
+                                    "Private Cloud Compute",
+                                    systemImage: store.activeAgentID == CourseAgentProvider.applePrivateCloud
+                                        ? "checkmark.circle.fill"
+                                        : "cloud"
+                                )
+                            }
+                            .disabled(
+                                !store.canSwitchCurrentThread(
+                                    to: CourseAgentProvider.applePrivateCloud
+                                )
+                            )
+
+                            Button {
+                                store.switchCurrentAppleProvider(
+                                    to: CourseAgentProvider.appleOnDevice
+                                )
+                            } label: {
+                                Label(
+                                    "On‑Device",
+                                    systemImage: store.activeAgentID == CourseAgentProvider.appleOnDevice
+                                        ? "checkmark.circle.fill"
+                                        : "iphone"
+                                )
+                            }
+                            .disabled(
+                                !store.canSwitchCurrentThread(
+                                    to: CourseAgentProvider.appleOnDevice
+                                )
+                            )
+                        } label: {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(isAgentWorking)
+                        .accessibilityLabel("Switch Apple model")
+                        .accessibilityIdentifier("course-chat-apple-provider-switch")
+                    }
+                    agentStatusControl
+                }
             }
         }
         .fileImporter(
@@ -252,18 +607,125 @@ struct CourseChatView: View {
         } message: {
             Text(attachmentError ?? "Unknown error")
         }
+        .alert("Couldn’t Resolve Discussion", isPresented: Binding(
+            get: { resolveError != nil },
+            set: { if !$0 { resolveError = nil } }
+        )) {
+            Button("OK", role: .cancel) { resolveError = nil }
+        } message: {
+            Text(resolveError ?? "The discussion is still open.")
+        }
     }
 
     private func sendCurrentMessage() {
+        guard !isPreparingSelectionDiscussion else { return }
         let text = inputText
         inputText = ""
         composerFocused = false
-        store.sendMessage(text, appModel: appModel, appState: appState)
+        autoFollowStreaming = true
+        isNearBottom = true
+        let reference = hasSentSelectionContext ? nil : selectionContext
+        store.sendMessage(
+            text,
+            reference: reference,
+            selectionDiscussionID: selectionDiscussionID,
+            appModel: appModel,
+            appState: appState
+        )
     }
 
-    private func followLiveAgent(_ proxy: ScrollViewProxy) {
+    private func resolveDiscussion() {
+        guard let selectionDiscussionID else { return }
+        isResolvingDiscussion = true
+        Task {
+            defer { isResolvingDiscussion = false }
+            do {
+                try await store.resolveSelectionDiscussion(
+                    id: selectionDiscussionID,
+                    appModel: appModel
+                )
+                dismiss()
+            } catch {
+                resolveError = "The agent discussion could not be closed, so the passage remains highlighted. \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func dismissDisplayedError() {
+        if let selectionDiscussionID {
+            store.selectionDiscussionErrors[selectionDiscussionID] = nil
+        } else {
+            store.agentError = nil
+        }
+    }
+
+    @ViewBuilder
+    private var agentStatusControl: some View {
+        if codexNeedsSignIn {
+            Button(action: reconnectAgent) {
+                agentStatusLabel(color: .orange)
+            }
+            .accessibilityLabel("Sign in to \(store.activeAgentID.displayLabel)")
+        } else {
+            agentStatusLabel(color: isAgentReady ? .green : .gray)
+                .accessibilityLabel(
+                    isAgentReady
+                        ? "\(store.activeAgentID.displayLabel) connected"
+                        : "\(store.activeAgentID.displayLabel) unavailable"
+                )
+        }
+    }
+
+    private func agentStatusLabel(color: Color) -> some View {
+        HStack(spacing: 7) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            AgentIconView(kind: store.activeAgentID, size: 23)
+        }
+        .frame(minWidth: 44, minHeight: 44)
+        .padding(.horizontal, 4)
+        .background(.thinMaterial, in: Capsule())
+    }
+
+    private func reconnectAgent() {
+        Task {
+            await store.connectLocalAgent(
+                appModel: appModel,
+                agentID: store.activeAgentID,
+                modelID: store.selectedModelID,
+                reasoningEffortID: store.selectedReasoningEffortID
+            )
+        }
+    }
+
+    private func requestFollowScrollAfterLayout(_ proxy: ScrollViewProxy) {
+        guard !followScrollScheduled else { return }
+        followScrollScheduled = true
         DispatchQueue.main.async {
+            followScrollScheduled = false
+            guard CourseChatScrollPolicy.shouldFollow(
+                autoFollowEnabled: autoFollowStreaming,
+                userIsDragging: userIsDraggingScroll
+            ) else { return }
             proxy.scrollTo("course-chat-bottom", anchor: .bottom)
+        }
+    }
+
+    private func updateDistanceFromBottom(_ distance: CGFloat) {
+        let clampedDistance = max(0, distance)
+        let nextIsNearBottom =
+            clampedDistance <= CourseChatScrollPolicy.nearBottomDistance
+        if nextIsNearBottom != isNearBottom {
+            isNearBottom = nextIsNearBottom
+        }
+
+        let nextAutoFollow = CourseChatScrollPolicy.updatedAutoFollow(
+            currentValue: autoFollowStreaming,
+            distanceFromBottom: clampedDistance,
+            userIsDragging: userIsDraggingScroll,
+            isAgentWorking: isAgentWorking
+        )
+        if nextAutoFollow != autoFollowStreaming {
+            autoFollowStreaming = nextAutoFollow
         }
     }
 
@@ -275,13 +737,95 @@ struct CourseChatView: View {
             attachmentError = "Copy a web link first, then choose Paste Link."
             return
         }
-        if !inputText.isEmpty { inputText += "\n" }
-        inputText += pasted
-        composerFocused = true
+        store.addSource(
+            CourseSource(
+                name: pasted,
+                detail: url.host?.uppercased() ?? "LINK",
+                kind: .link
+            )
+        )
+    }
+}
+
+private struct CourseAgentErrorCard: View {
+    let agentName: String
+    let message: String
+    let needsAuthentication: Bool
+    let isConnecting: Bool
+    let onReconnect: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("\(agentName) couldn’t continue", systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.red)
+
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                if needsAuthentication {
+                    Button(action: onReconnect) {
+                        if isConnecting {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("Sign In", systemImage: "person.crop.circle.badge.checkmark")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isConnecting)
+                }
+
+                Button("Dismiss", action: onDismiss)
+                    .buttonStyle(.bordered)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct CourseSelectionContextCard: View {
+    let reference: CourseTextReference
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Selected from \(reference.pageTitle)", systemImage: "text.quote")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.blue)
+
+            Text(reference.selectedText)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if reference.wasTruncated {
+                Text("The first \(CourseTextReference.maximumLength.formatted()) characters will be sent as context.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.blue.opacity(0.14))
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Selected passage from \(reference.pageTitle). \(reference.selectedText)")
     }
 }
 
 private struct CourseChatIntro: View {
+    let supportsBinarySources: Bool
+
     var body: some View {
         VStack(spacing: 10) {
             ZStack {
@@ -294,7 +838,11 @@ private struct CourseChatIntro: View {
 
             Text("Build something worth learning")
                 .font(.title3.weight(.bold))
-            Text("Talk naturally. Your course agent can work from files, images, and URLs just like a desktop agent.")
+            Text(
+                supportsBinarySources
+                    ? "Talk naturally. Your course agent can work from files, images, and URLs just like a desktop agent."
+                    : "Talk naturally. Your Apple course agent can answer questions, use web links, and build native course pages after you approve its plan."
+            )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -307,13 +855,14 @@ private struct CourseChatIntro: View {
 
 private struct CourseMessageRow: View {
     let message: CourseChatMessage
+    let agentID: String
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 9) {
             if message.role == .learner { Spacer(minLength: 40) }
 
             if message.role == .agent {
-                AgentIconView(kind: "codex", size: 27)
+                AgentIconView(kind: agentID, size: 27)
                     .padding(.bottom, 5)
             }
 
@@ -403,7 +952,9 @@ private struct CourseChatComposer: View {
     let onRemoveSource: (CourseSource) -> Void
     let onSend: () -> Void
     let isAgentWorking: Bool
+    let isPreparing: Bool
     let onStop: () -> Void
+    let supportsBinarySources: Bool
     @Binding var selectedPhoto: PhotosPickerItem?
     let onChooseFile: () -> Void
     let onPasteLink: () -> Void
@@ -435,11 +986,13 @@ private struct CourseChatComposer: View {
 
             HStack(alignment: .bottom, spacing: 9) {
                 Menu {
-                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                        Label("Photo", systemImage: "photo")
-                    }
-                    Button(action: onChooseFile) {
-                        Label("File", systemImage: "doc")
+                    if supportsBinarySources {
+                        PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                            Label("Photo", systemImage: "photo")
+                        }
+                        Button(action: onChooseFile) {
+                            Label("File", systemImage: "doc")
+                        }
                     }
                     Button(action: onPasteLink) {
                         Label("Paste Link", systemImage: "link")
@@ -447,10 +1000,12 @@ private struct CourseChatComposer: View {
                 } label: {
                     Image(systemName: "plus")
                         .font(.headline)
-                        .frame(width: 38, height: 38)
+                        .frame(width: 44, height: 44)
                         .background(.thinMaterial, in: Circle())
                 }
                 .accessibilityLabel("Add a source")
+                .accessibilityIdentifier("course-chat-add-source")
+                .disabled(isPreparing)
 
                 TextField("Message your course agent", text: $inputText, axis: .vertical)
                     .lineLimit(1...5)
@@ -458,16 +1013,30 @@ private struct CourseChatComposer: View {
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                     .background(.background, in: RoundedRectangle(cornerRadius: 19, style: .continuous))
+                    .accessibilityLabel("Message your course agent")
+                    .accessibilityIdentifier("course-chat-composer")
+                    .disabled(isPreparing)
 
                 Button(action: isAgentWorking ? onStop : onSend) {
-                    Image(systemName: isAgentWorking ? "stop.fill" : "arrow.up")
-                        .font(.headline.bold())
-                        .foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
-                        .background(sendButtonColor, in: Circle())
+                    Group {
+                        if isPreparing {
+                            ProgressView()
+                                .tint(.white)
+                        } else {
+                            Image(systemName: isAgentWorking ? "stop.fill" : "arrow.up")
+                                .font(.headline.bold())
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .frame(width: 44, height: 44)
+                    .background(sendButtonColor, in: Circle())
                 }
-                .disabled(!isAgentWorking && !canSend)
-                .accessibilityLabel(isAgentWorking ? "Stop agent" : "Send message")
+                .disabled(isPreparing || (!isAgentWorking && !canSend))
+                .accessibilityLabel(
+                    isPreparing
+                        ? "Starting discussion"
+                        : (isAgentWorking ? "Stop agent" : "Send message")
+                )
                 .accessibilityIdentifier(isAgentWorking ? "course-chat-stop" : "course-chat-send")
             }
         }
@@ -483,6 +1052,7 @@ private struct CourseChatComposer: View {
     }
 
     private var sendButtonColor: Color {
+        if isPreparing { return .gray.opacity(0.5) }
         if isAgentWorking { return .primary }
         return canSend ? .blue : .gray.opacity(0.35)
     }

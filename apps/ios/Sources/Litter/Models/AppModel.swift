@@ -461,10 +461,18 @@ final class AppModel {
     }
 
     func ensureLocalAuthForThreadStart(serverId: String) async throws -> Bool {
-        guard let server = snapshot?.serverSnapshot(for: serverId) else {
-            return true
+        var server = snapshot?.serverSnapshot(for: serverId)
+        if server == nil {
+            await refreshSnapshot()
+            server = snapshot?.serverSnapshot(for: serverId)
+        }
+        guard let server else {
+            throw LocalAccountLoginFlowError.localServerUnavailable
         }
         guard server.isLocal else {
+            return true
+        }
+        guard server.requiresOpenaiAuth else {
             return true
         }
         guard server.account == nil else {
@@ -1846,6 +1854,10 @@ final class AppModel {
     }
 
     func startTurn(key: ThreadKey, payload: AppComposerPayload) async throws {
+        let backgroundContinuationToken = AppRuntimeController.shared.beginUserInitiatedTurn(
+            key: key,
+            appModel: self
+        )
         await restoreStoredLocalAuthIfNeeded(serverId: key.serverId, reason: "startTurn")
 
         do {
@@ -1853,7 +1865,9 @@ final class AppModel {
                 key: key,
                 params: payload.turnStartRequest(threadId: key.threadId)
             )
+            AppRuntimeController.shared.markUserInitiatedTurnAccepted(backgroundContinuationToken)
         } catch {
+            AppRuntimeController.shared.markUserInitiatedTurnStartFailed(backgroundContinuationToken)
             lastError = error.localizedDescription
             throw error
         }

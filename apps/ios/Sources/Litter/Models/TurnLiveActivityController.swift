@@ -10,6 +10,20 @@ final class TurnLiveActivityController {
     private var outputSnippetSourceItemId: String?
     private var lastUpdateTime: CFAbsoluteTime = 0
     private var didCleanupStaleActivities = false
+    private var systemContinuedProcessingActive = false
+
+    /// iOS 26 continued-processing tasks provide their own system Live
+    /// Activity. Suppress Litter's custom ActivityKit card while one is active
+    /// so a single Codex turn never creates duplicate lock-screen activities.
+    func setSystemContinuedProcessingActive(_ isActive: Bool, snapshot: AppSnapshotRecord?) {
+        guard systemContinuedProcessingActive != isActive else { return }
+        systemContinuedProcessingActive = isActive
+        if isActive {
+            endCurrent(phase: .completed, snapshot: snapshot)
+        } else {
+            sync(snapshot)
+        }
+    }
 
     private func cleanupStaleActivities() {
         guard !didCleanupStaleActivities else { return }
@@ -27,6 +41,8 @@ final class TurnLiveActivityController {
 
     func sync(_ snapshot: AppSnapshotRecord?) {
         cleanupStaleActivities()
+
+        guard !systemContinuedProcessingActive else { return }
 
         guard let snapshot else {
             endCurrent(phase: .completed, snapshot: nil)

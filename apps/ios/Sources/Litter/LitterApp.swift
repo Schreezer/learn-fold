@@ -2,12 +2,14 @@ import SwiftUI
 import UIKit
 import UserNotifications
 import Combine
+import CloudKit
 import os
 
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     private var pendingPushToken: Data?
     private var pendingNotificationThreadKey: ThreadKey?
     private var splashWindow: UIWindow?
+    private weak var windowBeforeSplash: UIWindow?
     private var minTimeElapsed = false
     private var contentReady = false
     private var splashDismissed = false
@@ -102,6 +104,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         DispatchQueue.main.async {
             CloudKVSBridge.shared.start()
         }
+        Task {
+            await CourseCloudSyncEngine.shared.startIfAvailable()
+        }
         showSplashWindow()
         scheduleKeyboardWarmup()
         // Start pushing state to the paired Apple Watch, gated behind the
@@ -123,6 +128,7 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
                 self.showSplashWindow()
                 return
             }
+            self.windowBeforeSplash = scene.windows.first(where: \.isKeyWindow)
             let window = UIWindow(windowScene: scene)
             // Keyboard window is typically at level ~10000. Go above it.
             window.windowLevel = UIWindow.Level(rawValue: 10000002)
@@ -171,6 +177,8 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
             window.isHidden = true
             window.rootViewController = nil
             self.splashWindow = nil
+            self.windowBeforeSplash?.makeKey()
+            self.windowBeforeSplash = nil
         })
     }
 
@@ -240,6 +248,18 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
             ],
             payloadJson: notificationPayloadJson(userInfo)
         )
+        if CKNotification(fromRemoteNotificationDictionary: userInfo) != nil {
+            Task {
+                let fetchedChanges = await CourseCloudSyncEngine.shared.fetchChanges()
+                LLog.info(
+                    "course-cloud-sync",
+                    "CloudKit push handling completed",
+                    fields: ["result": fetchedChanges ? "newData" : "noData"]
+                )
+                completionHandler(fetchedChanges ? .newData : .noData)
+            }
+            return
+        }
         if application.applicationState == .active {
             LLog.info("push", "skipping background push handler because app is already active")
             completionHandler(.noData)
@@ -524,6 +544,7 @@ struct ContentView: View {
         #endif
         .onAppear {
             themeManager.syncSystemColorScheme(colorScheme)
+            CourseCloudSyncApplyBridge.shared.register(store: courseStore)
             let forceDiscoveryForUITest =
                 ProcessInfo.processInfo.environment["CODEXIOS_UI_TEST_FORCE_DISCOVERY"] == "1"
             if forceDiscoveryForUITest {
@@ -548,6 +569,9 @@ struct ContentView: View {
             // the app was backgrounded).
             if newPhase == .active {
                 themeManager.syncSystemColorScheme(colorScheme)
+                Task {
+                    _ = await CourseCloudSyncEngine.shared.fetchChanges()
+                }
             }
         }
         .onChange(of: appModel.snapshot?.activeThread) { _, _ in

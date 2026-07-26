@@ -48,7 +48,7 @@ struct NewThreadHeroView: View {
                 Spacer(minLength: 0)
 
                 if !isSending {
-                    Text("What should we build in litter?")
+                    Text("What should we build in Learnfold?")
                         .font(.system(size: 22, weight: .medium))
                         .foregroundStyle(LitterTheme.textPrimary)
                         .multilineTextAlignment(.center)

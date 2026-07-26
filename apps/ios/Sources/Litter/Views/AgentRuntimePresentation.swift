@@ -23,6 +23,8 @@ extension AgentRuntimeKind {
     static let devin: AgentRuntimeKind = "devin"
     static let droid: AgentRuntimeKind = "droid"
     static let opencode: AgentRuntimeKind = "opencode"
+    static let appleOnDevice: AgentRuntimeKind = CourseAgentProvider.appleOnDevice
+    static let applePrivateCloud: AgentRuntimeKind = CourseAgentProvider.applePrivateCloud
 
     /// Presentation order surfaced by `AgentMetadataStore` (sorted by
     /// each agent's `presentation.sort_order` from the alleycat
@@ -41,6 +43,8 @@ extension AgentRuntimeKind {
     /// label during the brief window between server connect and probe
     /// completion.
     var displayLabel: String {
+        if self == .appleOnDevice { return "Apple On-Device" }
+        if self == .applePrivateCloud { return "Apple Private Cloud" }
         if let meta = metadata, !meta.displayName.isEmpty {
             return meta.displayName
         }
@@ -133,7 +137,19 @@ struct AgentIconView: View {
     var size: CGFloat = 24
 
     var body: some View {
-        if let assetName = kind.bundledAssetName {
+        if kind == .appleOnDevice {
+            Image(systemName: "apple.logo")
+                .font(.system(size: size * 0.68, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: size, height: size)
+                .background(.black.opacity(0.06), in: RoundedRectangle(cornerRadius: size * 0.22))
+        } else if kind == .applePrivateCloud {
+            Image(systemName: "icloud.fill")
+                .font(.system(size: size * 0.65, weight: .semibold))
+                .foregroundStyle(.blue)
+                .frame(width: size, height: size)
+                .background(.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: size * 0.22))
+        } else if let assetName = kind.bundledAssetName {
             Image(assetName)
                 .resizable()
                 .interpolation(.high)

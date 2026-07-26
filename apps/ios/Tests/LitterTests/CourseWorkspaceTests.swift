@@ -1,4 +1,5 @@
 import XCTest
+import NativeBlockEditorCore
 @testable import Litter
 
 final class CourseWorkspaceTests: XCTestCase {
@@ -176,8 +177,7 @@ final class CourseWorkspaceTests: XCTestCase {
         XCTAssertEqual(overlaid[1].status, .pendingGeneration)
     }
 
-    @MainActor
-    func testRemodexCourseMarkdownRendererParsesStructuredDocument() throws {
+    func testNativeEditorMarkdownCodecPreservesStructuredDocument() throws {
         let markdown = """
         # Diffusion Models
 
@@ -190,11 +190,14 @@ final class CourseWorkspaceTests: XCTestCase {
         sample = denoise(noise)
         ```
         """
-        let rendered = try CourseMarkdownRenderer.attributedString(markdown: markdown)
+        let codec = AppFlowyMarkdownCodec()
+        let document = try codec.decode(markdown)
+        let encoded = codec.encode(document)
 
-        XCTAssertTrue(String(rendered.characters).contains("Diffusion Models"))
-        XCTAssertTrue(String(rendered.characters).contains("sample = denoise(noise)"))
-        XCTAssertTrue(rendered.runs.contains(where: { $0.presentationIntent != nil }))
+        XCTAssertTrue(encoded.contains("Diffusion Models"))
+        XCTAssertTrue(encoded.contains("sample = denoise(noise)"))
+        XCTAssertTrue(document.root.children.contains(where: { $0.type == "heading" }))
+        XCTAssertTrue(document.root.children.contains(where: { $0.type == "code" }))
     }
 
     private func makeWorkspace() throws -> URL {

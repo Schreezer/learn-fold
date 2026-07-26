@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Learnfold</string>
 	<key>CFBundleIdentifier</key>
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleName</key>
@@ -16,7 +18,7 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>com.sigkitten.litter.auth</string>
+			<string>com.chirag.learnfold.auth</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>litterauth</string>
@@ -55,15 +57,15 @@
 		<string>_litter-pair._tcp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>Litter can import image files for conversations.</string>
+	<string>Learnfold can import image files for conversations.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Codex discovers coding agents and SSH servers on your local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Litter uses the microphone for voice-to-text input.</string>
+	<string>Learnfold uses the microphone for voice-to-text input.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Litter advertises a short-range Bluetooth beacon so nearby iPhones can find this Mac to pair with.</string>
+	<string>Learnfold advertises a short-range Bluetooth beacon so nearby iPhones can find this Mac to pair with.</string>
 	<key>NSNearbyInteractionUsageDescription</key>
-	<string>Litter uses Nearby Interaction to confirm your iPhone and Mac are close before pairing.</string>
+	<string>Learnfold uses Nearby Interaction to confirm your iPhone and Mac are close before pairing.</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>BerkeleyMono-Regular.otf</string>
