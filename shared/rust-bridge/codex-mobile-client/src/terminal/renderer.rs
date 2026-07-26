@@ -377,10 +377,14 @@ impl TerminalRenderer {
         let metrics = backend.cell_metrics();
         let viewport_pos = super::selection::hit_test_cell(metrics, x_px, y_px)?;
         let abs_row = metrics.viewport_top.saturating_add(viewport_pos.row);
-        self.inner.links.lock().unwrap().link_at(TerminalCellPosition {
-            row: abs_row,
-            col: viewport_pos.col,
-        })
+        self.inner
+            .links
+            .lock()
+            .unwrap()
+            .link_at(TerminalCellPosition {
+                row: abs_row,
+                col: viewport_pos.col,
+            })
     }
 
     /// Current surface cell metrics (cell width/height in pixels, grid
@@ -1059,10 +1063,7 @@ mod tests {
             fn cell_metrics(&self) -> super::super::selection::TerminalCellMetrics {
                 self.0.cell_metrics()
             }
-            fn set_selection_overlay(
-                &self,
-                r: Option<super::super::selection::TerminalCellRange>,
-            ) {
+            fn set_selection_overlay(&self, r: Option<super::super::selection::TerminalCellRange>) {
                 self.0.set_selection_overlay(r);
             }
         }
@@ -1146,10 +1147,7 @@ mod tests {
                     viewport_top: 100,
                 }
             }
-            fn set_selection_overlay(
-                &self,
-                _: Option<super::super::selection::TerminalCellRange>,
-            ) {
+            fn set_selection_overlay(&self, _: Option<super::super::selection::TerminalCellRange>) {
             }
         }
         let renderer = TerminalRenderer::new(Box::new(WithViewport));

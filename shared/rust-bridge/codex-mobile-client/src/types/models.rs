@@ -396,6 +396,34 @@ pub struct AppDynamicToolSpec {
     pub defer_loading: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[derive(uniffi::Record)]
+pub struct AppPlatformDynamicToolInvocation {
+    pub thread_id: String,
+    pub tool: String,
+    pub arguments_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[derive(uniffi::Record)]
+pub struct AppPlatformDynamicToolResult {
+    pub success: bool,
+    pub output: String,
+}
+
+/// Optional platform extension point for dynamic tools whose canonical state
+/// lives in native code, such as an iOS document editor. Returning `None`
+/// declines the invocation so the shared runtime reports an unknown tool.
+#[uniffi::export(callback_interface)]
+pub trait PlatformDynamicToolHandler: Send + Sync {
+    fn handle_dynamic_tool(
+        &self,
+        invocation: AppPlatformDynamicToolInvocation,
+    ) -> Option<AppPlatformDynamicToolResult>;
+}
+
 /// Output modality requested for a realtime session.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]

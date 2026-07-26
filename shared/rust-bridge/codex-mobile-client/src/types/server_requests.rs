@@ -348,6 +348,12 @@ pub struct AppStartThreadRequest {
     pub developer_instructions: Option<String>,
     pub persist_extended_history: bool,
     pub dynamic_tools: Option<Vec<AppDynamicToolSpec>>,
+    /// JSON object whose keys are Codex config paths and whose values are
+    /// thread-scoped overrides. This keeps app-owned MCP servers scoped to
+    /// the thread that requested them instead of enabling them globally.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub config_json: Option<String>,
     #[serde(default)]
     #[uniffi(default = None)]
     pub ephemeral: Option<bool>,
@@ -368,7 +374,19 @@ impl TryFrom<AppStartThreadRequest> for upstream::ThreadStartParams {
             approvals_reviewer: None,
             sandbox: value.sandbox.map(sandbox_mode_into_upstream),
             permissions: None,
-            config: None,
+            config: value
+                .config_json
+                .map(|json| {
+                    serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
+                        &json,
+                    )
+                    .map_err(|error| {
+                        RpcClientError::Serialization(format!(
+                            "parse AppStartThreadRequest.config_json: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
             service_name: None,
             base_instructions: None,
             developer_instructions: value.developer_instructions,
@@ -1356,10 +1374,44 @@ mod tests {
             developer_instructions: None,
             persist_extended_history: false,
             dynamic_tools: None,
+            config_json: None,
             ephemeral: None,
         };
         let upstream_params: upstream::ThreadStartParams = request.try_into().unwrap();
         assert_eq!(upstream_params.cwd.as_deref(), Some(r"C:\Users\npace\dev"));
+    }
+
+    #[test]
+    fn start_thread_request_forwards_thread_scoped_config() {
+        let request = AppStartThreadRequest {
+            agent_runtime_kind: None,
+            model: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            developer_instructions: None,
+            persist_extended_history: false,
+            dynamic_tools: None,
+            config_json: Some(
+                serde_json::json!({
+                    "features.code_mode.direct_only_tool_namespaces": ["mcp__learnfold_course"],
+                    "mcp_servers.learnfold_course.url": "http://127.0.0.1:8765/mcp",
+                    "mcp_servers.learnfold_course.required": true
+                })
+                .to_string(),
+            ),
+            ephemeral: None,
+        };
+        let upstream_params: upstream::ThreadStartParams = request.try_into().unwrap();
+        let config = upstream_params.config.unwrap();
+        assert_eq!(
+            config["mcp_servers.learnfold_course.url"],
+            "http://127.0.0.1:8765/mcp"
+        );
+        assert_eq!(
+            config["features.code_mode.direct_only_tool_namespaces"],
+            serde_json::json!(["mcp__learnfold_course"])
+        );
     }
 
     #[test]

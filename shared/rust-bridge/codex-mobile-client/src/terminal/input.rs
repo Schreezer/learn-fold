@@ -87,13 +87,21 @@ pub enum TerminalKeyCode {
     F11,
     F12,
     /// Single ASCII letter (lowercased).
-    Alpha { ch: String },
+    Alpha {
+        ch: String,
+    },
     /// ASCII digit 0..=9.
-    Digit { value: u8 },
+    Digit {
+        value: u8,
+    },
     /// Single ASCII punctuation character.
-    Punctuation { ch: String },
+    Punctuation {
+        ch: String,
+    },
     /// Anything else; raw platform keycode for diagnostic.
-    Other { raw: u32 },
+    Other {
+        raw: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -230,15 +238,9 @@ mod tests {
             ctrl: true,
             ..TerminalKeyMods::NONE
         };
-        let bytes = synthesize_special_key(
-            &TerminalKeyCode::Alpha { ch: "c".into() },
-            mods,
-        );
+        let bytes = synthesize_special_key(&TerminalKeyCode::Alpha { ch: "c".into() }, mods);
         assert_eq!(bytes, vec![0x03]);
-        let bytes = synthesize_special_key(
-            &TerminalKeyCode::Alpha { ch: "A".into() },
-            mods,
-        );
+        let bytes = synthesize_special_key(&TerminalKeyCode::Alpha { ch: "A".into() }, mods);
         // Uppercase still folds to lowercase for Ctrl-A.
         assert_eq!(bytes, vec![0x01]);
     }

@@ -39,6 +39,7 @@ impl MobileClient {
         let app_store = Arc::clone(&self.app_store);
         let widget_waiters = Arc::clone(&self.widget_waiters);
         let saved_apps_directory = Arc::clone(&self.saved_apps_directory);
+        let platform_dynamic_tool_handler = Arc::clone(&self.platform_dynamic_tool_handler);
         Self::spawn_detached(async move {
             loop {
                 let event = events.recv().await;
@@ -133,6 +134,8 @@ impl MobileClient {
                             let app_store = Arc::clone(&app_store);
                             let widget_waiters = Arc::clone(&widget_waiters);
                             let saved_apps_directory = Arc::clone(&saved_apps_directory);
+                            let platform_dynamic_tool_handler =
+                                Arc::clone(&platform_dynamic_tool_handler);
                             MobileClient::spawn_detached(async move {
                                 if let Err(error) = handle_dynamic_tool_call_request(
                                     session,
@@ -140,6 +143,7 @@ impl MobileClient {
                                     app_store,
                                     widget_waiters,
                                     saved_apps_directory,
+                                    platform_dynamic_tool_handler,
                                     request_id,
                                     params,
                                     runtime_kind,

@@ -14,6 +14,9 @@ pub(super) async fn handle_dynamic_tool_call_request(
     app_store: Arc<AppStoreReducer>,
     widget_waiters: Arc<StdMutex<HashMap<String, WidgetWaiter>>>,
     saved_apps_directory: Arc<StdMutex<Option<String>>>,
+    platform_dynamic_tool_handler: Arc<
+        StdMutex<Option<Arc<dyn crate::types::models::PlatformDynamicToolHandler>>>,
+    >,
     request_id: upstream::RequestId,
     params: upstream::DynamicToolCallParams,
     runtime_kind: AgentRuntimeKind,
@@ -28,7 +31,13 @@ pub(super) async fn handle_dynamic_tool_call_request(
             auto_upsert_saved_app(&saved_apps_directory, &params);
         }
     }
-    let response = match execute_dynamic_tool_call(sessions, Arc::clone(&app_store), &params).await
+    let response = match execute_dynamic_tool_call(
+        sessions,
+        Arc::clone(&app_store),
+        platform_dynamic_tool_handler,
+        &params,
+    )
+    .await
     {
         Ok(text) => upstream::DynamicToolCallResponse {
             content_items: vec![upstream::DynamicToolCallOutputContentItem::InputText { text }],
@@ -57,6 +66,9 @@ pub(super) async fn handle_dynamic_tool_call_request(
 pub(super) async fn execute_dynamic_tool_call(
     sessions: Arc<RwLock<HashMap<String, Arc<ServerSession>>>>,
     app_store: Arc<AppStoreReducer>,
+    platform_dynamic_tool_handler: Arc<
+        StdMutex<Option<Arc<dyn crate::types::models::PlatformDynamicToolHandler>>>,
+    >,
     params: &upstream::DynamicToolCallParams,
 ) -> Result<String, String> {
     let targets = snapshot_dynamic_tool_sessions(&sessions);
@@ -69,7 +81,42 @@ pub(super) async fn execute_dynamic_tool_call(
         }
         "show_widget" => crate::widget_guidelines::handle_show_widget(&params.arguments),
         "present_course_plan" => handle_present_course_plan(&params.arguments),
-        tool => Err(format!("Unknown dynamic tool: {tool}")),
+        tool => execute_platform_dynamic_tool(
+            &platform_dynamic_tool_handler,
+            &params.thread_id,
+            tool,
+            &params.arguments,
+        ),
+    }
+}
+
+fn execute_platform_dynamic_tool(
+    platform_dynamic_tool_handler: &Arc<
+        StdMutex<Option<Arc<dyn crate::types::models::PlatformDynamicToolHandler>>>,
+    >,
+    thread_id: &str,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
+    let handler = platform_dynamic_tool_handler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or_else(|| format!("Unknown dynamic tool: {tool}"))?;
+    let arguments_json = serde_json::to_string(arguments)
+        .map_err(|error| format!("serialize dynamic tool arguments: {error}"))?;
+    let invocation = crate::types::models::AppPlatformDynamicToolInvocation {
+        thread_id: thread_id.to_string(),
+        tool: tool.to_string(),
+        arguments_json,
+    };
+    let result = handler
+        .handle_dynamic_tool(invocation)
+        .ok_or_else(|| format!("Unknown dynamic tool: {tool}"))?;
+    if result.success {
+        Ok(result.output)
+    } else {
+        Err(result.output)
     }
 }
 
@@ -151,8 +198,30 @@ fn handle_present_course_plan(arguments: &serde_json::Value) -> Result<String, S
 
 #[cfg(test)]
 mod course_plan_tests {
-    use super::handle_present_course_plan;
+    use super::{execute_platform_dynamic_tool, handle_present_course_plan};
+    use crate::types::models::{
+        AppPlatformDynamicToolInvocation, AppPlatformDynamicToolResult, PlatformDynamicToolHandler,
+    };
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    struct NativePageTool;
+
+    impl PlatformDynamicToolHandler for NativePageTool {
+        fn handle_dynamic_tool(
+            &self,
+            invocation: AppPlatformDynamicToolInvocation,
+        ) -> Option<AppPlatformDynamicToolResult> {
+            (invocation.tool == "native-editor-fetch").then(|| AppPlatformDynamicToolResult {
+                success: true,
+                output: json!({
+                    "thread_id": invocation.thread_id,
+                    "arguments": invocation.arguments_json,
+                })
+                .to_string(),
+            })
+        }
+    }
 
     fn valid_plan() -> serde_json::Value {
         json!({
@@ -198,6 +267,37 @@ mod course_plan_tests {
             handle_present_course_plan(&plan)
                 .expect_err("blank deliverable must fail")
                 .contains("non-empty strings")
+        );
+    }
+
+    #[test]
+    fn routes_unknown_shared_tools_to_the_platform_handler_with_thread_scope() {
+        let handler: Arc<dyn PlatformDynamicToolHandler> = Arc::new(NativePageTool);
+        let slot = Arc::new(Mutex::new(Some(handler)));
+        let output = execute_platform_dynamic_tool(
+            &slot,
+            "thread-course-7",
+            "native-editor-fetch",
+            &json!({"id": "page-1"}),
+        )
+        .expect("native tool result");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("JSON output");
+
+        assert_eq!(value["thread_id"], "thread-course-7");
+        assert!(
+            value["arguments"]
+                .as_str()
+                .is_some_and(|json| json.contains("page-1"))
+        );
+        assert!(
+            execute_platform_dynamic_tool(
+                &slot,
+                "thread-course-7",
+                "unsupported-native-tool",
+                &json!({}),
+            )
+            .expect_err("declined tool must remain unknown")
+            .contains("Unknown dynamic tool")
         );
     }
 }

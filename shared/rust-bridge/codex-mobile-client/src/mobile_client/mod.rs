@@ -76,6 +76,11 @@ pub struct MobileClient {
     /// `Some`, the `show_widget` auto-upsert hook is enabled; when
     /// `None`, the hook is skipped (pre-R2 callers / tests).
     pub(crate) saved_apps_directory: Arc<StdMutex<Option<String>>>,
+    /// Native dynamic-tool bridge. The handler is deliberately global to the
+    /// shared mobile client and receives a thread ID so the platform can scope
+    /// each invocation to the correct local repository.
+    pub(crate) platform_dynamic_tool_handler:
+        Arc<StdMutex<Option<Arc<dyn crate::types::models::PlatformDynamicToolHandler>>>>,
     /// Directory where the Slingshot controller enrollment is persisted.
     /// This holds the device-key enrollment and short-lived remote-control
     /// session token so cold launches can reconnect without another browser
@@ -722,6 +727,7 @@ impl MobileClient {
             ambient_cache: crate::ambient_suggestions::new_ambient_cache(),
             widget_waiters: Arc::new(StdMutex::new(HashMap::new())),
             saved_apps_directory: Arc::new(StdMutex::new(None)),
+            platform_dynamic_tool_handler: Arc::new(StdMutex::new(None)),
             slingshot_credentials_directory: Arc::new(StdMutex::new(None)),
             direct_resumed_threads: Arc::new(StdMutex::new(HashSet::new())),
             thread_runtime_routes: Arc::new(StdMutex::new(HashMap::new())),

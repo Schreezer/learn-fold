@@ -19,8 +19,8 @@ mod ssh;
 mod ssh_known_hosts;
 
 pub use config::{
-    TerminalConfig, TerminalCursorStyle, TerminalPalette, TerminalThemePreset,
-    render_ghostty_conf, theme_palette,
+    TerminalConfig, TerminalCursorStyle, TerminalPalette, TerminalThemePreset, render_ghostty_conf,
+    theme_palette,
 };
 pub use input::{
     TerminalKeyAction, TerminalKeyCode, TerminalKeyEvent, TerminalKeyMods, encode_text,

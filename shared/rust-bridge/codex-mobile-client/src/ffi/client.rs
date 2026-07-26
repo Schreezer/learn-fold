@@ -446,6 +446,21 @@ impl AppClient {
         };
     }
 
+    /// Install or replace the platform dynamic-tool bridge. The shared Rust
+    /// dispatcher retains the callback and invokes it only for tools it does
+    /// not implement itself.
+    pub fn set_platform_dynamic_tool_handler(
+        &self,
+        handler: Box<dyn types::PlatformDynamicToolHandler>,
+    ) {
+        let mut guard = self
+            .inner
+            .platform_dynamic_tool_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(Arc::from(handler));
+    }
+
     /// Register the directory where Slingshot controller enrollment
     /// credentials are persisted. Platforms should pass their private
     /// preferences/application-support directory at launch.
