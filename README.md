@@ -1,11 +1,11 @@
-# litter
+# Learnfold
 
 <p align="center">
-  <img src="apps/ios/Sources/Litter/Resources/brand_logo.png" alt="litter logo" width="180" />
+  <img src="apps/ios/Sources/Litter/Resources/brand_logo.png" alt="Learnfold logo" width="180" />
 </p>
 
 <p align="center">
-  Native iOS + Android client for <a href="https://github.com/openai/codex">Codex</a>. Connect to local or remote servers, manage sessions, and run agentic coding workflows from your phone.
+  A Swift-first personal learning studio that turns topics, documents, and links into living courses powered by private course agents.
 </p>
 
 <p align="center">

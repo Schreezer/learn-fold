@@ -88,6 +88,7 @@ shared/third_party/codex/
 artifacts/
 tools/app-store-screenshots/
 .xcodebuildmcp/
+.swiftpm/
 .agents/
 .antigravitycli/
 skills-lock.json

@@ -1,5 +1,11 @@
 # Repository Guidelines
 
+## Product and Platform Focus
+- **Learnfold is a Swift-first Apple-platform application.** The iOS app under `apps/ios/` is the primary product, source of truth for user-facing behavior, and default implementation and verification target.
+- Default new product work to Swift, SwiftUI, and the iOS build/test lanes. Do not add, mirror, build, or verify Android behavior unless the user explicitly requests Android work.
+- The Android tree is a secondary/legacy surface retained in the repository; its presence does not create an automatic parity requirement for iOS changes.
+- Shared protocol, runtime-state, and reconciliation logic may still belong in `shared/rust-bridge/codex-mobile-client/` when required by the iOS architecture. Keep the Swift projection thin, but optimize decisions and verification for the iOS product.
+
 ## Project Structure & Module Organization
 - `apps/ios/Sources/Litter/` contains the iOS app code.
 - `apps/ios/Sources/Litter/Views/` holds SwiftUI screens, `Models/` contains app state/session logic, and `Bridge/` contains JSON-RPC + C FFI bridge code.
@@ -72,14 +78,15 @@
   - `apps/android/app/` and `apps/android/core/bridge/`
   - keep those files free of duplicated Rust-owned state/reducer logic
 
-## Drift Guardrails
-- Default to mobile parity. When a change affects shared mobile behavior or a user-facing mobile workflow, implement and verify it for both iOS and Android in the same pass unless it is truly platform-specific.
-- If a mobile change intentionally ships on only one platform, document the reason in your summary and note the follow-up needed for the other platform.
-- Before adding new Swift/Kotlin logic, ask: would Android/iOS both need this behavior? If yes, put it in Rust.
+## Platform Guardrails
+- Default to iOS-only implementation and verification. Android parity is not required unless the user explicitly includes Android in the task.
+- Do not touch `apps/android/`, run Android builds, or create Android follow-up work for an iOS product change unless requested.
+- Before adding new Swift logic, ask whether it is presentation/platform behavior or canonical protocol/runtime state. Keep iOS UI and Apple-platform behavior in Swift; put canonical shared runtime state and reconciliation in Rust when the existing architecture requires it.
+- If a shared Rust change incidentally affects generated Kotlin bindings, preserve boundary compatibility when practical, but do not expand the task into Android UI or Android QA without explicit direction.
 - Before adding a new `String` status field to Swift/Kotlin models, ask: should this be a Rust enum instead? Usually yes.
 - Before adding a new `AppStore` method, ask: is this a real composite/store action, or should it live on `AppClient` instead?
 - Before adding a new platform cache, ask: is this canonical runtime data that should live in the Rust store instead?
-- When in doubt, prefer one shared Rust implementation plus a thin platform projection over two parallel native implementations.
+- When in doubt, prefer the existing shared Rust implementation plus a thin Swift projection; do not create a parallel Kotlin implementation unless Android is explicitly in scope.
 - Do not push `shared/third_party/codex` as part of normal repo work. Keep submodule edits local-only unless the user explicitly asks for a separate submodule commit/push, and do not assume a top-level `git push` captures dirty submodule contents.
 
 ## Dependencies
