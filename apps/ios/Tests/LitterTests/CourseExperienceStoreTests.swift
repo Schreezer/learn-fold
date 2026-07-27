@@ -4,6 +4,10 @@ import NativeBlockEditorUI
 import NativeEditorMCP
 @testable import Litter
 
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
+
 @MainActor
 final class CourseExperienceStoreTests: XCTestCase {
     func testFreshStoreStartsWithEmptyCourseLibraryAndRequiresAgentSetup() throws {
@@ -250,9 +254,11 @@ final class CourseExperienceStoreTests: XCTestCase {
             CourseAgentProvider.applePrivateCloud
         )
 
-        XCTAssertEqual(onDevice.triggerTokens, 6_500)
-        XCTAssertEqual(onDevice.summaryTokenLimit, 1_500)
-        XCTAssertEqual(onDevice.effectiveTrigger(contextSize: 4_096), 2_084)
+        XCTAssertEqual(onDevice.triggerTokens, 2_850)
+        XCTAssertEqual(onDevice.summaryTokenLimit, 512)
+        XCTAssertEqual(onDevice.responseReserveTokens, 640)
+        XCTAssertEqual(onDevice.toolOutputReserveTokens, 384)
+        XCTAssertEqual(onDevice.effectiveTrigger(contextSize: 4_096), 2_850)
         XCTAssertEqual(privateCloud.triggerTokens, 27_500)
         XCTAssertEqual(privateCloud.summaryTokenLimit, 1_500)
         XCTAssertEqual(privateCloud.effectiveTrigger(contextSize: 32_768), 27_500)
@@ -284,7 +290,9 @@ final class CourseExperienceStoreTests: XCTestCase {
     func testAppleContextBudgetIncludesIncomingPromptAndUsesConservativeEstimate() {
         let budget = AppleCourseContextBudget(
             triggerTokens: 10,
-            summaryTokenLimit: 3
+            summaryTokenLimit: 3,
+            responseReserveTokens: 2,
+            toolOutputReserveTokens: 1
         )
 
         XCTAssertFalse(
@@ -305,9 +313,85 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
     }
 
+    func testOnDeviceToolModeCarriesOnlyTheCurrentWorkflowSchema() {
+        XCTAssertEqual(
+            AppleCourseToolMode.forTurn(
+                providerID: CourseAgentProvider.appleOnDevice,
+                hasApprovedPlan: false,
+                learnerPrompt: "Teach me Swift actors."
+            ),
+            .planning
+        )
+        XCTAssertEqual(
+            AppleCourseToolMode.forTurn(
+                providerID: CourseAgentProvider.appleOnDevice,
+                hasApprovedPlan: true,
+                learnerPrompt: "Add an example to the current lesson."
+            ),
+            .appendingLesson
+        )
+        XCTAssertEqual(
+            AppleCourseToolMode.forTurn(
+                providerID: CourseAgentProvider.appleOnDevice,
+                hasApprovedPlan: true,
+                learnerPrompt: "I approve course plan actor-basics, revision 1. Go ahead."
+            ),
+            .generatingLesson
+        )
+        XCTAssertEqual(
+            AppleCourseToolMode.forTurn(
+                providerID: CourseAgentProvider.appleOnDevice,
+                hasApprovedPlan: true,
+                learnerPrompt: "Revise the plan to use fewer chapters."
+            ),
+            .planning
+        )
+        XCTAssertEqual(
+            AppleCourseToolMode.forTurn(
+                providerID: CourseAgentProvider.applePrivateCloud,
+                hasApprovedPlan: true,
+                learnerPrompt: "Add an example."
+            ),
+            .full
+        )
+    }
+
+    func testGeneratedLessonValidatorRejectsNonActorAndTruncatedSwift() {
+        XCTAssertNotNil(
+            AppleCourseGeneratedLessonValidator.swiftCodeIssue(
+                "struct Counter { var value = 0 }"
+            )
+        )
+        XCTAssertNotNil(
+            AppleCourseGeneratedLessonValidator.swiftCodeIssue(
+                "actor Counter { func increment() { print("
+            )
+        )
+        XCTAssertNil(
+            AppleCourseGeneratedLessonValidator.swiftCodeIssue(
+                """
+                actor Counter {
+                    private var value = 0
+
+                    func increment() -> Int {
+                        value += 1
+                        return value
+                    }
+                }
+                """
+            )
+        )
+        XCTAssertEqual(
+            AppleCourseGeneratedLessonValidator.validatedSwiftCode(
+                "struct Counter { var value = 0 }"
+            ),
+            AppleCourseGeneratedLessonValidator.safeActorExample
+        )
+    }
+
     func testPrivateCloudCancellationRetriesRemainBoundedForMutationFreeTurns() {
         XCTAssertTrue(
-            AppleCoursePrivateCloudRetryPolicy.canRetryCancellation(
+            AppleCourseGenerationRetryPolicy.canRetryCancellation(
                 retryCount: 0,
                 taskWasCancelled: false,
                 latestResponse: "",
@@ -316,7 +400,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             )
         )
         XCTAssertTrue(
-            AppleCoursePrivateCloudRetryPolicy.canRetryCancellation(
+            AppleCourseGenerationRetryPolicy.canRetryCancellation(
                 retryCount: 1,
                 taskWasCancelled: false,
                 latestResponse: "",
@@ -325,7 +409,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            AppleCoursePrivateCloudRetryPolicy.canRetryCancellation(
+            AppleCourseGenerationRetryPolicy.canRetryCancellation(
                 retryCount: 2,
                 taskWasCancelled: false,
                 latestResponse: "",
@@ -337,7 +421,7 @@ final class CourseExperienceStoreTests: XCTestCase {
 
     func testPrivateCloudCancellationNeverRetriesPossibleSideEffects() {
         XCTAssertFalse(
-            AppleCoursePrivateCloudRetryPolicy.canRetryCancellation(
+            AppleCourseGenerationRetryPolicy.canRetryCancellation(
                 retryCount: 0,
                 taskWasCancelled: false,
                 latestResponse: "Partial",
@@ -346,7 +430,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            AppleCoursePrivateCloudRetryPolicy.canRetryCancellation(
+            AppleCourseGenerationRetryPolicy.canRetryCancellation(
                 retryCount: 0,
                 taskWasCancelled: false,
                 latestResponse: "",
@@ -355,7 +439,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            AppleCoursePrivateCloudRetryPolicy.canRetryCancellation(
+            AppleCourseGenerationRetryPolicy.canRetryCancellation(
                 retryCount: 0,
                 taskWasCancelled: false,
                 latestResponse: "",
@@ -364,7 +448,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            AppleCoursePrivateCloudRetryPolicy.canRetryCancellation(
+            AppleCourseGenerationRetryPolicy.canRetryCancellation(
                 retryCount: 0,
                 taskWasCancelled: true,
                 latestResponse: "",
@@ -376,11 +460,11 @@ final class CourseExperienceStoreTests: XCTestCase {
 
     func testPrivateCloudWatchdogOnlyCancelsMutationFreeHungAttempts() {
         XCTAssertEqual(
-            AppleCoursePrivateCloudRetryPolicy.mutationFreeAttemptTimeout,
+            AppleCourseGenerationRetryPolicy.mutationFreeAttemptTimeout,
             .seconds(90)
         )
         XCTAssertTrue(
-            AppleCoursePrivateCloudRetryPolicy.canCancelHungAttempt(
+            AppleCourseGenerationRetryPolicy.canCancelHungAttempt(
                 taskWasCancelled: false,
                 latestResponse: "",
                 didPresentCoursePlan: false,
@@ -388,7 +472,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            AppleCoursePrivateCloudRetryPolicy.canCancelHungAttempt(
+            AppleCourseGenerationRetryPolicy.canCancelHungAttempt(
                 taskWasCancelled: false,
                 latestResponse: "partial",
                 didPresentCoursePlan: false,
@@ -396,7 +480,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            AppleCoursePrivateCloudRetryPolicy.canCancelHungAttempt(
+            AppleCourseGenerationRetryPolicy.canCancelHungAttempt(
                 taskWasCancelled: false,
                 latestResponse: "",
                 didPresentCoursePlan: true,
@@ -404,7 +488,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            AppleCoursePrivateCloudRetryPolicy.canCancelHungAttempt(
+            AppleCourseGenerationRetryPolicy.canCancelHungAttempt(
                 taskWasCancelled: false,
                 latestResponse: "",
                 didPresentCoursePlan: false,
@@ -414,6 +498,183 @@ final class CourseExperienceStoreTests: XCTestCase {
     }
 
 #if canImport(FoundationModels)
+    func testAppleOnDeviceRuntimeLiveSmoke() async throws {
+        guard #available(iOS 26.4, *) else {
+            throw XCTSkip("Exact Foundation Models context APIs require iOS 26.4 or later.")
+        }
+        let model = SystemLanguageModel.default
+        guard case .available = model.availability else {
+            throw XCTSkip("Apple On-Device is unavailable: \(model.availability)")
+        }
+
+        let prompt = """
+        Make a one-chapter beginner course plan about Swift actors and present it for my approval.
+        """
+        let promptTokens = try await model.tokenCount(for: prompt)
+        XCTAssertGreaterThan(model.contextSize, promptTokens)
+
+        let runtime = SystemAppleCourseAgentRuntime()
+        let sessionID = UUID()
+        let workspaceID = "local-model-e2e-swift-actors-\(sessionID.uuidString.lowercased())"
+        let store = CourseExperienceStore(
+            defaults: try makeDefaults(),
+            environment: ["SNAPPY_SKIP_AGENT_SETUP": "1"],
+            appleRuntime: runtime
+        )
+        let courseDirectory = store.courseDatabaseURL(workspaceID: workspaceID)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let coursesRoot = courseDirectory.deletingLastPathComponent()
+        if let priorLiveSmokeDirectories = try? FileManager.default.contentsOfDirectory(
+            at: coursesRoot,
+            includingPropertiesForKeys: nil
+        ) {
+            for priorDirectory in priorLiveSmokeDirectories where
+                priorDirectory.lastPathComponent.hasPrefix("local-model-e2e-swift-actors-")
+            {
+                try? FileManager.default.removeItem(at: priorDirectory)
+            }
+        }
+        try? FileManager.default.removeItem(at: courseDirectory)
+        var latestResponse = ""
+        var presentedPlans: [CourseBrief] = []
+        defer {
+            runtime.remove(sessionID: sessionID, workspaceID: workspaceID)
+        }
+
+        try await runtime.send(
+            sessionID: sessionID,
+            providerID: CourseAgentProvider.appleOnDevice,
+            workspaceID: workspaceID,
+            prompt: prompt,
+            onPartialResponse: { latestResponse = $0 },
+            onCoursePlan: { plan in
+                presentedPlans.append(plan)
+            }
+        )
+
+        XCTAssertEqual(presentedPlans.count, 1)
+        XCTAssertEqual(presentedPlans.first?.chapters.count, 1)
+        XCTAssertFalse(latestResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        let plan = try XCTUnwrap(presentedPlans.first)
+        let metadataDirectory = courseDirectory.appendingPathComponent(".course", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: metadataDirectory,
+            withIntermediateDirectories: true
+        )
+        let planData = try JSONEncoder().encode(plan)
+        try planData.write(
+            to: metadataDirectory.appendingPathComponent(
+                AppleCourseApprovalPolicy.presentedPlanFilename
+            ),
+            options: .atomic
+        )
+        try planData.write(
+            to: metadataDirectory.appendingPathComponent(
+                AppleCourseApprovalPolicy.approvedPlanFilename
+            ),
+            options: .atomic
+        )
+        XCTAssertTrue(
+            AppleCourseApprovalPolicy.isLatestPlanApproved(courseDirectory: courseDirectory)
+        )
+
+        _ = try await store.prepareApprovedCourseShell(
+            brief: plan,
+            workspaceID: workspaceID
+        )
+        latestResponse = ""
+        let firstChapter = try XCTUnwrap(plan.chapters.first)
+        try await runtime.send(
+            sessionID: sessionID,
+            providerID: CourseAgentProvider.appleOnDevice,
+            workspaceID: workspaceID,
+            prompt: """
+            I approve course plan \(plan.planID), revision \(plan.revision). Learnfold has already \
+            created the learner context pages, the chapter folder, and one pending lesson page for \
+            \(firstChapter.title). Use learnfold_generate_lesson exactly once, replacing the current \
+            lesson content with a concise but complete beginner lesson of at most 120 words containing \
+            an explanation, one small compiling Swift example, and one short exercise. Mark it \
+            generated. Do not recreate the course structure.
+            """,
+            onPartialResponse: { latestResponse = $0 },
+            onCoursePlan: { _ in
+                XCTFail("An approved course turn must use only the editor tool schema.")
+            }
+        )
+        XCTAssertFalse(latestResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+        let repository = try await CourseDocumentRegistry.shared.repository(
+            workspaceID: workspaceID,
+            databaseURL: store.courseDatabaseURL(workspaceID: workspaceID),
+            rootTitle: plan.title
+        )
+        var outline = try await repository.outline()
+        let lessonNodeID = "\(firstChapter.id)-lesson-1"
+        let generatedLessonNode = try XCTUnwrap(
+            flattenCourseNodes(outline.learningPages).first(where: { $0.id == lessonNodeID })
+        )
+        XCTAssertEqual(generatedLessonNode.status, .generated)
+        let lessonPageID = try XCTUnwrap(generatedLessonNode.pageID)
+        let generatedLesson = try await repository.pageSnapshot(id: lessonPageID)
+        let generatedMarkdown = AppFlowyMarkdownCodec().encode(generatedLesson.document)
+        XCTAssertTrue(generatedMarkdown.contains("actor"))
+        XCTAssertTrue(generatedMarkdown.contains("```swift"))
+        let generatedCode = generatedMarkdown
+            .components(separatedBy: "```swift")
+            .dropFirst()
+            .first?
+            .components(separatedBy: "```")
+            .first ?? ""
+        XCTAssertNil(AppleCourseGeneratedLessonValidator.swiftCodeIssue(generatedCode))
+
+        let editMarker = "Prefer one actor per independently mutable subsystem."
+        latestResponse = ""
+        try await runtime.send(
+            sessionID: sessionID,
+            providerID: CourseAgentProvider.appleOnDevice,
+            workspaceID: workspaceID,
+            prompt: """
+            Edit the generated lesson for \(firstChapter.title). Fetch it immediately, then append \
+            a section titled "Actor Design Rule" containing exactly this sentence: "\(editMarker)" \
+            Use learnfold_append_lesson_section exactly once, appending the new section to the current \
+            lesson without marking generation status again. Do not change any other page.
+            """,
+            onPartialResponse: { latestResponse = $0 },
+            onCoursePlan: { _ in
+                XCTFail("Editing an approved course must not present another plan.")
+            }
+        )
+        XCTAssertFalse(latestResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+        let editedLesson = try await repository.pageSnapshot(id: lessonPageID)
+        let editedMarkdown = AppFlowyMarkdownCodec().encode(editedLesson.document)
+        XCTAssertGreaterThan(editedLesson.revision, generatedLesson.revision)
+        XCTAssertTrue(editedMarkdown.contains("Actor Design Rule"))
+        XCTAssertTrue(editedMarkdown.contains(editMarker))
+        try await store.markCourseReadyForLearning(repository: repository, brief: plan)
+
+        outline = try await repository.outline()
+        XCTAssertTrue(outline.isReadyForLearning)
+        let relaunchedStore = CourseExperienceStore(
+            defaults: try makeDefaults(),
+            environment: ["SNAPPY_SKIP_AGENT_SETUP": "1"]
+        )
+        await relaunchedStore.recoverReadyCourses(
+            in: courseDirectory.deletingLastPathComponent()
+        )
+        XCTAssertTrue(relaunchedStore.courses.contains { $0.workspaceID == workspaceID })
+
+        let messages = await runtime.restoredMessages(
+            sessionID: sessionID,
+            workspaceID: workspaceID
+        )
+        XCTAssertEqual(
+            messages.map(\.role),
+            [.learner, .agent, .learner, .agent, .learner, .agent]
+        )
+    }
+
     func testAppleLiveSessionCallbacksRebindForApprovedTurn() throws {
         guard #available(iOS 26.0, *) else { return }
 
@@ -1220,7 +1481,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(instructions.contains("A selected-passage question"))
         XCTAssertTrue(instructions.contains("Answer only in chat"))
         XCTAssertTrue(instructions.contains("Add or revise a focused section"))
-        XCTAssertTrue(instructions.contains("create an `explainer` child page"))
+        XCTAssertTrue(instructions.contains("Create an `explainer` child page"))
         XCTAssertTrue(instructions.contains("Do not edit merely because editing tools are available"))
         XCTAssertTrue(instructions.contains("expected_revision"))
         XCTAssertTrue(instructions.contains("Never create Markdown lesson files"))
@@ -1472,6 +1733,10 @@ final class CourseExperienceStoreTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
         return defaults
+    }
+
+    private func flattenCourseNodes(_ nodes: [CourseLearningNode]) -> [CourseLearningNode] {
+        nodes.flatMap { [$0] + flattenCourseNodes($0.children) }
     }
 
     private func jsonString(_ object: [String: Any]) throws -> String {

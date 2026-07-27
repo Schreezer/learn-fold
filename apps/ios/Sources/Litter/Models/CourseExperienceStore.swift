@@ -38,6 +38,12 @@ struct LearningCourse: Identifiable, Codable, Equatable {
 
 }
 
+struct PreparedCourseLessonTarget: Codable, Equatable, Sendable {
+    let nodeID: String
+    let pageID: String
+    let revision: Int64
+}
+
 struct CourseAgentOption: Identifiable, Equatable {
     let id: String
     let title: String
@@ -920,7 +926,7 @@ final class CourseExperienceStore {
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.prepareApprovedCourseShell(
+                _ = try await self.prepareApprovedCourseShell(
                     brief: acceptedBrief,
                     workspaceID: workspaceID
                 )
@@ -935,7 +941,8 @@ final class CourseExperienceStore {
             let editorInstruction: String
             if CourseAgentProvider.isApple(self.currentAgentRuntimeID ?? self.selectedAgentID ?? "") {
                 editorInstruction = """
-                Use learnfold_editor_action to fetch that pending lesson and update only that page
+                Use learnfold_generate_lesson once to write the current lesson and mark it \
+                generated
                 """
             } else {
                 editorInstruction = """
@@ -948,9 +955,10 @@ final class CourseExperienceStore {
             Learnfold has already created the learner context pages, every chapter folder, and one \
             pending lesson page for Chapter 1\(firstChapter.map { " (\($0.title))" } ?? ""). \
             \(editorInstruction) with a \
-            concise, complete beginner lesson: explanation, one Swift example, and one short \
-            exercise. Set its generation_status to generated. Do not create or edit later chapter \
-            lessons, and do not recreate the course structure.
+            concise, complete beginner lesson of at most 120 words: explanation, one small \
+            compiling Swift example, and one short exercise. Set its generation_status to \
+            generated in that same update. Do not create or edit later chapter lessons, and do \
+            not recreate the course structure.
             """
             self.sendMessage(approval, appModel: appModel, appState: appState)
         }
@@ -1719,10 +1727,10 @@ final class CourseExperienceStore {
         )
     }
 
-    private func prepareApprovedCourseShell(
+    func prepareApprovedCourseShell(
         brief: CourseBrief,
         workspaceID: String
-    ) async throws {
+    ) async throws -> PreparedCourseLessonTarget {
         let repository = try await CourseDocumentRegistry.shared.repository(
             workspaceID: workspaceID,
             databaseURL: courseDatabaseURL(workspaceID: workspaceID),
@@ -1853,6 +1861,25 @@ final class CourseExperienceStore {
                 ]
             )
         }
+        outline = try await repository.outline()
+        guard let lessonPageID = Self.flattenLearningNodes(outline.learningPages)
+            .first(where: { $0.id == lessonNodeID })?.pageID else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let lesson = try await repository.pageSnapshot(id: lessonPageID)
+        let target = PreparedCourseLessonTarget(
+            nodeID: lessonNodeID,
+            pageID: lessonPageID,
+            revision: lesson.revision
+        )
+        let targetData = try JSONEncoder().encode(target)
+        try targetData.write(
+            to: courseDatabaseURL(workspaceID: workspaceID)
+                .deletingLastPathComponent()
+                .appendingPathComponent(AppleCourseApprovalPolicy.lessonTargetFilename),
+            options: .atomic
+        )
+        return target
     }
 
     private func markCourseReadyForLearning() async throws {
@@ -1864,7 +1891,7 @@ final class CourseExperienceStore {
         try await markCourseReadyForLearning(repository: repository, brief: brief)
     }
 
-    private func markCourseReadyForLearning(
+    func markCourseReadyForLearning(
         repository: CourseDocumentRepository,
         brief: CourseBrief
     ) async throws {
