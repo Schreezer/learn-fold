@@ -366,6 +366,12 @@ enum CourseAgentHydrationPolicy {
     }
 }
 
+struct RemoteCourseToolCall: Equatable {
+    let name: String
+    let argumentsJSON: String
+    let visibleText: String
+}
+
 @MainActor
 @Observable
 final class CourseExperienceStore {
@@ -379,6 +385,7 @@ final class CourseExperienceStore {
     private static let introKey = "learnfold.intro.hasCompleted"
     private static let setupKey = "snappy.course.agentSetupComplete"
     private static let agentKey = "snappy.course.selectedAgent"
+    private static let agentServerKey = "snappy.course.selectedAgentServer"
     private static let modelKey = "snappy.course.selectedModel"
     private static let effortKey = "snappy.course.selectedReasoningEffort"
     private static let coursesKey = "snappy.course.savedCourses"
@@ -388,6 +395,7 @@ final class CourseExperienceStore {
 
     var navigationPath: [CourseRoute] = []
     var selectedAgentID: String?
+    var selectedAgentServerID: String?
     var selectedModelID: String?
     var selectedReasoningEffortID: String?
     var agentOptions: [CourseAgentOption] = []
@@ -429,6 +437,7 @@ final class CourseExperienceStore {
     private var processedCoursePlanToolCallIDs: Set<String> = []
     private let defaults: UserDefaults
     private var currentAgentRuntimeID: String?
+    private var currentAgentServerID: String?
     private var currentAgentModelID: String?
     private var currentAppleSessionID: UUID?
     private var didInstallDocumentToolRouter = false
@@ -458,6 +467,7 @@ final class CourseExperienceStore {
             defaults.removeObject(forKey: Self.introKey)
             defaults.removeObject(forKey: Self.setupKey)
             defaults.removeObject(forKey: Self.agentKey)
+            defaults.removeObject(forKey: Self.agentServerKey)
             defaults.removeObject(forKey: Self.modelKey)
             defaults.removeObject(forKey: Self.effortKey)
             defaults.removeObject(forKey: Self.coursesKey)
@@ -465,6 +475,7 @@ final class CourseExperienceStore {
         }
 
         selectedAgentID = defaults.string(forKey: Self.agentKey)
+        selectedAgentServerID = defaults.string(forKey: Self.agentServerKey)
         selectedModelID = defaults.string(forKey: Self.modelKey)
         selectedReasoningEffortID = defaults.string(forKey: Self.effortKey)
         let persistedSetupComplete = defaults.bool(forKey: Self.setupKey)
@@ -556,12 +567,38 @@ final class CourseExperienceStore {
         LitterPlatform.bootstrapLocalRuntimeIfNeeded()
 
         do {
-            let serverID = try await connectedLocalServerID(appModel: appModel)
+            let serverID = try await connectedCourseServerID(appModel: appModel)
             await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
             refreshAgentCatalog(appModel: appModel, serverID: serverID)
         } catch {
             agentError = error.localizedDescription
         }
+    }
+
+    func selectRemoteAgentServer(
+        serverID: String,
+        appModel: AppModel
+    ) async {
+        while isLoadingAgentCatalog {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard appModel.snapshot?.serverSnapshot(for: serverID)?.isConnected == true else {
+            agentError = "The selected server is no longer connected."
+            return
+        }
+        selectedAgentServerID = serverID
+        defaults.set(serverID, forKey: Self.agentServerKey)
+        await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
+        refreshAgentCatalog(appModel: appModel, serverID: serverID)
+        if agentOptions.first(where: { $0.id == "hermes" })?.available == true {
+            selectedAgentID = "hermes"
+            selectedModelID = defaultModelID(for: "hermes")
+            selectedReasoningEffortID = nil
+        }
+        setupComplete = false
+        connectionState = .idle
+        agentError = nil
+        defaults.set(false, forKey: Self.setupKey)
     }
 
     func installDocumentToolRouterIfNeeded(appModel: AppModel) {
@@ -609,7 +646,7 @@ final class CourseExperienceStore {
         LitterPlatform.bootstrapLocalRuntimeIfNeeded()
 
         do {
-            let serverID = try await connectedLocalServerID(appModel: appModel)
+            let serverID = try await connectedCourseServerID(appModel: appModel)
             refreshAgentCatalog(appModel: appModel, serverID: serverID)
             guard agentOptions.first(where: { $0.id == agentID })?.available == true else {
                 throw CourseAgentSelectionError.runtimeUnavailable(agentID.titleDisplayLabel)
@@ -645,6 +682,7 @@ final class CourseExperienceStore {
                 })?.reasoningEffort.wireValue
 
             selectedAgentID = agentID
+            selectedAgentServerID = serverID
             selectedModelID = resolvedModelID
             selectedReasoningEffortID = resolvedEffort
             setupComplete = true
@@ -654,7 +692,8 @@ final class CourseExperienceStore {
         } catch {
             LLog.error("course-agent", "could not connect the local course agent", error: error)
             connectionState = .failed(error.localizedDescription)
-            agentError = "Codex is unavailable right now. Check the local connection and try again."
+            agentError =
+                "\(agentID.titleDisplayLabel) is unavailable right now. Check the selected server connection and try again."
         }
     }
 
@@ -712,6 +751,7 @@ final class CourseExperienceStore {
         }
         currentCourseWorkspaceID = UUID().uuidString.lowercased()
         currentAgentRuntimeID = selectedAgentID ?? "codex"
+        currentAgentServerID = selectedAgentServerID
         currentAgentModelID = selectedModelID
         currentAppleSessionID = CourseAgentProvider.isApple(currentAgentRuntimeID ?? "")
             ? UUID()
@@ -892,11 +932,22 @@ final class CourseExperienceStore {
             }
             guard self.currentCourseWorkspaceID == workspaceID else { return }
             let firstChapter = acceptedBrief.chapters.first
+            let editorInstruction: String
+            if CourseAgentProvider.isApple(self.currentAgentRuntimeID ?? self.selectedAgentID ?? "") {
+                editorInstruction = """
+                Use learnfold_editor_action to fetch that pending lesson and update only that page
+                """
+            } else {
+                editorInstruction = """
+                Use native-editor-fetch to inspect that pending lesson, then native-editor-update-page \
+                to update only that page
+                """
+            }
             let approval = """
             I approve course plan \(acceptedBrief.planID), revision \(acceptedBrief.revision). \
             Learnfold has already created the learner context pages, every chapter folder, and one \
-            pending lesson page for Chapter 1\(firstChapter.map { " (\($0.title))" } ?? ""). Use \
-            learnfold_editor_action to fetch that pending lesson and update only that page with a \
+            pending lesson page for Chapter 1\(firstChapter.map { " (\($0.title))" } ?? ""). \
+            \(editorInstruction) with a \
             concise, complete beginner lesson: explanation, one Swift example, and one short \
             exercise. Set its generation_status to generated. Do not create or edit later chapter \
             lessons, and do not recreate the course structure.
@@ -1103,7 +1154,7 @@ final class CourseExperienceStore {
         do {
             installDocumentToolRouterIfNeeded(appModel: appModel)
             let workspaceID = currentCourseWorkspaceID
-            let serverID = try await connectedLocalServerID(appModel: appModel)
+            let serverID = try await connectedCourseServerID(appModel: appModel)
             let runtimeID = currentAgentRuntimeID ?? selectedAgentID ?? "codex"
             if runtimeID == .codex {
                 guard try await appModel.ensureLocalAuthForThreadStart(serverId: serverID) else {
@@ -1378,6 +1429,7 @@ final class CourseExperienceStore {
         generationError = nil
         agentThreadKey = nil
         currentAgentRuntimeID = course.agentRuntimeKind ?? "codex"
+        currentAgentServerID = course.agentServerID
         currentAgentModelID = course.agentModelID
         currentAppleSessionID = course.appleSessionID
         if let serverID = course.agentServerID,
@@ -1427,24 +1479,32 @@ final class CourseExperienceStore {
             agentError = capability.available ? nil : capability.reason
             return
         }
-        guard activeAgentID == .codex else { return }
         do {
-            let serverID = try await connectedLocalServerID(appModel: appModel)
-            _ = try await appModel.client.refreshAccount(
-                serverId: serverID,
-                params: AppRefreshAccountRequest(refreshToken: false)
-            )
-            await appModel.refreshSnapshot()
+            let serverID = try await connectedCourseServerID(appModel: appModel)
+            if activeAgentID == .codex {
+                _ = try await appModel.client.refreshAccount(
+                    serverId: serverID,
+                    params: AppRefreshAccountRequest(refreshToken: false)
+                )
+                await appModel.refreshSnapshot()
+            }
             guard let server = appModel.snapshot?.serverSnapshot(for: serverID) else {
                 connectionState = .idle
                 return
             }
-            agentNeedsAuthentication = server.requiresOpenaiAuth && server.account == nil
-            connectionState = server.isConnected && !agentNeedsAuthentication ? .connected : .idle
+            let runtimeAvailable = server.agentRuntimes.contains {
+                $0.kind == activeAgentID && $0.available
+            }
+            agentNeedsAuthentication =
+                activeAgentID == .codex && server.requiresOpenaiAuth && server.account == nil
+            connectionState =
+                server.isConnected && runtimeAvailable && !agentNeedsAuthentication
+                ? .connected
+                : .idle
         } catch {
-            LLog.error("course-agent", "could not refresh Codex account readiness", error: error)
+            LLog.error("course-agent", "could not refresh course agent readiness", error: error)
             connectionState = .failed(error.localizedDescription)
-            agentError = "Codex is unavailable right now. Check the local connection and try again."
+            agentError = "The course agent is unavailable right now. Check its server connection and try again."
         }
     }
 
@@ -1507,7 +1567,20 @@ final class CourseExperienceStore {
                     databaseURL: databaseURL,
                     rootTitle: approvedBrief.title
                 )
-                guard (try await repository.outline()).isReadyForLearning else { continue }
+                var outline = try await repository.outline()
+                if !outline.isReadyForLearning,
+                   outline.learningPages.first.map({
+                       Self.flattenLearningNodes([$0]).contains {
+                           $0.kind == .markdown && $0.status == .generated
+                       }
+                   }) == true {
+                    try await markCourseReadyForLearning(
+                        repository: repository,
+                        brief: approvedBrief
+                    )
+                    outline = try await repository.outline()
+                }
+                guard outline.isReadyForLearning else { continue }
                 recovered.append(makeLearningCourse(
                     brief: approvedBrief,
                     workspaceID: workspaceID
@@ -1788,6 +1861,13 @@ final class CourseExperienceStore {
             databaseURL: courseDatabaseURL(workspaceID: currentCourseWorkspaceID),
             rootTitle: brief.title
         )
+        try await markCourseReadyForLearning(repository: repository, brief: brief)
+    }
+
+    private func markCourseReadyForLearning(
+        repository: CourseDocumentRepository,
+        brief: CourseBrief
+    ) async throws {
         let root = try await repository.rootPageSnapshot()
         try await callDocumentTool(
             repository,
@@ -1828,7 +1908,7 @@ final class CourseExperienceStore {
         }
     }
 
-    private func acceptPresentedApplePlan(_ plan: CourseBrief) throws {
+    private func acceptPresentedCoursePlan(_ plan: CourseBrief) throws {
         guard !plan.planID.isEmpty else {
             throw AppleCourseAgentError.toolFailed(
                 "The generated course plan is missing its plan identifier."
@@ -1947,7 +2027,7 @@ final class CourseExperienceStore {
                 return
             }
 
-            let serverID = try await connectedLocalServerID(appModel: appModel)
+            let serverID = try await connectedCourseServerID(appModel: appModel)
             if runtimeID == .codex {
                 guard try await appModel.ensureLocalAuthForThreadStart(serverId: serverID) else {
                     if let originalText, let optimisticMessageID {
@@ -2031,8 +2111,13 @@ final class CourseExperienceStore {
             }
             let previousResponseTurnID = appModel.snapshot?.sessionSummaries
                 .first(where: { $0.key == threadKey })?.lastResponseTurnId
+            let turnText = runtimeID == "hermes" && startsNewThread
+                ? try Self.remoteHermesBootstrapPrompt(workspaceID: workspaceID)
+                    + "\n\nLearner message:\n"
+                    + text
+                : text
             let payload = AppComposerPayload(
-                text: text,
+                text: turnText,
                 additionalInputs: imageInputs,
                 fileAttachments: fileAttachments,
                 approvalPolicy: .never,
@@ -2052,13 +2137,26 @@ final class CourseExperienceStore {
                 persistSelectionDiscussions()
             }
             lastAcceptedSelectionContextID = selectionContextID
-            await hydrateAgentResponse(
-                for: threadKey,
-                previousResponseTurnID: previousResponseTurnID,
-                workspaceID: workspaceID,
-                selectionDiscussionID: selectionDiscussionID,
-                appModel: appModel
-            )
+            if runtimeID == "hermes" {
+                try await hydrateRemoteHermesResponse(
+                    for: threadKey,
+                    previousResponseTurnID: previousResponseTurnID,
+                    workspaceID: workspaceID,
+                    selectionDiscussionID: selectionDiscussionID,
+                    appModel: appModel
+                )
+                if selectionDiscussionID == nil {
+                    await reconcileGeneratedCourseIfReady(workspaceID: workspaceID)
+                }
+            } else {
+                await hydrateAgentResponse(
+                    for: threadKey,
+                    previousResponseTurnID: previousResponseTurnID,
+                    workspaceID: workspaceID,
+                    selectionDiscussionID: selectionDiscussionID,
+                    appModel: appModel
+                )
+            }
         } catch {
             guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
             let submissionWasRestored = !turnWasAccepted && originalText != nil && optimisticMessageID != nil
@@ -2091,6 +2189,36 @@ final class CourseExperienceStore {
             } else {
                 agentError = failureMessage
             }
+        }
+    }
+
+    private func reconcileGeneratedCourseIfReady(workspaceID: String) async {
+        guard currentCourseWorkspaceID == workspaceID,
+              FileManager.default.fileExists(
+                  atPath: nativeCourseDirectory()
+                      .appendingPathComponent(
+                          ".course/\(AppleCourseApprovalPolicy.approvedPlanFilename)"
+                      )
+                      .path
+              ) else {
+            return
+        }
+        do {
+            var state = await courseBuildState()
+            if state.step == 4, !state.isComplete {
+                try await markCourseReadyForLearning()
+                state = await courseBuildState()
+            }
+            if state.isComplete {
+                finishGeneratedCourse(brief: brief, workspaceID: workspaceID)
+            }
+        } catch {
+            LLog.error(
+                "course-agent",
+                "could not reconcile the generated remote course",
+                error: error,
+                fields: ["workspaceId": workspaceID]
+            )
         }
     }
 
@@ -2155,7 +2283,7 @@ final class CourseExperienceStore {
                             "The course screen closed before the plan could be presented."
                         )
                     }
-                    try self.acceptPresentedApplePlan(plan)
+                    try self.acceptPresentedCoursePlan(plan)
                 }
             )
         } catch {
@@ -2217,6 +2345,187 @@ final class CourseExperienceStore {
     ) -> [CourseSource] {
         let currentSourceIDs = Set(current.map(\.id))
         return submitted.filter { !currentSourceIDs.contains($0.id) } + current
+    }
+
+    private func hydrateRemoteHermesResponse(
+        for key: ThreadKey,
+        previousResponseTurnID: String?,
+        workspaceID: String,
+        selectionDiscussionID: UUID?,
+        appModel: AppModel
+    ) async throws {
+        var previousTurnID = previousResponseTurnID
+        for _ in 0..<24 {
+            guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
+            let response = try await waitForRemoteHermesResponse(
+                for: key,
+                after: previousTurnID,
+                workspaceID: workspaceID,
+                appModel: appModel
+            )
+            guard let call = Self.remoteCourseToolCall(from: response.text) else {
+                appendCourseAgentMessage(response.text, discussionID: selectionDiscussionID)
+                return
+            }
+            if !call.visibleText.isEmpty {
+                appendCourseAgentMessage(call.visibleText, discussionID: selectionDiscussionID)
+            }
+
+            guard Self.remoteToolWorkspaceID(argumentsJSON: call.argumentsJSON) == workspaceID else {
+                throw NSError(
+                    domain: "LearnfoldRemoteCourseTool",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Hermes requested a course tool without the active Learnfold workspace identifier.",
+                    ]
+                )
+            }
+
+            if call.name == CourseAgentTools.presentPlan {
+                guard let data = call.argumentsJSON.data(using: .utf8),
+                      let plan = try? JSONDecoder().decode(CourseBrief.self, from: data) else {
+                    throw NSError(
+                        domain: "LearnfoldRemoteCourseTool",
+                        code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Hermes presented a course plan that Learnfold could not decode.",
+                        ]
+                    )
+                }
+                try acceptPresentedCoursePlan(plan)
+                return
+            }
+
+            let result: AppPlatformDynamicToolResult
+            if CourseAgentTools.isEditorTool(call.name) {
+                let invocation = AppPlatformDynamicToolInvocation(
+                    threadId: key.threadId,
+                    tool: call.name,
+                    argumentsJson: call.argumentsJSON
+                )
+                result = await Task.detached {
+                    CourseDocumentToolRouter.shared.handleDynamicTool(invocation: invocation)
+                        ?? AppPlatformDynamicToolResult(
+                            success: false,
+                            output: "Learnfold did not recognize this native course tool."
+                        )
+                }.value
+            } else {
+                result = AppPlatformDynamicToolResult(
+                    success: false,
+                    output: "Unknown Learnfold course tool: \(call.name)"
+                )
+            }
+
+            let toolResultPrompt = try Self.remoteHermesToolResultPrompt(
+                call: call,
+                result: result
+            )
+            previousTurnID = response.turnID
+            try await appModel.startTurn(
+                key: key,
+                payload: AppComposerPayload(
+                    text: toolResultPrompt,
+                    additionalInputs: [],
+                    fileAttachments: [],
+                    approvalPolicy: .never,
+                    sandboxPolicy: TurnSandboxPolicy.workspaceWrite.ffiValue,
+                    model: nil,
+                    effort: nil,
+                    serviceTier: nil
+                )
+            )
+        }
+        throw NSError(
+            domain: "LearnfoldRemoteCourseTool",
+            code: 3,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Hermes exceeded Learnfold’s 24-step native course tool limit.",
+            ]
+        )
+    }
+
+    private func waitForRemoteHermesResponse(
+        for key: ThreadKey,
+        after previousTurnID: String?,
+        workspaceID: String,
+        appModel: AppModel
+    ) async throws -> (text: String, turnID: String) {
+        var lastCandidate: String?
+        var stablePolls = 0
+        for poll in 0..<1_200 {
+            guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else {
+                throw CancellationError()
+            }
+            try await Task.sleep(for: .milliseconds(250))
+            if poll > 0, poll.isMultiple(of: 40) {
+                await appModel.refreshSnapshot()
+            }
+            guard let summary = appModel.snapshot?.sessionSummaries.first(where: {
+                $0.key == key
+            }),
+            let turnID = summary.lastResponseTurnId,
+            turnID != previousTurnID else {
+                continue
+            }
+            let preview = summary.lastResponsePreview?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let fullText = appModel.threadSnapshot(for: key)?
+                .hydratedConversationItems
+                .reversed()
+                .first(where: { item in
+                    guard item.sourceTurnId == turnID else { return false }
+                    if case .assistant = item.content { return true }
+                    return false
+                })
+                .flatMap { item -> String? in
+                    guard case .assistant(let data) = item.content else { return nil }
+                    return data.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            guard let candidate = fullText?.isEmpty == false ? fullText : preview,
+                  !candidate.isEmpty else {
+                continue
+            }
+            if candidate == lastCandidate {
+                stablePolls += 1
+            } else {
+                lastCandidate = candidate
+                stablePolls = 0
+            }
+            let threadIsIdle = appModel.threadSnapshot(for: key)?.hasActiveTurn == false
+            let hasCompleteToolCall = Self.remoteCourseToolCall(from: candidate) != nil
+            if threadIsIdle || hasCompleteToolCall || stablePolls >= 12 {
+                return (candidate, turnID)
+            }
+        }
+        throw NSError(
+            domain: "LearnfoldRemoteCourseTool",
+            code: 4,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Hermes did not finish its course response within five minutes.",
+            ]
+        )
+    }
+
+    private func appendCourseAgentMessage(_ text: String, discussionID: UUID?) {
+        let message = CourseChatMessage(role: .agent, text: text)
+        if let discussionID {
+            selectionLocalMessages[discussionID, default: []].append(message)
+        } else {
+            messages.append(message)
+        }
+    }
+
+    private static func remoteToolWorkspaceID(argumentsJSON: String) -> String? {
+        guard let data = argumentsJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object[CourseAgentTools.workspaceIDArgument] as? String
     }
 
     private func hydrateAgentResponse(
@@ -2329,6 +2638,128 @@ final class CourseExperienceStore {
         return json
     }
 
+    static func remoteCourseToolCall(from response: String) -> RemoteCourseToolCall? {
+        let marker = "\"learnfold_tool_call\""
+        guard let markerRange = response.range(of: marker) else { return nil }
+        let characters = Array(response)
+        let markerOffset = response.distance(from: response.startIndex, to: markerRange.lowerBound)
+        var objectStart = markerOffset
+        while objectStart >= 0, characters[objectStart] != "{" {
+            objectStart -= 1
+        }
+        guard objectStart >= 0,
+              let objectEnd = balancedJSONObjectEnd(in: characters, startingAt: objectStart) else {
+            return nil
+        }
+
+        let objectText = String(characters[objectStart...objectEnd])
+        guard let data = objectText.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let call = root["learnfold_tool_call"] as? [String: Any],
+              let name = call["name"] as? String,
+              !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let arguments = call["arguments"] as? [String: Any],
+              JSONSerialization.isValidJSONObject(arguments),
+              let argumentsData = try? JSONSerialization.data(
+                withJSONObject: arguments,
+                options: [.sortedKeys]
+              ) else {
+            return nil
+        }
+
+        let visiblePrefix = String(characters[..<objectStart])
+        let visibleSuffix = objectEnd + 1 < characters.count
+            ? String(characters[(objectEnd + 1)...])
+            : ""
+        let visibleText = (visiblePrefix + visibleSuffix)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("```") }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return RemoteCourseToolCall(
+            name: name,
+            argumentsJSON: String(decoding: argumentsData, as: UTF8.self),
+            visibleText: visibleText
+        )
+    }
+
+    private static func balancedJSONObjectEnd(
+        in characters: [Character],
+        startingAt start: Int
+    ) -> Int? {
+        var depth = 0
+        var isInsideString = false
+        var isEscaped = false
+        for index in start..<characters.count {
+            let character = characters[index]
+            if isInsideString {
+                if isEscaped {
+                    isEscaped = false
+                } else if character == "\\" {
+                    isEscaped = true
+                } else if character == "\"" {
+                    isInsideString = false
+                }
+                continue
+            }
+            if character == "\"" {
+                isInsideString = true
+            } else if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth == 0 {
+                    return index
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func remoteHermesBootstrapPrompt(workspaceID: String) throws -> String {
+        let definitions = try CourseAgentTools.mcpToolDefinitions().map(\.jsonObject)
+        let definitionsData = try JSONSerialization.data(
+            withJSONObject: definitions,
+            options: [.sortedKeys]
+        )
+        let definitionsJSON = String(decoding: definitionsData, as: UTF8.self)
+        return """
+        \(courseAgentInstructions)
+
+        Learnfold remote native-tool protocol:
+        - Your Hermes API runtime executes ordinary tools on the VPS, but the course document is owned by this iPhone.
+        - To call a Learnfold course tool, reply with exactly one JSON object and no Markdown fence:
+          {"learnfold_tool_call":{"name":"TOOL_NAME","arguments":{...}}}
+        - Emit at most one Learnfold tool call per reply. Learnfold executes it on the iPhone and sends a learnfold_tool_result message back to you.
+        - Never claim a native page changed until its successful tool result arrives.
+        - Every tool call must include "\(CourseAgentTools.workspaceIDArgument)":"\(workspaceID)".
+        - A mutating native-editor tool is rejected until the learner approves the presented plan.
+        - For a normal learner-facing reply, emit ordinary prose without a JSON envelope.
+
+        Available Learnfold tools:
+        \(definitionsJSON)
+        """
+    }
+
+    private static func remoteHermesToolResultPrompt(
+        call: RemoteCourseToolCall,
+        result: AppPlatformDynamicToolResult
+    ) throws -> String {
+        let payload: [String: Any] = [
+            "learnfold_tool_result": [
+                "name": call.name,
+                "success": result.success,
+                "output": result.output,
+            ],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        return """
+        \(String(decoding: data, as: UTF8.self))
+
+        Continue the course task. Return either one learnfold_tool_call JSON object or a normal learner-facing response.
+        """
+    }
+
     private func startFreshCourseThread(
         serverID: String,
         runtimeID: String,
@@ -2363,10 +2794,13 @@ final class CourseExperienceStore {
             persistExtendedHistory: true,
             configJSON: try courseMCPURL.map(Self.courseMCPConfigJSON(endpoint:))
         )
+        let courseCWD = appModel.isLocalServer(serverId: serverID)
+            ? "/mnt/apps/Courses/\(workspaceID)"
+            : "/"
         return try await appModel.client.startThread(
             serverId: serverID,
             params: launch.threadStartRequest(
-                cwd: "/mnt/apps/Courses/\(workspaceID)",
+                cwd: courseCWD,
                 dynamicTools: try courseDynamicToolSpecs(
                     appModel: appModel,
                     serverID: serverID,
@@ -2391,6 +2825,36 @@ final class CourseExperienceStore {
             tools.append(contentsOf: documentTools)
         }
         return tools
+    }
+
+    private func connectedCourseServerID(appModel: AppModel) async throws -> String {
+        var selectedServerIDs: [String] = []
+        for serverID in [currentAgentServerID, selectedAgentServerID].compactMap({ $0 })
+        where !selectedServerIDs.contains(serverID) {
+            selectedServerIDs.append(serverID)
+        }
+        if !selectedServerIDs.isEmpty {
+            for attempt in 0..<40 {
+                for serverID in selectedServerIDs {
+                    if appModel.snapshot?.serverSnapshot(for: serverID)?.isConnected == true {
+                        return serverID
+                    }
+                }
+                if attempt.isMultiple(of: 10) {
+                    await appModel.refreshSnapshot()
+                }
+                try await Task.sleep(for: .milliseconds(125))
+            }
+            throw NSError(
+                domain: "LearnfoldCourseServer",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The selected course server is not connected. Reconnect it and try again.",
+                ]
+            )
+        }
+        return try await connectedLocalServerID(appModel: appModel)
     }
 
     private func connectedLocalServerID(appModel: AppModel) async throws -> String {
@@ -2596,6 +3060,7 @@ final class CourseExperienceStore {
 
     private func persistAgentSelection() {
         defaults.set(selectedAgentID, forKey: Self.agentKey)
+        defaults.set(selectedAgentServerID, forKey: Self.agentServerKey)
         defaults.set(selectedModelID, forKey: Self.modelKey)
         defaults.set(selectedReasoningEffortID, forKey: Self.effortKey)
         defaults.set(true, forKey: Self.setupKey)

@@ -93,9 +93,6 @@ struct AlleycatAddServerSheet: View {
                 },
                 onCancel: {
                     showScanner = false
-                    if startScanningOnAppear, parsedParams == nil {
-                        dismiss()
-                    }
                 },
                 onPermissionDenied: {
                     showScanner = false
@@ -118,12 +115,18 @@ struct AlleycatAddServerSheet: View {
 
     private func requestInitialScanIfNeeded() {
         guard !LitterPlatform.rendersAsMacApp else { return }
+#if targetEnvironment(simulator)
+        // The simulator has no reliable camera feed. Keep the production
+        // paste-JSON fallback visible so pairing remains testable end to end.
+        return
+#else
         guard startScanningOnAppear, !didRequestInitialScan, parsedParams == nil else { return }
         didRequestInitialScan = true
         Task { @MainActor in
             await Task.yield()
             requestCameraAndScan()
         }
+#endif
     }
 
     private var pairingSection: some View {

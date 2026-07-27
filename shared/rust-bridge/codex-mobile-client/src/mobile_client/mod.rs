@@ -46,6 +46,9 @@ mod thread_projection;
 use self::dynamic_tools::*;
 use self::store_listener::*;
 use self::thread_projection::*;
+
+const ALLEYCAT_INITIAL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub use self::thread_projection::{
     copy_thread_runtime_fields, reasoning_effort_from_string, reasoning_effort_string,
     reconcile_active_turn, thread_info_from_upstream_thread,
@@ -1877,17 +1880,30 @@ impl MobileClient {
                 agent.wire,
                 endpoint.clone(),
             );
-            let (remote_client, alleycat_session) =
-                match reconnect_transport.connect_initial().await {
-                    Ok(result) => result,
-                    Err(error) => {
-                        warn!(
-                            "MobileClient: alleycat connect failed server_id={} agent={} error={}",
-                            server_id, agent.name, error
-                        );
-                        continue;
-                    }
-                };
+            let (remote_client, alleycat_session) = match tokio::time::timeout(
+                ALLEYCAT_INITIAL_CONNECT_TIMEOUT,
+                reconnect_transport.connect_initial(),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    warn!(
+                        "MobileClient: alleycat connect failed server_id={} agent={} error={}",
+                        server_id, agent.name, error
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    warn!(
+                        "MobileClient: alleycat connect timed out server_id={} agent={} timeout_seconds={}",
+                        server_id,
+                        agent.name,
+                        ALLEYCAT_INITIAL_CONNECT_TIMEOUT.as_secs()
+                    );
+                    continue;
+                }
+            };
             // Register the freshly-built session with the transport so
             // `close_current_connection()` can target this Connection
             // before the worker has had to call `reconnect()`.

@@ -1422,6 +1422,51 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertEqual(catalog.first(where: { $0.id == "future-agent" })?.available, true)
     }
 
+    func testRemoteCourseToolCallParsesNestedArgumentsAndKeepsVisibleIntroduction() throws {
+        let response = """
+        I have enough context to propose the course.
+        ```json
+        {"learnfold_tool_call":{"name":"present_course_plan","arguments":{"workspace_id":"workspace-1","plan_id":"swift-actors","revision":1,"title":"Swift Actors","chapters":[{"id":"one","title":"Foundations","objective":"Understand { isolation }","deliverables":[]}]}}}
+        ```
+        """
+
+        let call = try XCTUnwrap(CourseExperienceStore.remoteCourseToolCall(from: response))
+        XCTAssertEqual(call.name, "present_course_plan")
+        XCTAssertEqual(
+            call.visibleText,
+            "I have enough context to propose the course."
+        )
+        let arguments = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: try XCTUnwrap(call.argumentsJSON.data(using: .utf8))
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(arguments["workspace_id"] as? String, "workspace-1")
+        XCTAssertEqual(arguments["plan_id"] as? String, "swift-actors")
+    }
+
+    func testRemoteCourseToolCallRejectsMalformedEnvelope() {
+        XCTAssertNil(
+            CourseExperienceStore.remoteCourseToolCall(
+                from: #"{"learnfold_tool_call":{"name":"native-editor-fetch"}}"#
+            )
+        )
+        XCTAssertNil(
+            CourseExperienceStore.remoteCourseToolCall(
+                from: #"{"tool_call":{"name":"native-editor-fetch","arguments":{}}}"#
+            )
+        )
+    }
+
+    func testSelectedRemoteCourseServerPersistsAcrossStoreLaunches() throws {
+        let defaults = try makeDefaults()
+        defaults.set("personal-claw", forKey: "snappy.course.selectedAgentServer")
+
+        let store = CourseExperienceStore(defaults: defaults, environment: [:])
+
+        XCTAssertEqual(store.selectedAgentServerID, "personal-claw")
+    }
+
     private func makeDefaults() throws -> UserDefaults {
         let suiteName = "CourseExperienceStoreTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -1625,6 +1670,59 @@ final class CourseChatTimelinePolicyTests: XCTestCase {
             CourseChatTimelinePolicy.projectLiveItems([user, assistant]),
             [user, assistant]
         )
+    }
+
+    func testRemoteHermesBootstrapProjectsOnlyLearnerMessage() throws {
+        let item = ConversationItem(
+            id: "remote-bootstrap",
+            content: .user(
+                ConversationUserMessageData(
+                    text: """
+                    Internal instructions.
+
+                    Learnfold remote native-tool protocol:
+                    - Use the envelope.
+
+                    Learner message:
+                    Build me a Swift course.
+                    """,
+                    images: []
+                )
+            )
+        )
+
+        let projected = try XCTUnwrap(
+            CourseChatTimelinePolicy.projectLiveItems([item]).first
+        )
+        guard case .user(let data) = projected.content else {
+            return XCTFail("Expected a projected learner message")
+        }
+        XCTAssertEqual(data.text, "Build me a Swift course.")
+    }
+
+    func testRemoteHermesToolEnvelopesAreHidden() {
+        let call = ConversationItem(
+            id: "remote-call",
+            content: .assistant(
+                ConversationAssistantMessageData(
+                    text: #"{"learnfold_tool_call":{"name":"native-editor-fetch","arguments":{}}}"#,
+                    agentNickname: nil,
+                    agentRole: nil,
+                    phase: nil
+                )
+            )
+        )
+        let result = ConversationItem(
+            id: "remote-result",
+            content: .user(
+                ConversationUserMessageData(
+                    text: #"{"learnfold_tool_result":{"name":"native-editor-fetch","success":true}}"#,
+                    images: []
+                )
+            )
+        )
+
+        XCTAssertTrue(CourseChatTimelinePolicy.projectLiveItems([call, result]).isEmpty)
     }
 
     private func mcpItem(
