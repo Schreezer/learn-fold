@@ -2,7 +2,7 @@
 
 [package]
 name = "kittylitter"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 license = "GPL-3.0-only"
 authors = ["The Alleycat Authors"]
@@ -26,6 +26,9 @@ path = "src/main.rs"
 # refreshes Cargo.lock to whatever `main` points at before build/release lanes.
 alleycat = { git = "https://github.com/dnakov/alleycat.git", branch = "main" }
 anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+url = "2"
 
 # cargo-dist builds with `cargo build --profile dist`. Mirrors the
 # upstream alleycat workspace's profile so binaries are LTO-thinned in

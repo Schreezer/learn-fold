@@ -116,3 +116,40 @@ final class NetworkDiscoveryTests: XCTestCase {
         )
     }
 }
+
+final class AgentAssistedPairingTests: XCTestCase {
+    func testPromptAsksAgentToPerformSetupWithoutDelegatingCommandsToUser() {
+        let submitURL = URL(
+            string: "https://litter-pairing-broker.chiragmgg.workers.dev/v1/pairing-requests/request/submit?token=secret"
+        )!
+        let prompt = AgentAssistedPairing.prompt(submitURL: submitURL)
+
+        XCTAssertTrue(prompt.contains("Please do the setup yourself"))
+        XCTAssertTrue(prompt.contains("npx -y kittylitter@latest pair"))
+        XCTAssertTrue(prompt.contains("HTTP POST that JSON object"))
+        XCTAssertTrue(prompt.contains(submitURL.absoluteString))
+        XCTAssertTrue(prompt.contains("do not ask me to run a command"))
+        XCTAssertTrue(prompt.contains("Do not show me a token or pairing JSON"))
+    }
+
+    func testPairingPayloadCandidateExtractsJSONFromAgentResponse() {
+        let response = """
+        Done. Here is the pairing response:
+        ```json
+        {"v":1,"node_id":"node-1","token":"secret","relay":"https://relay.example"}
+        ```
+        """
+
+        XCTAssertEqual(
+            AgentAssistedPairing.pairingPayloadCandidate(from: response),
+            #"{"v":1,"node_id":"node-1","token":"secret","relay":"https://relay.example"}"#
+        )
+    }
+
+    func testPairingPayloadCandidateLeavesInvalidResponseForCanonicalParser() {
+        XCTAssertEqual(
+            AgentAssistedPairing.pairingPayloadCandidate(from: "Hermes could not start kittylitter."),
+            "Hermes could not start kittylitter."
+        )
+    }
+}

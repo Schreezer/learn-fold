@@ -2,7 +2,7 @@
 
 Distribution wrapper for the [alleycat](https://github.com/dnakov/alleycat) daemon. Ships the daemon to npm, Homebrew, and the platform installer scripts under the kittylitter brand.
 
-The wrapper itself is a 3-line `main()` that re-exports `alleycat::run("kittylitter")`. All daemon behavior lives in the alleycat crate; this crate exists so cargo-dist sees a `kittylitter` package name and produces correctly-named artifacts (`kittylitter-installer.sh`, `kittylitter.rb`, `kittylitter` on npm).
+The wrapper delegates daemon behavior to Alleycat and adds distribution-specific commands such as the one-time Learnfold pairing handoff. It exists so cargo-dist sees a `kittylitter` package name and produces correctly-named artifacts (`kittylitter-installer.sh`, `kittylitter.rb`, `kittylitter` on npm).
 
 ## Cutting a release
 
