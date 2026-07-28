@@ -158,7 +158,7 @@ struct DiscoveryView: View {
             slingshotHostsSheet
         }
         .sheet(isPresented: $showAlleycatSheet) {
-            AlleycatAddServerSheet(appModel: appModel, startScanningOnAppear: true) { result in
+            AlleycatAddServerSheet(appModel: appModel) { result in
                 showAlleycatSheet = false
                 Task { await connectAlleycatTarget(result) }
             }

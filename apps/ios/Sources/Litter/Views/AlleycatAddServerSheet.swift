@@ -203,7 +203,6 @@ actor HermesPairingBrokerClient {
 
 struct AlleycatAddServerSheet: View {
     let appModel: AppModel
-    let startScanningOnAppear: Bool
     let onConnected: (AlleycatConnectedTarget) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -217,7 +216,6 @@ struct AlleycatAddServerSheet: View {
     @State private var isConnecting = false
     @State private var connectError: String?
     @State private var showScanner = false
-    @State private var didRequestInitialScan = false
     @State private var cameraDenied = false
     // pasteJSON / showPaste are used by the Mac paste-JSON UI
     // (Catalyst + iOS-on-Mac) and the iOS QR fallback.
@@ -237,11 +235,9 @@ struct AlleycatAddServerSheet: View {
 
     init(
         appModel: AppModel,
-        startScanningOnAppear: Bool = false,
         onConnected: @escaping (AlleycatConnectedTarget) -> Void
     ) {
         self.appModel = appModel
-        self.startScanningOnAppear = startScanningOnAppear
         self.onConnected = onConnected
     }
 
@@ -279,9 +275,6 @@ struct AlleycatAddServerSheet: View {
                         .foregroundColor(LitterTheme.accent)
                 }
             }
-        }
-        .onAppear {
-            requestInitialScanIfNeeded()
         }
         .onDisappear {
             cancelHermesPairing()
@@ -327,22 +320,6 @@ struct AlleycatAddServerSheet: View {
                 Text(hermesConfirmationMessage)
             }
         )
-    }
-
-    private func requestInitialScanIfNeeded() {
-        guard !LitterPlatform.rendersAsMacApp else { return }
-#if targetEnvironment(simulator)
-        // The simulator has no reliable camera feed. Keep the production
-        // paste-JSON fallback visible so pairing remains testable end to end.
-        return
-#else
-        guard startScanningOnAppear, !didRequestInitialScan, parsedParams == nil else { return }
-        didRequestInitialScan = true
-        Task { @MainActor in
-            await Task.yield()
-            requestCameraAndScan()
-        }
-#endif
     }
 
     private var pairingSection: some View {
