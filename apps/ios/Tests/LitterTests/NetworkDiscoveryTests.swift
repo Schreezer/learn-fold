@@ -152,4 +152,17 @@ final class AgentAssistedPairingTests: XCTestCase {
             "Hermes could not start kittylitter."
         )
     }
+
+    func testDisablePromptRevokesPairingsAndStopsAutostartWithoutRemovingHermes() {
+        let prompt = AgentAssistedPairing.disablePrompt(computerName: "Aeon Server")
+
+        XCTAssertTrue(prompt.contains("Aeon Server"))
+        XCTAssertTrue(prompt.contains("kittylitter@latest rotate"))
+        XCTAssertTrue(prompt.contains("kittylitter@latest uninstall"))
+        XCTAssertTrue(prompt.contains("kittylitter@latest stop"))
+        XCTAssertTrue(prompt.contains("keeping Hermes itself running"))
+        XCTAssertTrue(prompt.contains("Do not delete Hermes"))
+        XCTAssertTrue(prompt.contains("Do not ask me to run any commands"))
+        XCTAssertTrue(prompt.contains("external Hermes chat"))
+    }
 }

@@ -42,6 +42,25 @@ enum AgentAssistedPairing {
         }
         return String(trimmed[firstBrace...lastBrace])
     }
+
+    static func disablePrompt(computerName: String) -> String {
+        """
+    Securely disable Learnfold connectivity on \(computerName), while keeping Hermes itself running.
+
+    Perform the shutdown yourself in your own terminal:
+    1. Run `npx -y kittylitter@latest rotate` to invalidate every existing Learnfold pairing.
+    2. Run `npx -y kittylitter@latest uninstall` to disable autostart and stop the managed service.
+    3. If a kittylitter or Alleycat daemon is still running, run \
+    `npx -y kittylitter@latest stop`.
+    4. Verify that autostart is disabled and no kittylitter or Alleycat daemon remains running.
+
+    Do not display the new token. Do not delete Hermes, projects, configuration, or logs. \
+    Do not ask me to run any commands. Report only whether revocation and shutdown succeeded.
+
+    This request intentionally ends Learnfold's connection, so complete it from this external \
+    Hermes chat even if Learnfold disconnects before receiving a final response.
+    """
+    }
 }
 
 struct HermesPairingRequest: Decodable, Equatable {
