@@ -19,5 +19,5 @@ pairings, and autostart entry while the public package moves to Learnfold.
 2. Keep the `alleycat` dependency on `branch = "main"` and refresh it with
    `./tools/scripts/update-alleycat-main.sh --learnfold-link`.
 3. Bump `version` in this crate's `Cargo.toml`.
-4. Tag `vX.Y.Z` on `Schreezer/learn-fold`. The root `release.yml` workflow
-   builds the native artifacts and publishes `learnfold-link` to npm.
+4. Publish the native artifacts on `Schreezer/learnfold-link`, then publish
+   the generated `learnfold-link` package to npm.

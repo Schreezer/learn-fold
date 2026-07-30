@@ -2,12 +2,12 @@
 
 [package]
 name = "learnfold-link"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 license = "GPL-3.0-only"
 authors = ["Learnfold"]
-repository = "https://github.com/Schreezer/learn-fold"
-homepage = "https://github.com/Schreezer/learn-fold"
+repository = "https://github.com/Schreezer/learnfold-link"
+homepage = "https://github.com/Schreezer/learnfold-link"
 description = "Securely connects a learner-owned coding agent to the Learnfold app."
 readme = "README.md"
 
