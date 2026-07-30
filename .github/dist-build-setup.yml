@@ -13,6 +13,7 @@
 # resolves the path via `.github/workflows/ + ../dist-build-setup.yml`.
 
 - name: Configure sccache env for R2 backend
+  if: ${{ secrets.SCCACHE_R2_ENDPOINT != '' && secrets.SCCACHE_R2_ACCESS_KEY_ID != '' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY != '' }}
   shell: bash
   run: |
     {
@@ -28,6 +29,7 @@
     } >> "$GITHUB_ENV"
 
 - name: Install sccache
+  if: ${{ secrets.SCCACHE_R2_ENDPOINT != '' && secrets.SCCACHE_R2_ACCESS_KEY_ID != '' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY != '' }}
   uses: mozilla-actions/sccache-action@v0.0.9
 
 - name: Resolve Alleycat to latest main
