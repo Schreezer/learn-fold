@@ -5,16 +5,30 @@
 </p>
 
 <p align="center">
-  A Swift-first personal learning studio that turns topics, documents, and links into living courses powered by private course agents.
+  A Swift-first personal learning studio that turns topics, documents, files,
+  and links into living courses with help from private course agents.
 </p>
 
-<p align="center">
-  <a href="https://kittylitter.app"><img src="docs/badges/website.svg" alt="kittylitter.app" /></a>
-  &nbsp;
-  <a href="https://apps.apple.com/us/app/kittylitter/id6759521788"><img src="docs/badges/app-store.svg" alt="App Store" /></a>
-  &nbsp;
-  <a href="https://kittylitter.app/android-beta"><img src="docs/badges/android-beta.svg" alt="Android Beta" /></a>
-</p>
+Learnfold lets you ask a course agent to research a subject, propose a learning
+plan, build lessons and assessments, and keep improving the resulting course.
+Agents can run on the Apple device or connect securely to runtimes such as
+Codex and Hermes on another computer. The iOS app is the primary product and
+implementation target.
+
+## Project Origin
+
+Learnfold is an independent fork of
+[Litter](https://github.com/dnakov/litter), the open-source mobile client for
+working with coding agents. This repository preserves Litter's Git history and
+license while taking the product in a learning-first direction: durable
+courses, course-aware agent tools, native Apple-platform experiences, private
+remote-agent pairing, and learning progress rather than a general-purpose
+coding chat.
+
+Thank you to the Litter maintainers and contributors whose work provides the
+foundation for Learnfold. Learnfold is not an official Litter release, and
+Learnfold-specific issues and contributions should be filed in this
+repository.
 
 ## Screenshots (iOS)
 
@@ -70,11 +84,17 @@ Both platforms share a single Rust core (`codex-mobile-client`) via UniFFI-gener
 
 ## Contributing
 
-Litter is under active development and a lot of features are in flight. PRs are welcome but will likely only be merged if they're small and target a specific problem — sweeping refactors and new features tend to collide with work already underway. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening one.
+Learnfold is under active development and a lot of features are in flight. PRs
+are welcome but will likely only be merged if they're small and target a
+specific problem — sweeping refactors and new features tend to collide with
+work already underway. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening
+one.
 
 ## License
 
-Litter is licensed under the GNU General Public License version 3 with an additional permission under GPLv3 section 7 for Apple App Store and Google Play distribution. See [LICENSE](LICENSE).
+Learnfold retains Litter's GNU General Public License version 3 with the
+additional permission under GPLv3 section 7 for Apple App Store and Google Play
+distribution. See [LICENSE](LICENSE).
 
 ## Make Targets
 
