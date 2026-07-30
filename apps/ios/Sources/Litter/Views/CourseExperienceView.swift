@@ -172,7 +172,7 @@ private struct CourseAgentSetupView: View {
                                 Text("Connect Hermes on a server")
                                     .font(.headline)
                                     .foregroundStyle(.primary)
-                                Text("Pair with kittylitter, then continue in a private remote chat.")
+                                Text("Pair with Learnfold Link, then continue in a private remote chat.")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                                     .multilineTextAlignment(.leading)
@@ -638,7 +638,7 @@ private struct CourseAgentSettingsView: View {
                 } header: {
                     Text("Remote agents")
                 } footer: {
-                    Text("Pairs through kittylitter. Hermes can build and edit native course pages through Learnfold’s approval-gated tool bridge.")
+                    Text("Pairs through Learnfold Link. Hermes can build and edit native course pages through Learnfold’s approval-gated tool bridge.")
                 }
 
                 Section("Learnfold") {

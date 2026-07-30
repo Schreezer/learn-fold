@@ -4,14 +4,20 @@ use url::Url;
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if matches!(args.as_slice(), [arg] if arg == "--version" || arg == "-V") {
+        println!("learnfold-link {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("handoff") {
         return run_handoff(&args[1..]);
     }
 
     alleycat::App {
-        binary_name: "kittylitter",
+        binary_name: "learnfold-link",
         qualifier: "com",
         organization: "sigkitten",
+        // Preserve the existing state and service identity so upgrading from
+        // kittylitter does not orphan pairings or create a second daemon.
         application: "kittylitter",
         label: "com.sigkitten.kittylitter",
         version: env!("CARGO_PKG_VERSION"),
@@ -21,20 +27,24 @@ fn main() -> anyhow::Result<()> {
 
 fn run_handoff(args: &[String]) -> anyhow::Result<()> {
     let [submit_url] = args else {
-        bail!("usage: kittylitter handoff <one-time-submit-url>");
+        bail!("usage: learnfold-link handoff <one-time-submit-url>");
     };
     validate_submit_url(submit_url)?;
 
-    let executable = std::env::current_exe().context("locate kittylitter executable")?;
+    let executable = std::env::current_exe().context("locate learnfold-link executable")?;
+    // The bare invocation is Alleycat's complete onboarding path: it installs
+    // user-level autostart when possible, starts/upgrades the daemon, and
+    // prints a fresh pairing payload. Capture that payload so the model never
+    // has to inspect or relay the credential itself.
     let output = Command::new(executable)
-        .arg("pair")
         .output()
-        .context("start the local kittylitter pairing service")?;
+        .context("set up the local Learnfold Link service")?;
     if !output.status.success() {
-        bail!("kittylitter could not create a pairing credential");
+        bail!("Learnfold Link could not create a pairing credential");
     }
 
-    let stdout = String::from_utf8(output.stdout).context("read kittylitter pairing response")?;
+    let stdout =
+        String::from_utf8(output.stdout).context("read Learnfold Link pairing response")?;
     let payload = pairing_payload_from_output(&stdout)?;
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -82,7 +92,7 @@ fn pairing_payload_from_output(output: &str) -> anyhow::Result<serde_json::Value
                 && object.contains_key("token"))
             .then_some(value)
         })
-        .context("kittylitter did not return a valid pairing credential")
+        .context("Learnfold Link did not return a valid pairing credential")
 }
 
 #[cfg(test)]

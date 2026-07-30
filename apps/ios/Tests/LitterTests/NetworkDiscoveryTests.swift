@@ -124,12 +124,13 @@ final class AgentAssistedPairingTests: XCTestCase {
         )!
         let prompt = AgentAssistedPairing.prompt(submitURL: submitURL)
 
-        XCTAssertTrue(prompt.contains("Please do the setup yourself"))
-        XCTAssertTrue(prompt.contains("npx -y kittylitter@latest pair"))
-        XCTAssertTrue(prompt.contains("HTTP POST that JSON object"))
+        XCTAssertTrue(prompt.contains("Run exactly this one terminal command"))
+        XCTAssertTrue(prompt.contains("npx -y learnfold-link@0.3.5 handoff"))
         XCTAssertTrue(prompt.contains(submitURL.absoluteString))
+        XCTAssertFalse(prompt.contains("HTTP POST"))
+        XCTAssertFalse(prompt.contains("capture the first"))
         XCTAssertTrue(prompt.contains("do not ask me to run a command"))
-        XCTAssertTrue(prompt.contains("Do not show me a token or pairing JSON"))
+        XCTAssertTrue(prompt.contains("Do not display a token or pairing JSON"))
     }
 
     func testPairingPayloadCandidateExtractsJSONFromAgentResponse() {
@@ -148,8 +149,10 @@ final class AgentAssistedPairingTests: XCTestCase {
 
     func testPairingPayloadCandidateLeavesInvalidResponseForCanonicalParser() {
         XCTAssertEqual(
-            AgentAssistedPairing.pairingPayloadCandidate(from: "Hermes could not start kittylitter."),
-            "Hermes could not start kittylitter."
+            AgentAssistedPairing.pairingPayloadCandidate(
+                from: "Hermes could not start Learnfold Link."
+            ),
+            "Hermes could not start Learnfold Link."
         )
     }
 
@@ -157,9 +160,9 @@ final class AgentAssistedPairingTests: XCTestCase {
         let prompt = AgentAssistedPairing.disablePrompt(computerName: "Aeon Server")
 
         XCTAssertTrue(prompt.contains("Aeon Server"))
-        XCTAssertTrue(prompt.contains("kittylitter@latest rotate"))
-        XCTAssertTrue(prompt.contains("kittylitter@latest uninstall"))
-        XCTAssertTrue(prompt.contains("kittylitter@latest stop"))
+        XCTAssertTrue(prompt.contains("learnfold-link@0.3.5 rotate"))
+        XCTAssertTrue(prompt.contains("learnfold-link@0.3.5 uninstall"))
+        XCTAssertTrue(prompt.contains("learnfold-link@0.3.5 stop"))
         XCTAssertTrue(prompt.contains("keeping Hermes itself running"))
         XCTAssertTrue(prompt.contains("Do not delete Hermes"))
         XCTAssertTrue(prompt.contains("Do not ask me to run any commands"))

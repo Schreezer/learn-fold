@@ -1,8 +1,7 @@
 [workspace]
-# The kittylitter wrapper crate at services/kittylitter re-exports the
-# alleycat daemon under a kittylitter-branded name. cargo-dist runs against
-# that workspace and produces kittylitter-* artifacts hosted on this repo's
-# GitHub Releases.
+# The wrapper crate remains in the legacy services/kittylitter directory for
+# migration compatibility, but cargo-dist publishes it as Learnfold Link and
+# produces learnfold-link-* artifacts hosted on this repo's GitHub Releases.
 members = ["cargo:services/kittylitter"]
 
 [dist]
@@ -28,7 +27,7 @@ install-updater = false
 #   CODESIGN_IDENTITY             "Developer ID Application: <Name> (<TEAM>)"
 macos-sign = true
 # Inject sccache (Cloudflare R2 backend, same key/secret as the mobile
-# lanes) into the build-local-artifacts job so kittylitter releases
+# lanes) into the build-local-artifacts job so Learnfold Link releases
 # don't recompile iroh/ring/reqwest from scratch on every bump. Path is
 # resolved relative to .github/workflows/, so `../` escapes to .github/
 # (we don't want this fragment under workflows/ because GitHub would

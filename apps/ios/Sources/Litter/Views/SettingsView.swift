@@ -607,7 +607,7 @@ private struct HermesServerDisconnectSheet: View {
                         .litterFont(.subheadline, weight: .semibold)
                         .foregroundColor(LitterTheme.textPrimary)
 
-                    Text("Learnfold cannot shut down kittylitter through the connection it is about to terminate. Copy this prompt into a separate Hermes chat on \(serverName); Hermes will revoke the pairings, disable autostart, and stop the background service.")
+                    Text("Learnfold cannot shut down Learnfold Link through the connection it is about to terminate. Copy this prompt into a separate Hermes chat on \(serverName); Hermes will revoke the pairings, disable autostart, and stop the background service.")
                         .litterFont(.footnote)
                         .foregroundColor(LitterTheme.textSecondary)
 
@@ -647,7 +647,7 @@ private struct HermesServerDisconnectSheet: View {
                     .frame(maxWidth: .infinity)
                     .accessibilityIdentifier("settings.removeHermesServer")
                 } footer: {
-                    Text("Removing only from Learnfold does not stop kittylitter on the computer. Use the copied prompt first if you want the background service disabled.")
+                    Text("Removing only from Learnfold does not stop Learnfold Link on the computer. Use the copied prompt first if you want the background service disabled.")
                         .foregroundColor(LitterTheme.textMuted)
                 }
                 .listRowBackground(LitterTheme.surface.opacity(0.6))

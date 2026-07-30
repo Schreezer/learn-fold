@@ -143,7 +143,7 @@ PACKAGE_CARGO_ENV := CARGO_INCREMENTAL=0
 # build-rust.sh directly with its own env, so it bypasses this var.
 DEV_CARGO_ENV := env -u RUSTC_WRAPPER CARGO_INCREMENTAL=1
 KITTYLITTER_CARGO_ENV := $(DEV_CARGO_ENV)
-ifeq ($(firstword $(MAKECMDGOALS)),kittylitter)
+ifneq ($(filter $(firstword $(MAKECMDGOALS)),kittylitter learnfold-link),)
   KITTYLITTER_GOAL_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
   .PHONY: $(KITTYLITTER_GOAL_ARGS)
   $(KITTYLITTER_GOAL_ARGS):
@@ -210,7 +210,7 @@ $(shell mkdir -p $(STAMPS))
 	test test-rust test-ios test-android \
 	ios-release-prep mac-release-prep testflight mac-testflight mac-direct-dist appstore-release play-upload play-release \
 	clean clean-rust clean-ios clean-android \
-	rebuild-bindings kittylitter kittylitter-restart tui tui-run help
+	rebuild-bindings kittylitter kittylitter-restart learnfold-link learnfold-link-restart tui tui-run help
 
 all: ios android
 
@@ -869,7 +869,7 @@ screenshots-android:
 $(KITTYLITTER_DEV_MANIFEST): $(KITTYLITTER_DIR)/Cargo.toml $(KITTYLITTER_DIR)/src/main.rs
 	@if [ ! -f "$(ALLEYCAT_DEV_DIR)/crates/alleycat/Cargo.toml" ]; then \
 		echo "error: ALLEYCAT_DEV_DIR=$(ALLEYCAT_DEV_DIR) does not look like an alleycat checkout"; \
-		echo "override with: make kittylitter ALLEYCAT_DEV_DIR=/path/to/alleycat"; \
+		echo "override with: make learnfold-link ALLEYCAT_DEV_DIR=/path/to/alleycat"; \
 		exit 1; \
 	fi
 	@mkdir -p "$(KITTYLITTER_DEV_DIR)/src"
@@ -877,13 +877,13 @@ $(KITTYLITTER_DEV_MANIFEST): $(KITTYLITTER_DIR)/Cargo.toml $(KITTYLITTER_DIR)/sr
 		'[workspace]' \
 		'' \
 		'[package]' \
-		'name = "kittylitter-dev"' \
+		'name = "learnfold-link-dev"' \
 		'version = "$(KITTYLITTER_VERSION)"' \
 		'edition = "2024"' \
 		'publish = false' \
 		'' \
 		'[[bin]]' \
-		'name = "kittylitter"' \
+		'name = "learnfold-link"' \
 		'path = "src/main.rs"' \
 		'' \
 		'[dependencies]' \
@@ -893,7 +893,7 @@ $(KITTYLITTER_DEV_MANIFEST): $(KITTYLITTER_DIR)/Cargo.toml $(KITTYLITTER_DIR)/sr
 	@printf '%s\n' \
 		'fn main() -> anyhow::Result<()> {' \
 		'    alleycat::App {' \
-		'        binary_name: "kittylitter",' \
+		'        binary_name: "learnfold-link",' \
 		'        qualifier: "com",' \
 		'        organization: "sigkitten",' \
 		'        application: "kittylitter",' \
@@ -904,21 +904,21 @@ $(KITTYLITTER_DEV_MANIFEST): $(KITTYLITTER_DIR)/Cargo.toml $(KITTYLITTER_DIR)/sr
 		'}' \
 		> "$(KITTYLITTER_DEV_DIR)/src/main.rs"
 
-kittylitter: $(KITTYLITTER_DEV_MANIFEST)
-	@echo "── Running kittylitter $(KITTYLITTER_ARGS) via $(ALLEYCAT_DEV_DIR) ──"
-	@cd $(ROOT) && $(KITTYLITTER_CARGO_ENV) cargo run --manifest-path "$(KITTYLITTER_DEV_MANIFEST)" --bin kittylitter -- $(KITTYLITTER_ARGS)
+kittylitter learnfold-link: $(KITTYLITTER_DEV_MANIFEST)
+	@echo "── Running Learnfold Link $(KITTYLITTER_ARGS) via $(ALLEYCAT_DEV_DIR) ──"
+	@cd $(ROOT) && $(KITTYLITTER_CARGO_ENV) cargo run --manifest-path "$(KITTYLITTER_DEV_MANIFEST)" --bin learnfold-link -- $(KITTYLITTER_ARGS)
 
-kittylitter-restart: $(KITTYLITTER_DEV_MANIFEST)
-	@echo "── Building kittylitter via $(ALLEYCAT_DEV_DIR) ──"
-	@cd $(ROOT) && $(KITTYLITTER_CARGO_ENV) cargo build --manifest-path "$(KITTYLITTER_DEV_MANIFEST)" --bin kittylitter
-	@echo "── Restarting installed kittylitter daemon ──"
-	@cd $(ROOT) && $(KITTYLITTER_CARGO_ENV) cargo run --manifest-path "$(KITTYLITTER_DEV_MANIFEST)" --bin kittylitter -- stop >/dev/null 2>&1 || true
+kittylitter-restart learnfold-link-restart: $(KITTYLITTER_DEV_MANIFEST)
+	@echo "── Building Learnfold Link via $(ALLEYCAT_DEV_DIR) ──"
+	@cd $(ROOT) && $(KITTYLITTER_CARGO_ENV) cargo build --manifest-path "$(KITTYLITTER_DEV_MANIFEST)" --bin learnfold-link
+	@echo "── Restarting installed Learnfold Link daemon ──"
+	@cd $(ROOT) && $(KITTYLITTER_CARGO_ENV) cargo run --manifest-path "$(KITTYLITTER_DEV_MANIFEST)" --bin learnfold-link -- stop >/dev/null 2>&1 || true
 	@if launchctl print "gui/$$(id -u)/com.sigkitten.kittylitter" >/dev/null 2>&1; then \
 		launchctl kickstart -k "gui/$$(id -u)/com.sigkitten.kittylitter"; \
 		sleep 3; \
-		cd "$(ROOT)" && $(KITTYLITTER_CARGO_ENV) cargo run --manifest-path "$(KITTYLITTER_DEV_MANIFEST)" --bin kittylitter -- agents list; \
+		cd "$(ROOT)" && $(KITTYLITTER_CARGO_ENV) cargo run --manifest-path "$(KITTYLITTER_DEV_MANIFEST)" --bin learnfold-link -- agents list; \
 	else \
-		echo "kittylitter autostart is not installed; start it with: make kittylitter serve"; \
+		echo "Learnfold Link autostart is not installed; start it with: make learnfold-link serve"; \
 	fi
 
 tui:

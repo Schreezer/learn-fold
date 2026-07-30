@@ -1,24 +1,24 @@
 [workspace]
 
 [package]
-name = "kittylitter"
+name = "learnfold-link"
 version = "0.3.5"
 edition = "2024"
 license = "GPL-3.0-only"
-authors = ["The Alleycat Authors"]
-repository = "https://github.com/dnakov/litter"
-homepage = "https://github.com/dnakov/litter"
-description = "Iroh-backed daemon that multiplexes local coding agents (Codex, Pi, OpenCode, Claude) for paired clients."
+authors = ["Learnfold"]
+repository = "https://github.com/Schreezer/learn-fold"
+homepage = "https://github.com/Schreezer/learn-fold"
+description = "Securely connects a learner-owned coding agent to the Learnfold app."
 readme = "README.md"
 
 [package.metadata.wix]
-upgrade-guid = "DA2F3E1D-ED35-4E0F-A090-DBAF066F1634"
-path-guid = "45FCD157-114F-40BA-8F2D-21BA43E7F15F"
+upgrade-guid = "040AC730-0882-4343-8CEE-D62BCE80CC95"
+path-guid = "1843B30F-41A4-446B-B1FB-3A123CC78BCD"
 license = false
 eula = false
 
 [[bin]]
-name = "kittylitter"
+name = "learnfold-link"
 path = "src/main.rs"
 
 [dependencies]

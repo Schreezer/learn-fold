@@ -8,11 +8,11 @@ MODE="all"
 case "${1:-}" in
   "")
     ;;
-  --all|--shared|--kittylitter)
+  --all|--shared|--kittylitter|--learnfold-link)
     MODE="${1#--}"
     ;;
   *)
-    echo "usage: $(basename "$0") [--all|--shared|--kittylitter]" >&2
+    echo "usage: $(basename "$0") [--all|--shared|--learnfold-link]" >&2
     exit 1
     ;;
 esac
@@ -53,7 +53,7 @@ update_shared() {
 }
 
 update_kittylitter() {
-  echo "==> Resolving kittylitter Alleycat dep to dnakov/alleycat main ($ALLEYCAT_MAIN_SHA)..."
+  echo "==> Resolving Learnfold Link Alleycat dep to dnakov/alleycat main ($ALLEYCAT_MAIN_SHA)..."
   cargo update \
     --quiet \
     --manifest-path "$REPO_DIR/services/kittylitter/Cargo.toml" \
@@ -69,7 +69,7 @@ case "$MODE" in
   shared)
     update_shared
     ;;
-  kittylitter)
+  kittylitter|learnfold-link)
     update_kittylitter
     ;;
 esac

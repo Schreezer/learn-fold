@@ -1,4 +1,4 @@
-name: Auto-release kittylitter
+name: Auto-release Learnfold Link
 
 # Fires on every push to `main` that touches the wrapper crate's Cargo.toml
 # or the release automation that determines how the current version ships.
@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Read kittylitter version
+      - name: Read Learnfold Link version
         id: ver
         run: |
           set -euo pipefail

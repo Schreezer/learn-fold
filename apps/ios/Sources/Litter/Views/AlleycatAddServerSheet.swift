@@ -18,17 +18,15 @@ enum AgentAssistedPairing {
         """
     Connect this computer's Hermes agent to the Learnfold app on my iPhone.
 
-    Please do the setup yourself:
-    1. In your own terminal, run `npx -y kittylitter@latest pair` and capture the first \
-    complete JSON object it prints.
-    2. HTTP POST that JSON object, unchanged, to this one-time URL with \
-    `Content-Type: application/json`:
-       \(submitURL.absoluteString)
-    3. Tell me only whether the handoff succeeded. Do not show me a token or pairing JSON, \
-    and do not ask me to run a command.
+    Run exactly this one terminal command now. Do not inspect the environment or run \
+    preflight commands first:
+    `npx -y learnfold-link@0.3.5 handoff "\(submitURL.absoluteString)"`
+
+    If it exits successfully, reply only "Connected". Otherwise reply only "Setup failed". \
+    Do not display a token or pairing JSON, and do not ask me to run a command.
 
     The URL is a temporary, one-time credential. Do not save it to a file, memory, or log, \
-    and do not use it for anything except the secure HTTP POST described above.
+    and do not use it for anything except this Learnfold Link handoff.
     """
     }
 
@@ -48,11 +46,11 @@ enum AgentAssistedPairing {
     Securely disable Learnfold connectivity on \(computerName), while keeping Hermes itself running.
 
     Perform the shutdown yourself in your own terminal:
-    1. Run `npx -y kittylitter@latest rotate` to invalidate every existing Learnfold pairing.
-    2. Run `npx -y kittylitter@latest uninstall` to disable autostart and stop the managed service.
-    3. If a kittylitter or Alleycat daemon is still running, run \
-    `npx -y kittylitter@latest stop`.
-    4. Verify that autostart is disabled and no kittylitter or Alleycat daemon remains running.
+    1. Run `npx -y learnfold-link@0.3.5 rotate` to invalidate every existing Learnfold pairing.
+    2. Run `npx -y learnfold-link@0.3.5 uninstall` to disable autostart and stop the managed service.
+    3. If a Learnfold Link or Alleycat daemon is still running, run \
+    `npx -y learnfold-link@0.3.5 stop`.
+    4. Verify that autostart is disabled and no Learnfold Link or Alleycat daemon remains running.
 
     Do not display the new token. Do not delete Hermes, projects, configuration, or logs. \
     Do not ask me to run any commands. Report only whether revocation and shutdown succeeded.
@@ -941,7 +939,7 @@ private struct QRScannerScreen: View {
     let onCancel: () -> Void
     let onPermissionDenied: () -> Void
 
-    private static let pairCommand = "npx kittylitter"
+    private static let pairCommand = "npx learnfold-link"
 
     @State private var copied = false
 
@@ -995,7 +993,7 @@ private struct QRScannerScreen: View {
 
     private var instructionsCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Pair with kittylitter")
+            Text("Pair with Learnfold Link")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(.white)
 
