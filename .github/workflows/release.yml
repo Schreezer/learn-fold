@@ -135,8 +135,11 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: "Configure sccache env for R2 backend"
-        if: "${{ secrets.SCCACHE_R2_ENDPOINT != '' && secrets.SCCACHE_R2_ACCESS_KEY_ID != '' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY != '' }}"
         run: |
+          if [[ -z "${{ secrets.SCCACHE_R2_ENDPOINT }}" || -z "${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}" || -z "${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}" ]]; then
+            echo "R2 cache secrets are unavailable; using runner-local sccache."
+            exit 0
+          fi
           {
             echo "RUSTC_WRAPPER=sccache"
             echo "SCCACHE_BUCKET=rust-cache"
@@ -150,7 +153,6 @@ jobs:
           } >> "$GITHUB_ENV"
         shell: "bash"
       - name: "Install sccache"
-        if: "${{ secrets.SCCACHE_R2_ENDPOINT != '' && secrets.SCCACHE_R2_ACCESS_KEY_ID != '' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY != '' }}"
         uses: "mozilla-actions/sccache-action@v0.0.9"
       - name: "Resolve Alleycat to latest main"
         run: "./tools/scripts/update-alleycat-main.sh --learnfold-link"
