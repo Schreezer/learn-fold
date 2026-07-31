@@ -462,6 +462,7 @@ struct ContentView: View {
     @State private var composerBottomInset: CGFloat = 0
     @State private var splashDismissed = false
     @State private var showsClassicLitter = false
+    @State private var connectsCourseAgentAfterServerSelection = false
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("conversationTextSizeStep") private var textSizeStep = ConversationTextSize.large.rawValue
@@ -583,9 +584,25 @@ struct ContentView: View {
         .onChange(of: appModel.snapshot) { _, nextSnapshot in
             appRuntime.handleSnapshot(nextSnapshot)
         }
-        .sheet(isPresented: $bindableAppState.showServerPicker) {
+        .sheet(
+            isPresented: $bindableAppState.showServerPicker,
+            onDismiss: {
+                connectsCourseAgentAfterServerSelection = false
+            }
+        ) {
             NavigationStack {
-                DiscoveryView(onServerSelected: { _ in
+                DiscoveryView(onServerSelected: { server in
+                    if connectsCourseAgentAfterServerSelection {
+                        SavedProjectStore.selectedServerId = server.id
+                        showsClassicLitter = false
+                        Task {
+                            await courseStore.selectRemoteAgentServer(
+                                serverID: server.id,
+                                appModel: appModel
+                            )
+                        }
+                    }
+                    connectsCourseAgentAfterServerSelection = false
                     appState.showServerPicker = false
                 })
             }
@@ -614,7 +631,26 @@ struct ContentView: View {
     private var courseExperienceRoot: some View {
         CourseExperienceRootView(
             store: courseStore,
-            onOpenClassicLitter: { showsClassicLitter = true }
+            onOpenClassicLitter: { showsClassicLitter = true },
+            onConnectRemoteAgent: {
+                if let hermesServer = appModel.snapshot?.servers.first(where: { server in
+                    !server.isLocal
+                        && server.isConnected
+                        && server.agentRuntimes.contains {
+                            $0.kind == "hermes" && $0.available
+                        }
+                }) {
+                    Task {
+                        await courseStore.selectRemoteAgentServer(
+                            serverID: hermesServer.serverId,
+                            appModel: appModel
+                        )
+                    }
+                } else {
+                    connectsCourseAgentAfterServerSelection = true
+                    appState.showServerPicker = true
+                }
+            }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {

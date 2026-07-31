@@ -54,12 +54,24 @@ enum CourseAgentProvider {
 struct AppleCourseContextBudget: Equatable, Sendable {
     let triggerTokens: Int
     let summaryTokenLimit: Int
+    let responseReserveTokens: Int
+    let toolOutputReserveTokens: Int
 
     static func forProvider(_ providerID: String) -> Self {
         if providerID == CourseAgentProvider.applePrivateCloud {
-            return Self(triggerTokens: 27_500, summaryTokenLimit: 1_500)
+            return Self(
+                triggerTokens: 27_500,
+                summaryTokenLimit: 1_500,
+                responseReserveTokens: 2_048,
+                toolOutputReserveTokens: 1_024
+            )
         }
-        return Self(triggerTokens: 6_500, summaryTokenLimit: 1_500)
+        return Self(
+            triggerTokens: 2_850,
+            summaryTokenLimit: 512,
+            responseReserveTokens: 640,
+            toolOutputReserveTokens: 384
+        )
     }
 
     func estimatedTokens(in text: String) -> Int {
@@ -82,9 +94,9 @@ struct AppleCourseContextBudget: Equatable, Sendable {
     }
 
     func effectiveTrigger(contextSize: Int) -> Int {
-        // The compaction request must fit the old context and still leave
-        // enough output room for the durable summary plus instructions.
-        let runtimeSafeTrigger = contextSize - summaryTokenLimit - 512
+        let runtimeSafeTrigger = contextSize
+            - responseReserveTokens
+            - toolOutputReserveTokens
         return min(triggerTokens, max(summaryTokenLimit, runtimeSafeTrigger))
     }
 
@@ -99,9 +111,82 @@ struct AppleCourseContextBudget: Equatable, Sendable {
     }
 }
 
+enum AppleCourseToolMode: String, Codable, Equatable, Sendable {
+    case planning
+    case editing
+    case generatingLesson
+    case appendingLesson
+    case full
+
+    static func forTurn(
+        providerID: String,
+        hasApprovedPlan: Bool,
+        learnerPrompt: String
+    ) -> Self {
+        guard providerID == CourseAgentProvider.appleOnDevice else {
+            return .full
+        }
+        guard hasApprovedPlan else {
+            return .planning
+        }
+        if promptRequestsPlanRevision(learnerPrompt) {
+            return .planning
+        }
+        let normalized = learnerPrompt
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        if normalized.contains("learnfold_generate_lesson")
+            || normalized.contains("i approve")
+            || normalized.contains("approved")
+        {
+            return .generatingLesson
+        }
+        if normalized.contains("learnfold_append_lesson_section")
+            || normalized.contains("append ")
+            || normalized.contains("add ")
+            || normalized.contains("edit ")
+        {
+            return .appendingLesson
+        }
+        return .editing
+    }
+
+    private static func promptRequestsPlanRevision(_ prompt: String) -> Bool {
+        let normalized = prompt
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let approvalTerms = [
+            "i approve",
+            "approved",
+            "looks good",
+            "go ahead",
+        ]
+        let explicitRevisionTerms = [
+            "revise the plan",
+            "change the plan",
+            "update the plan",
+            "restructure",
+            "add a chapter",
+            "remove a chapter",
+            "fewer chapters",
+            "more chapters",
+            "shorter course",
+            "longer course",
+        ]
+        if approvalTerms.contains(where: normalized.contains),
+           !explicitRevisionTerms.contains(where: normalized.contains) {
+            return false
+        }
+        let planTerms = [
+            "course plan",
+            "course outline",
+        ] + explicitRevisionTerms
+        return planTerms.contains(where: normalized.contains)
+    }
+}
+
 enum AppleCourseApprovalPolicy {
     static let presentedPlanFilename = "presented-plan.json"
     static let approvedPlanFilename = "approved-plan.json"
+    static let lessonTargetFilename = "current-lesson-target.json"
 
     static func isLatestPlanApproved(courseDirectory: URL) -> Bool {
         let metadataDirectory = courseDirectory.appendingPathComponent(".course", isDirectory: true)
@@ -319,6 +404,63 @@ enum AppleCoursePlanValidator {
     }
 }
 
+enum AppleCourseGeneratedLessonValidator {
+    static let safeActorExample = """
+    actor Counter {
+        private var value = 0
+
+        func increment() -> Int {
+            value += 1
+            return value
+        }
+    }
+
+    let counter = Counter()
+    Task {
+        print(await counter.increment())
+    }
+    """
+
+    static func validatedSwiftCode(_ code: String) -> String {
+        swiftCodeIssue(code) == nil ? code : safeActorExample
+    }
+
+    static func swiftCodeIssue(_ code: String) -> String? {
+        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "the Swift example is empty"
+        }
+        guard trimmed.range(
+            of: #"\bactor\s+[A-Za-z_][A-Za-z0-9_]*"#,
+            options: .regularExpression
+        ) != nil else {
+            return "the Swift example must declare an actor, not merely describe one"
+        }
+
+        let openingToClosing: [Character: Character] = [
+            "(": ")",
+            "[": "]",
+            "{": "}",
+        ]
+        let closing = Set(openingToClosing.values)
+        var stack: [Character] = []
+        for character in trimmed {
+            if openingToClosing[character] != nil {
+                stack.append(character)
+            } else if closing.contains(character) {
+                guard let opening = stack.popLast(),
+                      openingToClosing[opening] == character else {
+                    return "the Swift example has mismatched delimiters"
+                }
+            }
+        }
+        guard stack.isEmpty else {
+            return "the Swift example is truncated or has unclosed delimiters"
+        }
+        return nil
+    }
+}
+
 enum AppleCourseGenerationSchemaOrdering {
     private static let preferredOrder = [
         "operation",
@@ -383,9 +525,11 @@ enum AppleCourseAgentError: LocalizedError {
     }
 }
 
-enum AppleCoursePrivateCloudRetryPolicy {
+enum AppleCourseGenerationRetryPolicy {
     static let maximumCancellationRetries = 2
     static let mutationFreeAttemptTimeout: Duration = .seconds(90)
+    static let watchdogPollInterval: Duration = .milliseconds(100)
+    static let watchdogPollCount = 900
 
     static func canCancelHungAttempt(
         taskWasCancelled: Bool,
@@ -421,22 +565,27 @@ enum AppleCoursePrivateCloudRetryPolicy {
 @MainActor
 final class AppleCourseLiveSessionCallbacks {
     private var onCoursePlan: @MainActor (CourseBrief) throws -> Void
-    private var onEditorMutationAttempt: @MainActor () -> Void
+    private var onEditorMutationAttempt: @MainActor @Sendable () -> Void
+    private var onEditorMutationCompletion: @MainActor @Sendable () -> Void
 
     init(
         onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void,
-        onEditorMutationAttempt: @escaping @MainActor () -> Void
+        onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void,
+        onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) {
         self.onCoursePlan = onCoursePlan
         self.onEditorMutationAttempt = onEditorMutationAttempt
+        self.onEditorMutationCompletion = onEditorMutationCompletion
     }
 
     func rebind(
         onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void,
-        onEditorMutationAttempt: @escaping @MainActor () -> Void
+        onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void,
+        onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) {
         self.onCoursePlan = onCoursePlan
         self.onEditorMutationAttempt = onEditorMutationAttempt
+        self.onEditorMutationCompletion = onEditorMutationCompletion
     }
 
     func presentCoursePlan(_ plan: CourseBrief) throws {
@@ -445,6 +594,10 @@ final class AppleCourseLiveSessionCallbacks {
 
     func recordEditorMutationAttempt() {
         onEditorMutationAttempt()
+    }
+
+    func recordEditorMutationCompletion() {
+        onEditorMutationCompletion()
     }
 }
 #endif
@@ -476,6 +629,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
     private struct LiveSession {
         let workspaceID: String
         let providerID: String
+        let toolMode: AppleCourseToolMode
         let session: LanguageModelSession
         let callbacks: AppleCourseLiveSessionCallbacks
     }
@@ -539,12 +693,14 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             var state = (try? loadState(sessionID: sessionID, workspaceID: workspaceID))
                 ?? PersistedState(
                     providerID: providerID,
+                    toolMode: nil,
                     transcript: nil,
                     compactedSummary: nil,
                     messages: []
             )
             var didPresentCoursePlan = false
             var didAttemptEditorMutation = false
+            var didCompleteEditorMutation = false
             let trackedOnCoursePlan: @MainActor (CourseBrief) throws -> Void = { plan in
                 didPresentCoursePlan = true
                 LLog.info(
@@ -559,16 +715,26 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 try onCoursePlan(plan)
             }
             let budget = AppleCourseContextBudget.forProvider(providerID)
+            let toolMode = AppleCourseToolMode.forTurn(
+                providerID: providerID,
+                hasApprovedPlan: AppleCourseApprovalPolicy.isLatestPlanApproved(
+                    courseDirectory: Self.courseDirectory(workspaceID: workspaceID)
+                ),
+                learnerPrompt: prompt
+            )
             if let transcriptData = state.transcript,
                let transcript = try? JSONDecoder().decode(Transcript.self, from: transcriptData) {
                 let providerChanged = state.providerID != providerID
+                let toolModeChanged = state.toolMode.map { $0 != toolMode } ?? false
                 let contextIsFull = await shouldCompact(
                     providerID: providerID,
+                    toolMode: toolMode,
+                    workspaceID: workspaceID,
                     transcript: transcript,
                     incomingPrompt: prompt,
                     budget: budget
                 )
-                if providerChanged || contextIsFull {
+                if providerChanged || toolModeChanged || contextIsFull {
                     // Rebase every Apple model switch through a summary.
                     // Besides fitting a PCC transcript into the smaller
                     // on-device window, this removes the previous model's
@@ -585,24 +751,26 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                             tokenLimit: budget.summaryTokenLimit
                         )
                     } catch {
-                        guard providerChanged else {
-                            throw error
-                        }
-                        switch CourseAgentProvider.compactionFallback(
-                            from: compactionProvider,
-                            to: providerID
-                        ) {
-                        case .localSummary:
+                        if providerID == CourseAgentProvider.appleOnDevice {
                             // PCC may be offline or quota-limited precisely
-                            // when a learner needs to fall back. Preserve
-                            // durable state and the newest context locally.
+                            // when a learner needs to fall back, and the local
+                            // compaction request can itself exceed 4K. Preserve
+                            // durable state and the newest context without
+                            // requiring another model request.
                             summary = Self.localTransitionSummary(
                                 workspaceID: workspaceID,
                                 transcript: transcript,
                                 previousSummary: state.compactedSummary,
                                 tokenLimit: budget.summaryTokenLimit
                             )
-                        case .targetProvider(let targetProviderID):
+                        } else if
+                            providerChanged,
+                            case .targetProvider(let targetProviderID) =
+                                CourseAgentProvider.compactionFallback(
+                                    from: compactionProvider,
+                                    to: providerID
+                                )
+                        {
                             // If Apple Intelligence becomes unavailable, the
                             // already-validated PCC target can summarize the
                             // smaller on-device transcript before taking over.
@@ -613,7 +781,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                                 previousSummary: state.compactedSummary,
                                 tokenLimit: budget.summaryTokenLimit
                             )
-                        case nil:
+                        } else {
                             throw error
                         }
                     }
@@ -629,6 +797,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     workspaceID: workspaceID,
                     compactedSummary: state.compactedSummary,
                     prompt: prompt,
+                    toolMode: toolMode,
                     onCoursePlan: trackedOnCoursePlan
                 )
             }
@@ -636,6 +805,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 sessionID: sessionID,
                 providerID: providerID,
                 workspaceID: workspaceID,
+                toolMode: toolMode,
                 persistedTranscript: state.transcript,
                 compactedSummary: state.compactedSummary,
                 onCoursePlan: trackedOnCoursePlan,
@@ -646,8 +816,17 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                         "editor mutation tool entered",
                         fields: ["session_id": sessionID.uuidString.lowercased()]
                     )
+                },
+                onEditorMutationCompletion: {
+                    didCompleteEditorMutation = true
+                    LLog.info(
+                        "AppleCourseAgent",
+                        "editor mutation tool completed",
+                        fields: ["session_id": sessionID.uuidString.lowercased()]
+                    )
                 }
             )
+            state.toolMode = toolMode
             state.messages.append(.init(role: .learner, text: prompt))
             try saveState(state, sessionID: sessionID, workspaceID: workspaceID)
             LLog.info(
@@ -669,7 +848,8 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             ) async throws {
                 let runtimePrompt = Self.runtimePrompt(
                     for: prompt,
-                    providerID: providerID
+                    providerID: providerID,
+                    toolMode: toolMode
                 )
                 LLog.info(
                     "AppleCourseAgent",
@@ -724,29 +904,38 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     ]
                 )
             }
-            var privateCloudCancellationRetryCount = 0
+            var cancellationRetryCount = 0
             @MainActor
-            func consumeWithPrivateCloudTimeout(
+            func consumeWithMutationFreeTimeout(
                 _ activeSession: LanguageModelSession,
                 attemptNumber: Int
             ) async throws {
-                guard providerID == CourseAgentProvider.applePrivateCloud else {
-                    try await consume(activeSession, attemptNumber: attemptNumber)
-                    return
-                }
-
                 let generationTask = Task { @MainActor in
                     try await consume(activeSession, attemptNumber: attemptNumber)
                 }
                 let watchdogTask = Task { @MainActor in
-                    do {
-                        try await Task.sleep(
-                            for: AppleCoursePrivateCloudRetryPolicy.mutationFreeAttemptTimeout
-                        )
-                    } catch {
-                        return
+                    for _ in 0..<AppleCourseGenerationRetryPolicy.watchdogPollCount {
+                        do {
+                            try await Task.sleep(
+                                for: AppleCourseGenerationRetryPolicy.watchdogPollInterval
+                            )
+                        } catch {
+                            return
+                        }
+                        if didCompleteEditorMutation {
+                            LLog.info(
+                                "AppleCourseAgent",
+                                "ending generation after verified editor mutation",
+                                fields: [
+                                    "attempt": attemptNumber,
+                                    "session_id": sessionID.uuidString.lowercased(),
+                                ]
+                            )
+                            generationTask.cancel()
+                            return
+                        }
                     }
-                    guard AppleCoursePrivateCloudRetryPolicy.canCancelHungAttempt(
+                    guard AppleCourseGenerationRetryPolicy.canCancelHungAttempt(
                         taskWasCancelled: generationTask.isCancelled,
                         latestResponse: latest,
                         didPresentCoursePlan: didPresentCoursePlan,
@@ -754,7 +943,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     ) else {
                         LLog.info(
                             "AppleCourseAgent",
-                            "PCC watchdog left active attempt running",
+                            "generation watchdog left active attempt running",
                             fields: [
                                 "attempt": attemptNumber,
                                 "did_attempt_editor_mutation": didAttemptEditorMutation,
@@ -767,7 +956,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     }
                     LLog.warn(
                         "AppleCourseAgent",
-                        "cancelling unresolved mutation-free PCC attempt",
+                        "cancelling unresolved mutation-free generation attempt",
                         fields: [
                             "attempt": attemptNumber,
                             "session_id": sessionID.uuidString.lowercased(),
@@ -786,31 +975,32 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 }
             }
             @MainActor
-            func preparePrivateCloudCancellationRetry() throws -> Bool {
-                guard providerID == CourseAgentProvider.applePrivateCloud,
-                      AppleCoursePrivateCloudRetryPolicy.canRetryCancellation(
-                        retryCount: privateCloudCancellationRetryCount,
+            func prepareMutationFreeCancellationRetry() throws -> Bool {
+                guard AppleCourseGenerationRetryPolicy.canRetryCancellation(
+                        retryCount: cancellationRetryCount,
                         taskWasCancelled: Task.isCancelled,
                         latestResponse: latest,
                         didPresentCoursePlan: didPresentCoursePlan,
                         didAttemptEditorMutation: didAttemptEditorMutation
                       ) else { return false }
-                privateCloudCancellationRetryCount += 1
+                cancellationRetryCount += 1
                 LLog.warn(
                     "AppleCourseAgent",
-                    "retrying mutation-free PCC cancellation",
+                    "retrying mutation-free generation cancellation",
                     fields: [
-                        "next_attempt": privateCloudCancellationRetryCount + 1,
+                        "next_attempt": cancellationRetryCount + 1,
                         "session_id": sessionID.uuidString.lowercased(),
                     ]
                 )
                 liveSessionStore().sessions[sessionID] = nil
                 didPresentCoursePlan = false
                 didAttemptEditorMutation = false
+                didCompleteEditorMutation = false
                 completedSession = try makeSession(
                     sessionID: sessionID,
                     providerID: providerID,
                     workspaceID: workspaceID,
+                    toolMode: toolMode,
                     persistedTranscript: state.transcript,
                     compactedSummary: state.compactedSummary,
                     onCoursePlan: trackedOnCoursePlan,
@@ -819,6 +1009,14 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                         LLog.info(
                             "AppleCourseAgent",
                             "editor mutation tool entered",
+                            fields: ["session_id": sessionID.uuidString.lowercased()]
+                        )
+                    },
+                    onEditorMutationCompletion: {
+                        didCompleteEditorMutation = true
+                        LLog.info(
+                            "AppleCourseAgent",
+                            "editor mutation tool completed",
                             fields: ["session_id": sessionID.uuidString.lowercased()]
                         )
                     }
@@ -842,13 +1040,26 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     throw originalError
                 }
                 let compactionProvider = state.providerID
-                let summary = try await compactedSummary(
-                    providerID: compactionProvider,
-                    workspaceID: workspaceID,
-                    transcript: transcript,
-                    previousSummary: state.compactedSummary,
-                    tokenLimit: budget.summaryTokenLimit
-                )
+                let summary: String
+                do {
+                    summary = try await compactedSummary(
+                        providerID: compactionProvider,
+                        workspaceID: workspaceID,
+                        transcript: transcript,
+                        previousSummary: state.compactedSummary,
+                        tokenLimit: budget.summaryTokenLimit
+                    )
+                } catch {
+                    guard providerID == CourseAgentProvider.appleOnDevice else {
+                        throw error
+                    }
+                    summary = Self.localTransitionSummary(
+                        workspaceID: workspaceID,
+                        transcript: transcript,
+                        previousSummary: state.compactedSummary,
+                        tokenLimit: budget.summaryTokenLimit
+                    )
+                }
                 state.compactedSummary = summary
                 state.transcript = nil
                 liveSessionStore().sessions[sessionID] = nil
@@ -857,6 +1068,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     sessionID: sessionID,
                     providerID: providerID,
                     workspaceID: workspaceID,
+                    toolMode: toolMode,
                     persistedTranscript: nil,
                     compactedSummary: summary,
                     onCoursePlan: trackedOnCoursePlan,
@@ -867,12 +1079,20 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                             "editor mutation tool entered",
                             fields: ["session_id": sessionID.uuidString.lowercased()]
                         )
+                    },
+                    onEditorMutationCompletion: {
+                        didCompleteEditorMutation = true
+                        LLog.info(
+                            "AppleCourseAgent",
+                            "editor mutation tool completed",
+                            fields: ["session_id": sessionID.uuidString.lowercased()]
+                        )
                     }
                 )
                 latest = ""
-                try await consumeWithPrivateCloudTimeout(
+                try await consumeWithMutationFreeTimeout(
                     completedSession,
-                    attemptNumber: privateCloudCancellationRetryCount + 1
+                    attemptNumber: cancellationRetryCount + 1
                 )
             }
             do {
@@ -880,9 +1100,9 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
 #if LEARNFOLD_PRIVATE_CLOUD_COMPUTE_SDK
                     while true {
                         do {
-                            try await consumeWithPrivateCloudTimeout(
+                            try await consumeWithMutationFreeTimeout(
                                 completedSession,
-                                attemptNumber: privateCloudCancellationRetryCount + 1
+                                attemptNumber: cancellationRetryCount + 1
                             )
                             break
                         } catch {
@@ -891,7 +1111,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                                 "generation attempt failed",
                                 error: error,
                                 fields: [
-                                    "attempt": privateCloudCancellationRetryCount + 1,
+                                    "attempt": cancellationRetryCount + 1,
                                     "did_attempt_editor_mutation": didAttemptEditorMutation,
                                     "did_present_course_plan": didPresentCoursePlan,
                                     "error_type": String(reflecting: type(of: error)),
@@ -900,8 +1120,9 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                                     "task_cancelled": Task.isCancelled,
                                 ]
                             )
-                            if error is CancellationError,
-                               try preparePrivateCloudCancellationRetry() {
+                            if (error is CancellationError
+                                || error is LanguageModelSession.GenerationError),
+                               try prepareMutationFreeCancellationRetry() {
                                 continue
                             }
                             if #available(iOS 27.0, *),
@@ -916,7 +1137,22 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                         }
                     }
 #else
-                    try await consumeWithPrivateCloudTimeout(session, attemptNumber: 1)
+                    while true {
+                        do {
+                            try await consumeWithMutationFreeTimeout(
+                                completedSession,
+                                attemptNumber: cancellationRetryCount + 1
+                            )
+                            break
+                        } catch {
+                            if (error is CancellationError
+                                || error is LanguageModelSession.GenerationError),
+                               try prepareMutationFreeCancellationRetry() {
+                                continue
+                            }
+                            throw error
+                        }
+                    }
 #endif
                 } catch let error as LanguageModelSession.GenerationError {
                     guard case .exceededContextWindowSize = error else {
@@ -930,6 +1166,12 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     state.messages.append(.init(role: .agent, text: latest))
                 }
                 try saveState(state, sessionID: sessionID, workspaceID: workspaceID)
+                if didCompleteEditorMutation {
+                    // Tool instances own their per-turn idempotency gate. Rotate
+                    // after a completed write so a later learner turn receives
+                    // a fresh gate and can perform another intentional edit.
+                    liveSessionStore().sessions[sessionID] = nil
+                }
                 LLog.info(
                     "AppleCourseAgent",
                     "send completed and transcript persisted",
@@ -959,6 +1201,20 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 }
                 try? saveState(state, sessionID: sessionID, workspaceID: workspaceID)
                 liveSessionStore().sessions[sessionID] = nil
+                if didCompleteEditorMutation {
+                    let confirmation = "Learnfold saved the requested course change."
+                    if latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        state.messages.append(.init(role: .agent, text: confirmation))
+                        onPartialResponse(confirmation)
+                        try? saveState(state, sessionID: sessionID, workspaceID: workspaceID)
+                    }
+                    LLog.info(
+                        "AppleCourseAgent",
+                        "accepted completed mutation after post-tool generation error",
+                        fields: ["session_id": sessionID.uuidString.lowercased()]
+                    )
+                    return
+                }
                 if let toolError = error as? LanguageModelSession.ToolCallError {
                     if let courseError = toolError.underlyingError as? AppleCourseAgentError {
                         throw courseError
@@ -969,7 +1225,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 }
                 if error is CancellationError, !Task.isCancelled {
                     throw AppleCourseAgentError.toolFailed(
-                        "Apple Private Cloud did not finish that request. Please try again."
+                        "Apple’s model did not finish that request. Please try again."
                     )
                 }
                 throw error
@@ -1002,6 +1258,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
 
     private struct PersistedState: Codable {
         var providerID: String
+        var toolMode: AppleCourseToolMode?
         var transcript: Data?
         var compactedSummary: String?
         var messages: [AppleCourseAgentStoredMessage]
@@ -1058,17 +1315,21 @@ private extension SystemAppleCourseAgentRuntime {
         sessionID: UUID,
         providerID: String,
         workspaceID: String,
+        toolMode: AppleCourseToolMode,
         persistedTranscript: Data?,
         compactedSummary: String?,
         onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void,
-        onEditorMutationAttempt: @escaping @MainActor () -> Void = {}
+        onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void = {},
+        onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) throws -> LanguageModelSession {
         if let cached = liveSessionStore().sessions[sessionID],
            cached.workspaceID == workspaceID,
-           cached.providerID == providerID {
+           cached.providerID == providerID,
+           cached.toolMode == toolMode {
             cached.callbacks.rebind(
                 onCoursePlan: onCoursePlan,
-                onEditorMutationAttempt: onEditorMutationAttempt
+                onEditorMutationAttempt: onEditorMutationAttempt,
+                onEditorMutationCompletion: onEditorMutationCompletion
             )
             LLog.info(
                 "AppleCourseAgent",
@@ -1083,16 +1344,21 @@ private extension SystemAppleCourseAgentRuntime {
 
         let callbacks = AppleCourseLiveSessionCallbacks(
             onCoursePlan: onCoursePlan,
-            onEditorMutationAttempt: onEditorMutationAttempt
+            onEditorMutationAttempt: onEditorMutationAttempt,
+            onEditorMutationCompletion: onEditorMutationCompletion
         )
         let tools = try AppleCourseToolFactory.tools(
             providerID: providerID,
             workspaceID: workspaceID,
+            mode: toolMode,
             onCoursePlan: { plan in
                 try callbacks.presentCoursePlan(plan)
             },
             onEditorMutationAttempt: {
                 callbacks.recordEditorMutationAttempt()
+            },
+            onEditorMutationCompletion: {
+                callbacks.recordEditorMutationCompletion()
             }
         )
         let transcript = persistedTranscript.flatMap {
@@ -1100,7 +1366,8 @@ private extension SystemAppleCourseAgentRuntime {
         }
         let instructions = Self.instructions(
             providerID: providerID,
-            compactedSummary: compactedSummary
+            compactedSummary: compactedSummary,
+            toolMode: toolMode
         )
         let session: LanguageModelSession
         if providerID == CourseAgentProvider.applePrivateCloud {
@@ -1140,9 +1407,11 @@ private extension SystemAppleCourseAgentRuntime {
                 instructions: instructions
             )
         }
+        session.prewarm()
         liveSessionStore().sessions[sessionID] = LiveSession(
             workspaceID: workspaceID,
             providerID: providerID,
+            toolMode: toolMode,
             session: session,
             callbacks: callbacks
         )
@@ -1153,6 +1422,7 @@ private extension SystemAppleCourseAgentRuntime {
                 "has_persisted_transcript": transcript != nil,
                 "provider": providerID,
                 "session_id": sessionID.uuidString.lowercased(),
+                "tool_mode": toolMode.rawValue,
             ]
         )
         return session
@@ -1163,6 +1433,7 @@ private extension SystemAppleCourseAgentRuntime {
         workspaceID: String,
         compactedSummary: String?,
         prompt: String,
+        toolMode: AppleCourseToolMode,
         onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void
     ) async throws {
         guard
@@ -1177,27 +1448,35 @@ private extension SystemAppleCourseAgentRuntime {
             let tools = try AppleCourseToolFactory.tools(
                 providerID: providerID,
                 workspaceID: workspaceID,
+                mode: toolMode,
                 onCoursePlan: onCoursePlan
             )
             let instructionTokens = try await model.tokenCount(
                 for: Instructions(
                     Self.instructions(
                         providerID: providerID,
-                        compactedSummary: compactedSummary
+                        compactedSummary: compactedSummary,
+                        toolMode: toolMode
                     )
                 )
             )
             let toolTokens = try await model.tokenCount(for: tools)
             let promptTokens = try await model.tokenCount(
-                for: Self.runtimePrompt(for: prompt, providerID: providerID)
+                for: Self.runtimePrompt(
+                    for: prompt,
+                    providerID: providerID,
+                    toolMode: toolMode
+                )
             )
             // A first turn has no transcript to compact. Keep room for a
             // useful response or a plan tool call and fail with actionable
             // copy instead of exposing the framework's overflow error.
-            let responseReserve = min(768, max(256, model.contextSize / 5))
+            let budget = AppleCourseContextBudget.forProvider(providerID)
             guard
                 instructionTokens + toolTokens + promptTokens
-                    < model.contextSize - responseReserve
+                    < model.contextSize
+                        - budget.responseReserveTokens
+                        - budget.toolOutputReserveTokens
             else {
                 throw AppleCourseAgentError.toolFailed(
                     """
@@ -1271,6 +1550,8 @@ private extension SystemAppleCourseAgentRuntime {
 
     func shouldCompact(
         providerID: String,
+        toolMode: AppleCourseToolMode,
+        workspaceID: String,
         transcript: Transcript,
         incomingPrompt: String,
         budget: AppleCourseContextBudget
@@ -1295,15 +1576,37 @@ private extension SystemAppleCourseAgentRuntime {
            #available(iOS 26.4, *) {
             do {
                 let model = SystemLanguageModel.default
+                let tools = try AppleCourseToolFactory.tools(
+                    providerID: providerID,
+                    workspaceID: workspaceID,
+                    mode: toolMode,
+                    onCoursePlan: { _ in }
+                )
                 let transcriptTokens = try await model.tokenCount(for: transcript)
+                let toolTokens = try await model.tokenCount(for: tools)
                 let promptTokens = try await model.tokenCount(
                     for: Self.runtimePrompt(
                         for: incomingPrompt,
-                        providerID: providerID
+                        providerID: providerID,
+                        toolMode: toolMode
                     )
                 )
-                return transcriptTokens + promptTokens
-                    >= budget.effectiveTrigger(contextSize: contextSize)
+                let consumedTokens = transcriptTokens + toolTokens + promptTokens
+                LLog.info(
+                    "AppleCourseAgent",
+                    "on-device context budget",
+                    fields: [
+                        "context_size": contextSize,
+                        "prompt_tokens": promptTokens,
+                        "reserved_tokens":
+                            budget.responseReserveTokens + budget.toolOutputReserveTokens,
+                        "tool_mode": toolMode.rawValue,
+                        "tool_tokens": toolTokens,
+                        "transcript_tokens": transcriptTokens,
+                        "used_tokens": consumedTokens,
+                    ]
+                )
+                return consumedTokens >= budget.effectiveTrigger(contextSize: contextSize)
             } catch {
                 // Availability can change while counting. The conservative
                 // text estimate remains a safe fallback and the generation
@@ -1320,14 +1623,39 @@ private extension SystemAppleCourseAgentRuntime {
 
     static func instructions(
         providerID _: String,
-        compactedSummary: String?
+        compactedSummary: String?,
+        toolMode: AppleCourseToolMode
     ) -> String {
-        let toolInstructions = """
-        Use learnfold_course_action. To propose or revise a plan, set operation to \
-        present_course_plan and fill every typed plan field directly. For native course reads or \
-        edits, set operation to the native-editor tool name, put that tool’s JSON object in \
-        arguments_json, and omit the plan fields.
-        """
+        let toolInstructions: String
+        switch toolMode {
+        case .planning:
+            toolInstructions = """
+            When ready, call present_course_plan with every typed plan field. Do not describe the \
+            plan in chat. Wait for learner approval before creating course content.
+            """
+        case .editing:
+            toolInstructions = """
+            The learner approved the current plan. Use learnfold_generate_lesson exactly once for \
+            initial lesson generation, or learnfold_append_lesson_section exactly once for a \
+            requested addition. Learnfold resolves and fetches the current page internally.
+            """
+        case .generatingLesson:
+            toolInstructions = """
+            The learner approved the current plan. Use learnfold_generate_lesson exactly once. \
+            Learnfold resolves and saves the pending lesson internally.
+            """
+        case .appendingLesson:
+            toolInstructions = """
+            Use learnfold_append_lesson_section exactly once for the requested lesson addition. \
+            Learnfold resolves and fetches the current page internally.
+            """
+        case .full:
+            toolInstructions = """
+            Use present_course_plan for typed plan proposals. After approval, use \
+            learnfold_generate_lesson or learnfold_append_lesson_section exactly once for each \
+            requested lesson write. Never edit before learner approval.
+            """
+        }
         let baseInstructions = """
         \(appleInstructions)
 
@@ -1349,11 +1677,11 @@ private extension SystemAppleCourseAgentRuntime {
 
     static var compactionInstructions: String {
         """
-        Produce a dense, faithful working-memory summary for another Learnfold course agent. \
-        Preserve the learner’s goal, starting knowledge, preferences, constraints, decisions, \
-        unresolved questions, source links, exact course/page/tool IDs, revision numbers, tool \
-        results, and the latest presented/approved plan status. Drop pleasantries, repetition, and \
-        superseded drafts. Never invent facts. Use compact Markdown headings and bullets.
+        Write bounded working memory for another Learnfold course agent using only these headings: \
+        Goal, Learner, Constraints, Decisions, Open Questions, Durable References, Latest State. \
+        Preserve source links, exact course/page/tool IDs, revision numbers, and approval status. \
+        Prefer terse facts over prose. Drop pleasantries, repetition, and superseded drafts. Never \
+        invent facts or repeat a heading when there is nothing to preserve.
         """
     }
 
@@ -1418,7 +1746,9 @@ private extension SystemAppleCourseAgentRuntime {
     ) -> String {
         let estimator = AppleCourseContextBudget(
             triggerTokens: tokenLimit,
-            summaryTokenLimit: tokenLimit
+            summaryTokenLimit: tokenLimit,
+            responseReserveTokens: 0,
+            toolOutputReserveTokens: 0
         )
         var sections = [
             """
@@ -1510,15 +1840,57 @@ private extension SystemAppleCourseAgentRuntime {
 
     static func runtimePrompt(
         for learnerPrompt: String,
-        providerID _: String
+        providerID _: String,
+        toolMode: AppleCourseToolMode
     ) -> String {
-        return """
-        \(learnerPrompt)
+        switch toolMode {
+        case .planning:
+            return """
+            \(learnerPrompt)
 
-        Learnfold runtime rule: If this turn is ready to propose or revise a course plan, do not \
-        describe that plan in chat; call present_course_plan with every typed plan field instead. \
-        Otherwise reply normally.
-        """
+            If ready to propose or revise the plan, call present_course_plan. Otherwise answer \
+            normally.
+            """
+        case .editing:
+            return learnerPrompt
+        case .generatingLesson, .appendingLesson:
+            return learnerPrompt
+        case .full:
+            return """
+            \(learnerPrompt)
+
+            Use the appropriate Learnfold tool when this request changes durable course state.
+            """
+        }
+    }
+}
+
+@available(iOS 26.0, *)
+private actor AppleCourseLessonWriteGate {
+    private var completed: [String: String] = [:]
+    private var inFlight: [String: Task<String, Error>] = [:]
+
+    func perform(
+        key: String,
+        operation: @escaping @Sendable () async throws -> String
+    ) async throws -> String {
+        if let result = completed[key] {
+            return result
+        }
+        if let task = inFlight[key] {
+            return try await task.value
+        }
+        let task = Task { try await operation() }
+        inFlight[key] = task
+        do {
+            let result = try await task.value
+            inFlight[key] = nil
+            completed[key] = result
+            return result
+        } catch {
+            inFlight[key] = nil
+            throw error
+        }
     }
 }
 
@@ -1527,13 +1899,16 @@ private enum AppleCourseToolFactory {
     static func tools(
         providerID _: String,
         workspaceID: String,
+        mode: AppleCourseToolMode,
         onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void,
-        onEditorMutationAttempt: @escaping @MainActor () -> Void = {}
+        onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void = {},
+        onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) throws -> [any Tool] {
         let planSpec = try presentCoursePlanSpec()
-        let editorSpec = try editorActionSpec()
-        return [
-            try AppleDynamicCourseTool(spec: planSpec) { generatedJSON in
+        let lessonWriteGate = AppleCourseLessonWriteGate()
+        var tools: [any Tool] = []
+        if mode == .planning || mode == .full {
+            tools.append(try AppleDynamicCourseTool(spec: planSpec) { generatedJSON in
                 let brief: CourseBrief
                 do {
                     brief = try JSONDecoder().decode(
@@ -1554,43 +1929,216 @@ private enum AppleCourseToolFactory {
                     retryToolName: CourseAgentTools.presentPlan,
                     onCoursePlan: onCoursePlan
                 )
-            },
-            try AppleDynamicCourseTool(spec: editorSpec) { generatedJSON in
-                let action: EditorAction
-                do {
-                    action = try JSONDecoder().decode(
-                        EditorAction.self,
+            })
+        }
+        if mode == .editing || mode == .generatingLesson || mode == .full {
+            tools.append(try AppleDynamicCourseTool(spec: try generateLessonSpec()) { generatedJSON in
+                let generated = try JSONDecoder().decode(
+                    GeneratedLesson.self,
+                    from: Data(generatedJSON.utf8)
+                )
+                await onEditorMutationAttempt()
+                return try await lessonWriteGate.perform(key: "generate") {
+                    let validatedSwiftCode =
+                        AppleCourseGeneratedLessonValidator.validatedSwiftCode(
+                            generated.swiftCode
+                        )
+                    let result = try await executeLessonWrite(
+                        write: LessonWrite(
+                            markdown: """
+                            ## Explanation
+
+                            \(generated.explanation)
+
+                            ## Swift example
+
+                            ```swift
+                            \(validatedSwiftCode)
+                            ```
+
+                            ## Exercise
+
+                            \(generated.exercise)
+                            """,
+                            mode: "replace",
+                            markGenerated: true
+                        ),
+                        workspaceID: workspaceID
+                    )
+                    await onEditorMutationCompletion()
+                    return result
+                }
+            })
+        }
+        if mode == .editing || mode == .appendingLesson || mode == .full {
+            tools.append(try AppleDynamicCourseTool(spec: try appendLessonSectionSpec()) {
+                generatedJSON in
+                await onEditorMutationAttempt()
+                return try await lessonWriteGate.perform(key: "append") {
+                    let generated = try JSONDecoder().decode(
+                        GeneratedLessonSection.self,
                         from: Data(generatedJSON.utf8)
                     )
-                } catch {
-                    return try rejection(
-                        """
-                        The editor action did not match the tool schema. Call \
-                        learnfold_editor_action again with a supported operation and its valid \
-                        arguments_json object.
-                        """
+                    let result = try await executeLessonWrite(
+                        write: LessonWrite(
+                            markdown: """
+                            ## \(generated.heading)
+
+                            \(generated.body)
+                            """,
+                            mode: "append",
+                            markGenerated: false
+                        ),
+                        workspaceID: workspaceID
                     )
+                    await onEditorMutationCompletion()
+                    return result
                 }
-                if isMutation(action.operation) {
-                    await onEditorMutationAttempt()
-                }
-                return try await execute(
-                    operation: action.operation,
-                    argumentsJSON: action.argumentsJSON,
-                    workspaceID: workspaceID
-                )
-            },
-        ]
+            })
+        }
+        return tools
     }
 
-    private struct EditorAction: Decodable {
-        let operation: String
-        let argumentsJSON: String
+    private struct GeneratedLesson: Decodable {
+        let explanation: String
+        let swiftCode: String
+        let exercise: String
 
         enum CodingKeys: String, CodingKey {
-            case operation
-            case argumentsJSON = "arguments_json"
+            case explanation
+            case swiftCode = "swift_code"
+            case exercise
         }
+    }
+
+    private struct GeneratedLessonSection: Decodable {
+        let heading: String
+        let body: String
+    }
+
+    private struct LessonWrite {
+        let markdown: String
+        let mode: String
+        let markGenerated: Bool
+    }
+
+    private static func executeLessonWrite(
+        write: LessonWrite,
+        workspaceID: String
+    ) async throws -> String {
+        guard AppleCourseApprovalPolicy.isLatestPlanApproved(
+            courseDirectory: courseDirectory(workspaceID: workspaceID)
+        ) else {
+            return try rejection(
+                "Course changes are locked until the learner approves the latest plan. Do not retry."
+            )
+        }
+        let targetURL = courseDirectory(workspaceID: workspaceID)
+            .appendingPathComponent(".course", isDirectory: true)
+            .appendingPathComponent(AppleCourseApprovalPolicy.lessonTargetFilename)
+        let targetData = try Data(contentsOf: targetURL)
+        let target = try JSONDecoder().decode(PreparedCourseLessonTarget.self, from: targetData)
+        let fetchResult = try await executeRawEditorAction(
+            operation: "native-editor-fetch",
+            arguments: ["id": target.pageID],
+            workspaceID: workspaceID
+        )
+        guard !fetchResult.isError, let expectedRevision = fetchResult.revision else {
+            throw AppleCourseAgentError.toolFailed(
+                "Learnfold could not fetch the current lesson revision."
+            )
+        }
+        let contentArguments: [String: Any]
+        switch write.mode {
+        case "replace":
+            contentArguments = [
+                "page_id": target.pageID,
+                "expected_revision": expectedRevision,
+                "command": "replace_content",
+                "new_str": write.markdown,
+            ]
+        case "append":
+            contentArguments = [
+                "page_id": target.pageID,
+                "expected_revision": expectedRevision,
+                "command": "insert_content",
+                "content": write.markdown,
+                "position": ["type": "end"],
+            ]
+        default:
+            return try rejection("Lesson write mode must be replace or append.")
+        }
+
+        let contentResult = try await executeRawEditorAction(
+            operation: "native-editor-update-page",
+            arguments: contentArguments,
+            workspaceID: workspaceID
+        )
+        guard !contentResult.isError else {
+            return try rejection(
+                "The native editor rejected the lesson content update: \(contentResult.text)"
+            )
+        }
+        guard let nextRevision = contentResult.revision else {
+            throw AppleCourseAgentError.toolFailed(
+                "The native editor omitted the updated lesson revision."
+            )
+        }
+        var properties: [String: Any] = [
+            "course_node_id": target.nodeID,
+            "course_role": "lesson",
+        ]
+        if write.markGenerated {
+            properties["generation_status"] = "generated"
+        }
+        let finalResult = try await executeRawEditorAction(
+            operation: "native-editor-update-page",
+            arguments: [
+                "page_id": target.pageID,
+                "expected_revision": nextRevision,
+                "command": "update_properties",
+                "properties": properties,
+            ],
+            workspaceID: workspaceID
+        )
+        guard !finalResult.isError else {
+            throw AppleCourseAgentError.toolFailed(
+                "The lesson content was saved, but Learnfold could not restore its course metadata."
+            )
+        }
+        return try accepted(
+            """
+            Learnfold saved the lesson successfully. Result: \(finalResult.text). Do not call \
+            another lesson-writing tool in this turn. Reply once with a brief confirmation.
+            """
+        )
+    }
+
+    private struct RawEditorResult {
+        let text: String
+        let isError: Bool
+        let revision: Int64?
+    }
+
+    private static func executeRawEditorAction(
+        operation: String,
+        arguments: [String: Any],
+        workspaceID: String
+    ) async throws -> RawEditorResult {
+        let argumentsData = try JSONSerialization.data(withJSONObject: arguments)
+        let argumentsJSON = String(decoding: argumentsData, as: UTF8.self)
+        guard let result = await CourseDocumentRegistry.shared.handle(
+            workspaceID: workspaceID,
+            tool: operation,
+            argumentsJSON: argumentsJSON
+        ) else {
+            throw AppleCourseAgentError.toolFailed("The native course document is not open.")
+        }
+        let data = try JSONEncoder().encode(result.value)
+        let text = String(decoding: data, as: UTF8.self)
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let revision = (object?["revision"] as? NSNumber)?.int64Value
+        return RawEditorResult(text: text, isError: result.isError, revision: revision)
     }
 
     private static func execute(
@@ -1628,7 +2176,17 @@ private enum AppleCourseToolFactory {
             return try rejection(
                 """
                 The native editor rejected that action: \(text). Correct arguments_json and call \
-                learnfold_course_action again.
+                the same native editor tool again.
+                """
+            )
+        }
+        if isMutation(operation) {
+            return try accepted(
+                """
+                The native editor applied \(operation) successfully. Result: \(text). If this \
+                completed the learner's requested change, do not repeat the mutation; reply once \
+                with a brief confirmation. Only call another editor operation when a distinct \
+                requested change is still outstanding.
                 """
             )
         }
@@ -1649,7 +2207,22 @@ private enum AppleCourseToolFactory {
             )
         }
         try await onCoursePlan(brief)
-        return #"{"accepted":true,"message":"The plan is ready for learner approval."}"#
+        return try accepted(
+            """
+            The plan was presented successfully and is now waiting for learner approval. Do not \
+            call present_course_plan again in this turn. Reply once, briefly, that the plan is \
+            ready for review.
+            """
+        )
+    }
+
+    private static func accepted(_ message: String) throws -> String {
+        let payload: [String: Any] = [
+            "accepted": true,
+            "message": message,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func presentCoursePlanSpec() throws -> AppDynamicToolSpec {
@@ -1698,42 +2271,64 @@ private enum AppleCourseToolFactory {
         )
     }
 
-    private static func editorActionSpec() throws -> AppDynamicToolSpec {
+    private static func generateLessonSpec() throws -> AppDynamicToolSpec {
         let root: [String: Any] = [
             "type": "object",
             "additionalProperties": false,
             "properties": [
-                "operation": [
+                "explanation": [
                     "type": "string",
-                    "description": "The approved native-editor operation to execute.",
-                    "enum": [
-                        "native-editor-search",
-                        "native-editor-fetch",
-                        "native-editor-create-pages",
-                        "native-editor-update-page",
-                        "native-editor-move-pages",
-                        "native-editor-duplicate-page",
-                        "native-editor-get-async-task",
-                    ],
+                    "description": "Concise beginner explanation of the lesson concept.",
                 ],
-                "arguments_json": [
+                "swift_code": [
                     "type": "string",
-                    "description": """
-                    A valid JSON object for the selected native-editor operation. For \
-                    native-editor-create-pages, every item in pages must contain properties with \
-                    a nonempty title.
-                    """,
+                    "description": "Small compiling Swift example without Markdown fences.",
+                ],
+                "exercise": [
+                    "type": "string",
+                    "description": "One short learner exercise.",
                 ],
             ],
-            "required": ["operation", "arguments_json"],
+            "required": [
+                "explanation",
+                "swift_code",
+                "exercise",
+            ],
         ]
         let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
         return AppDynamicToolSpec(
-            name: "learnfold_editor_action",
+            name: "learnfold_generate_lesson",
             description: """
-            Read or change the approved native course. Never call a mutating operation until the \
-            learner approves the latest plan. Pass the native editor's JSON object in \
-            arguments_json.
+            Generate the approved current lesson. Learnfold formats and saves the fields through \
+            its revision-safe native editor. Call exactly once.
+            """,
+            inputSchemaJson: String(decoding: data, as: UTF8.self),
+            deferLoading: false
+        )
+    }
+
+    private static func appendLessonSectionSpec() throws -> AppDynamicToolSpec {
+        let root: [String: Any] = [
+            "type": "object",
+            "additionalProperties": false,
+            "properties": [
+                "heading": [
+                    "type": "string",
+                    "description": "Exact requested section heading without Markdown markers.",
+                ],
+                "body": [
+                    "type": "string",
+                    "description": "Exact requested section body.",
+                ],
+            ],
+            "required": ["heading", "body"],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+        return AppDynamicToolSpec(
+            name: "learnfold_append_lesson_section",
+            description: """
+            Append one requested section to Learnfold's current lesson. Learnfold fetches the \
+            current revision and saves it through the native editor. Call exactly once.
             """,
             inputSchemaJson: String(decoding: data, as: UTF8.self),
             deferLoading: false

@@ -158,7 +158,7 @@ struct DiscoveryView: View {
             slingshotHostsSheet
         }
         .sheet(isPresented: $showAlleycatSheet) {
-            AlleycatAddServerSheet(appModel: appModel, startScanningOnAppear: true) { result in
+            AlleycatAddServerSheet(appModel: appModel) { result in
                 showAlleycatSheet = false
                 Task { await connectAlleycatTarget(result) }
             }
@@ -254,10 +254,10 @@ struct DiscoveryView: View {
                     .padding(.top, 8)
 
                 chooserCard(
-                    title: "Pair with kittylitter",
-                    subtitle: "Run npx kittylitter on the host, then scan the QR code it prints.",
+                    title: "Connect with Hermes",
+                    subtitle: "Copy a setup prompt into Hermes. Learnfold receives the pairing securely and asks before connecting.",
                     badge: "RECOMMENDED",
-                    icon: "qrcode.viewfinder",
+                    icon: "sparkles",
                     supportedAgents: Self.kittylitterAgents,
                     isRecommended: true,
                     accessibilityID: "discovery.chooser.kittylitter"

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var appModel
@@ -83,6 +84,15 @@ struct SettingsView: View {
                             Task { await reconnectViaSSH(server: server, host: host, credentials: credentials) }
                         }
                     }
+                case .disableHermes(let server):
+                    HermesServerDisconnectSheet(
+                        serverName: server.displayName,
+                        onRemove: {
+                            activeServerSheet = nil
+                            removeServer(server)
+                        }
+                    )
+                    .environment(\.textScale, textScale)
                 }
             }
             .alert("Server Update Failed", isPresented: Binding(
@@ -351,7 +361,11 @@ struct SettingsView: View {
                         }
                         .buttonStyle(.plain)
                         Button("Remove") {
-                            removeServer(conn)
+                            if isKittylitterPairedServer(conn) {
+                                activeServerSheet = .disableHermes(conn)
+                            } else {
+                                removeServer(conn)
+                            }
                         }
                         .litterFont(.caption)
                         .foregroundColor(LitterTheme.danger)
@@ -385,6 +399,12 @@ struct SettingsView: View {
         SavedServerStore.remove(serverId: server.id)
         Task { await SshSessionStore.shared.close(serverId: server.id, ssh: appModel.ssh) }
         appModel.serverBridge.disconnectServer(serverId: server.id)
+    }
+
+    private func isKittylitterPairedServer(_ server: HomeDashboardServer) -> Bool {
+        SavedServerStore.load().contains {
+            $0.id == server.id && $0.alleycatNodeId != nil
+        }
     }
 
     private func saveServerConfiguration(
@@ -556,6 +576,7 @@ private enum SettingsServerSheet: Identifiable {
     case add
     case edit(HomeDashboardServer)
     case sshReconnect(DiscoveredServer)
+    case disableHermes(HomeDashboardServer)
 
     var id: String {
         switch self {
@@ -565,6 +586,82 @@ private enum SettingsServerSheet: Identifiable {
             return "edit-\(server.id)"
         case .sshReconnect(let server):
             return "ssh-\(server.id)"
+        case .disableHermes(let server):
+            return "disable-hermes-\(server.id)"
+        }
+    }
+}
+
+private struct HermesServerDisconnectSheet: View {
+    let serverName: String
+    let onRemove: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var copiedPrompt = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Label("Disable Learnfold on this computer", systemImage: "power")
+                        .litterFont(.subheadline, weight: .semibold)
+                        .foregroundColor(LitterTheme.textPrimary)
+
+                    Text("Learnfold cannot shut down Learnfold Link through the connection it is about to terminate. Copy this prompt into a separate Hermes chat on \(serverName); Hermes will revoke the pairings, disable autostart, and stop the background service.")
+                        .litterFont(.footnote)
+                        .foregroundColor(LitterTheme.textSecondary)
+
+                    Button {
+                        UIPasteboard.general.string = AgentAssistedPairing.disablePrompt(
+                            computerName: serverName
+                        )
+                        copiedPrompt = true
+                    } label: {
+                        Label(
+                            copiedPrompt ? "Shutdown Prompt Copied" : "Copy Shutdown Prompt",
+                            systemImage: copiedPrompt ? "checkmark.circle.fill" : "doc.on.doc"
+                        )
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(LitterTheme.accent)
+                    .foregroundColor(.black)
+                    .accessibilityIdentifier("settings.copyHermesShutdownPrompt")
+
+                    if copiedPrompt {
+                        Text("Paste the prompt into an external Hermes chat. Return here afterward to remove the saved connection.")
+                            .litterFont(.caption)
+                            .foregroundColor(LitterTheme.accent)
+                            .accessibilityIdentifier("settings.hermesShutdownPromptCopied")
+                    }
+                } header: {
+                    Text(serverName)
+                        .foregroundColor(LitterTheme.textSecondary)
+                }
+                .listRowBackground(LitterTheme.surface.opacity(0.6))
+
+                Section {
+                    Button("Remove from Learnfold", role: .destructive) {
+                        onRemove()
+                    }
+                    .frame(maxWidth: .infinity)
+                    .accessibilityIdentifier("settings.removeHermesServer")
+                } footer: {
+                    Text("Removing only from Learnfold does not stop Learnfold Link on the computer. Use the copied prompt first if you want the background service disabled.")
+                        .foregroundColor(LitterTheme.textMuted)
+                }
+                .listRowBackground(LitterTheme.surface.opacity(0.6))
+            }
+            .scrollContentBackground(.hidden)
+            .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+            .navigationTitle("Disconnect Hermes")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                        .foregroundColor(LitterTheme.accent)
+                }
+            }
         }
     }
 }

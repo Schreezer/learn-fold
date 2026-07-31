@@ -1,6 +1,8 @@
 import AVFoundation
+import Foundation
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct AlleycatConnectedTarget: Equatable {
     let serverId: String
@@ -11,9 +13,194 @@ struct AlleycatConnectedTarget: Equatable {
     let agentWire: AppAlleycatAgentWire
 }
 
+enum AgentAssistedPairing {
+    static func prompt(submitURL: URL) -> String {
+        """
+    Connect this computer's Hermes agent to the Learnfold app on my iPhone.
+
+    Run exactly this one terminal command now. Do not inspect the environment or run \
+    preflight commands first:
+    `npx -y learnfold-link@0.3.9 handoff "\(submitURL.absoluteString)"`
+
+    If it exits successfully, reply only "Connected". Otherwise reply only "Setup failed". \
+    Do not display a token or pairing JSON, and do not ask me to run a command.
+
+    The URL is a temporary, one-time credential. Do not save it to a file, memory, or log, \
+    and do not use it for anything except this Learnfold Link handoff.
+    """
+    }
+
+    static func pairingPayloadCandidate(from response: String) -> String {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let firstBrace = trimmed.firstIndex(of: "{"),
+              let lastBrace = trimmed.lastIndex(of: "}"),
+              firstBrace <= lastBrace
+        else {
+            return trimmed
+        }
+        return String(trimmed[firstBrace...lastBrace])
+    }
+
+    static func disablePrompt(computerName: String) -> String {
+        """
+    Securely disable Learnfold connectivity on \(computerName), while keeping Hermes itself running.
+
+    Perform the shutdown yourself in your own terminal:
+    1. Run `npx -y learnfold-link@0.3.9 rotate` to invalidate every existing Learnfold pairing.
+    2. Run `npx -y learnfold-link@0.3.9 uninstall` to disable autostart and stop the managed service.
+    3. If a Learnfold Link or Alleycat daemon is still running, run \
+    `npx -y learnfold-link@0.3.9 stop`.
+    4. Verify that autostart is disabled and no Learnfold Link or Alleycat daemon remains running.
+
+    Do not display the new token. Do not delete Hermes, projects, configuration, or logs. \
+    Do not ask me to run any commands. Report only whether revocation and shutdown succeeded.
+
+    This request intentionally ends Learnfold's connection, so complete it from this external \
+    Hermes chat even if Learnfold disconnects before receiving a final response.
+    """
+    }
+}
+
+struct HermesPairingRequest: Decodable, Equatable {
+    let requestId: String
+    let submitURL: URL
+    let claimToken: String
+    let expiresAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+        case submitURL = "submit_url"
+        case claimToken = "claim_token"
+        case expiresAt = "expires_at"
+    }
+}
+
+struct HermesPairingStatus: Decodable, Equatable {
+    struct Host: Decodable, Equatable {
+        let name: String?
+        let nodeId: String
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case nodeId = "node_id"
+        }
+    }
+
+    let state: String
+    let expiresAt: Date
+    let host: Host?
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case expiresAt = "expires_at"
+        case host
+    }
+}
+
+enum HermesPairingBrokerError: LocalizedError {
+    case invalidResponse
+    case requestFailed(Int)
+    case expired
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "The secure pairing service returned an invalid response."
+        case let .requestFailed(status):
+            return "The secure pairing service could not complete this request (HTTP \(status))."
+        case .expired:
+            return "This pairing request expired. Copy a new setup prompt and try again."
+        }
+    }
+}
+
+actor HermesPairingBrokerClient {
+    static let shared = HermesPairingBrokerClient(
+        baseURL: URL(string: "https://litter-pairing-broker.chiragmgg.workers.dev")!
+    )
+
+    private let baseURL: URL
+    private let session: URLSession
+    private let decoder: JSONDecoder
+
+    init(baseURL: URL, session: URLSession? = nil) {
+        self.baseURL = baseURL
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            configuration.timeoutIntervalForRequest = 20
+            self.session = URLSession(configuration: configuration)
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        self.decoder = decoder
+    }
+
+    func createRequest(installationId: String) async throws -> HermesPairingRequest {
+        var request = URLRequest(url: baseURL.appending(path: "v1/pairing-requests"))
+        request.httpMethod = "POST"
+        request.setValue(installationId, forHTTPHeaderField: "X-Learnfold-Installation")
+        let data = try await perform(request, expectedStatus: 201)
+        return try decoder.decode(HermesPairingRequest.self, from: data)
+    }
+
+    func status(for pairing: HermesPairingRequest) async throws -> HermesPairingStatus {
+        var request = URLRequest(
+            url: baseURL.appending(path: "v1/pairing-requests/\(pairing.requestId)/status")
+        )
+        request.setValue("Bearer \(pairing.claimToken)", forHTTPHeaderField: "Authorization")
+        let data = try await perform(request)
+        return try decoder.decode(HermesPairingStatus.self, from: data)
+    }
+
+    func claim(_ pairing: HermesPairingRequest) async throws -> String {
+        var request = URLRequest(
+            url: baseURL.appending(path: "v1/pairing-requests/\(pairing.requestId)/claim")
+        )
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(pairing.claimToken)", forHTTPHeaderField: "Authorization")
+        let data = try await perform(request)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let payload = object["pairing_payload"],
+              JSONSerialization.isValidJSONObject(payload)
+        else {
+            throw HermesPairingBrokerError.invalidResponse
+        }
+        let payloadData = try JSONSerialization.data(withJSONObject: payload)
+        guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
+            throw HermesPairingBrokerError.invalidResponse
+        }
+        return payloadJSON
+    }
+
+    func cancel(_ pairing: HermesPairingRequest) async {
+        var request = URLRequest(
+            url: baseURL.appending(path: "v1/pairing-requests/\(pairing.requestId)/cancel")
+        )
+        request.httpMethod = "DELETE"
+        request.setValue("Bearer \(pairing.claimToken)", forHTTPHeaderField: "Authorization")
+        _ = try? await perform(request)
+    }
+
+    private func perform(_ request: URLRequest, expectedStatus: Int = 200) async throws -> Data {
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse else {
+            throw HermesPairingBrokerError.invalidResponse
+        }
+        guard response.statusCode == expectedStatus else {
+            if response.statusCode == 401 || response.statusCode == 410 {
+                throw HermesPairingBrokerError.expired
+            }
+            throw HermesPairingBrokerError.requestFailed(response.statusCode)
+        }
+        return data
+    }
+}
+
 struct AlleycatAddServerSheet: View {
     let appModel: AppModel
-    let startScanningOnAppear: Bool
     let onConnected: (AlleycatConnectedTarget) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -27,22 +214,28 @@ struct AlleycatAddServerSheet: View {
     @State private var isConnecting = false
     @State private var connectError: String?
     @State private var showScanner = false
-    @State private var didRequestInitialScan = false
     @State private var cameraDenied = false
     // pasteJSON / showPaste are used by the Mac paste-JSON UI
     // (Catalyst + iOS-on-Mac) and the iOS QR fallback.
     @State private var pasteJSON: String = ""
     @State private var showPaste: Bool = false
+    @State private var copiedAgentPrompt = false
+    @State private var isPreparingAgentPrompt = false
+    @State private var hermesPairingRequest: HermesPairingRequest?
+    @State private var hermesPairingStatus = "Create a secure request, then paste the prompt into Hermes."
+    @State private var hermesReadyHost: HermesPairingStatus.Host?
+    @State private var showHermesConfirmation = false
+    @State private var hermesPollingTask: Task<Void, Never>?
+    @State private var connectAfterAgentLoad = false
 
     private let alleycat = RustAlleycatBridge.shared
+    private let pairingBroker = HermesPairingBrokerClient.shared
 
     init(
         appModel: AppModel,
-        startScanningOnAppear: Bool = false,
         onConnected: @escaping (AlleycatConnectedTarget) -> Void
     ) {
         self.appModel = appModel
-        self.startScanningOnAppear = startScanningOnAppear
         self.onConnected = onConnected
     }
 
@@ -73,13 +266,16 @@ struct AlleycatAddServerSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Cancel") { dismiss() }
+                    Button("Cancel") {
+                        cancelHermesPairing()
+                        dismiss()
+                    }
                         .foregroundColor(LitterTheme.accent)
                 }
             }
         }
-        .onAppear {
-            requestInitialScanIfNeeded()
+        .onDisappear {
+            cancelHermesPairing()
         }
         // QR scanner cover + camera-denied alert are applied
         // unconditionally; on Mac builds (Catalyst + iOS-on-Mac) the
@@ -93,9 +289,6 @@ struct AlleycatAddServerSheet: View {
                 },
                 onCancel: {
                     showScanner = false
-                    if startScanningOnAppear, parsedParams == nil {
-                        dismiss()
-                    }
                 },
                 onPermissionDenied: {
                     showScanner = false
@@ -114,20 +307,23 @@ struct AlleycatAddServerSheet: View {
                 Text("Allow camera access in Settings to scan an Alleycat pairing QR code.")
             }
         )
-    }
-
-    private func requestInitialScanIfNeeded() {
-        guard !LitterPlatform.rendersAsMacApp else { return }
-        guard startScanningOnAppear, !didRequestInitialScan, parsedParams == nil else { return }
-        didRequestInitialScan = true
-        Task { @MainActor in
-            await Task.yield()
-            requestCameraAndScan()
-        }
+        .alert(
+            "Hermes is ready",
+            isPresented: $showHermesConfirmation,
+            actions: {
+                Button("Connect") { claimHermesPairingAndConnect() }
+                Button("Not now", role: .cancel) { cancelHermesPairing() }
+            },
+            message: {
+                Text(hermesConfirmationMessage)
+            }
+        )
     }
 
     private var pairingSection: some View {
         Section {
+            agentAssistedPairingControls
+
             // Mac (Catalyst + iOS-on-Mac) shows paste-JSON only; iOS shows
             // QR scanning first, with paste available as a production fallback
             // for users who already copied the pairing payload.
@@ -144,8 +340,68 @@ struct AlleycatAddServerSheet: View {
     }
 
     @ViewBuilder
+    private var agentAssistedPairingControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Let Hermes set it up", systemImage: "sparkles")
+                .litterFont(.subheadline, weight: .semibold)
+                .foregroundColor(LitterTheme.textPrimary)
+
+            Text("Copy this prompt into Hermes on the computer you want to connect. Hermes performs the setup and sends the pairing securely to Learnfold.")
+                .litterFont(.caption)
+                .foregroundColor(LitterTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                copyAgentSetupPrompt()
+            } label: {
+                HStack {
+                    if isPreparingAgentPrompt {
+                        ProgressView().tint(.black)
+                    }
+                    Label(
+                        copiedAgentPrompt ? "Prompt Copied — Waiting" : "Copy Setup Prompt",
+                        systemImage: copiedAgentPrompt ? "checkmark.circle.fill" : "doc.on.doc"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(LitterTheme.accent)
+            .foregroundColor(.black)
+            .disabled(isPreparingAgentPrompt)
+            .accessibilityIdentifier("alleycat.copyAgentSetupPrompt")
+
+            if hermesPairingRequest != nil {
+                HStack(spacing: 8) {
+                    ProgressView().tint(LitterTheme.accent)
+                    Text(hermesPairingStatus)
+                        .litterFont(.caption)
+                        .foregroundColor(LitterTheme.textSecondary)
+                    Spacer()
+                    Button("Cancel") {
+                        cancelHermesPairing()
+                    }
+                    .litterFont(.caption)
+                    .foregroundColor(LitterTheme.warning)
+                }
+            } else {
+                Text(hermesPairingStatus)
+                    .litterFont(.caption)
+                    .foregroundColor(LitterTheme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("No command or credential needs to be copied back. Learnfold will show the computer name and ask before connecting.")
+                .litterFont(.caption2)
+                .foregroundColor(LitterTheme.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
     private var pasteJSONPairingControls: some View {
-        Text("Run \(Self.pairCommandLabel) on the host you want to connect to, then paste the JSON it prints below.")
+        Text("Or paste a pairing response manually.")
             .litterFont(.caption)
             .foregroundColor(LitterTheme.textSecondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -173,7 +429,7 @@ struct AlleycatAddServerSheet: View {
                 pasteJSONEntryControls(minHeight: 90)
             },
             label: {
-                Text("Paste Pairing JSON")
+                Text("Advanced: paste pairing JSON")
                     .litterFont(.footnote)
                     .foregroundColor(LitterTheme.textSecondary)
             }
@@ -217,8 +473,6 @@ struct AlleycatAddServerSheet: View {
             .disabled(pasteJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
-
-    private static let pairCommandLabel = "npx kittylitter"
 
     private func previewSection(params: AppAlleycatPairPayload) -> some View {
         Section {
@@ -377,11 +631,12 @@ struct AlleycatAddServerSheet: View {
         }
     }
 
-    private func handleScannedPayload(_ raw: String) {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func handleScannedPayload(_ raw: String, connectAfterLoading: Bool = false) {
+        let trimmed = AgentAssistedPairing.pairingPayloadCandidate(from: raw)
         guard !trimmed.isEmpty else { return }
         do {
             let params = try alleycat.parsePairPayload(json: trimmed)
+            connectAfterAgentLoad = connectAfterLoading
             parsedParams = params
             displayName = suggestedDisplayName(for: params)
             parseError = nil
@@ -391,11 +646,148 @@ struct AlleycatAddServerSheet: View {
             selectedAgentNames = []
             loadAgents(params: params)
         } catch {
+            connectAfterAgentLoad = false
             parsedParams = nil
             agents = []
             selectedAgentNames = []
             parseError = error.localizedDescription
         }
+    }
+
+    private func copyAgentSetupPrompt() {
+        cancelHermesPairing()
+        isPreparingAgentPrompt = true
+        parseError = nil
+
+        Task {
+            do {
+                let pairing = try await pairingBroker.createRequest(
+                    installationId: pairingInstallationId
+                )
+                await MainActor.run {
+                    hermesPairingRequest = pairing
+                    hermesPairingStatus = "Waiting for Hermes…"
+                    let prompt = AgentAssistedPairing.prompt(
+                        submitURL: pairing.submitURL
+                    )
+                    UIPasteboard.general.setItems(
+                        [[UTType.plainText.identifier: prompt]],
+                        options: [.expirationDate: pairing.expiresAt]
+                    )
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        copiedAgentPrompt = true
+                    }
+                    isPreparingAgentPrompt = false
+                    startPollingHermesPairing(pairing)
+                }
+            } catch {
+                await MainActor.run {
+                    isPreparingAgentPrompt = false
+                    copiedAgentPrompt = false
+                    hermesPairingStatus = "Create a secure request, then paste the prompt into Hermes."
+                    parseError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private var pairingInstallationId: String {
+        let key = "learnfold.pairingInstallationId"
+        if let existing = UserDefaults.standard.string(forKey: key) {
+            return existing
+        }
+        let generated = UUID().uuidString
+        UserDefaults.standard.set(generated, forKey: key)
+        return generated
+    }
+
+    private var hermesConfirmationMessage: String {
+        guard let host = hermesReadyHost else {
+            return "Hermes submitted a pairing request. Connect to this computer?"
+        }
+        let name = host.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let display = name?.isEmpty == false ? name! : shortNodeId(host.nodeId)
+        return "\(display) is ready to connect. The one-time credential will only be claimed after you tap Connect."
+    }
+
+    private func startPollingHermesPairing(_ pairing: HermesPairingRequest) {
+        hermesPollingTask?.cancel()
+        hermesPollingTask = Task {
+            while !Task.isCancelled {
+                if Date() >= pairing.expiresAt {
+                    await MainActor.run {
+                        clearHermesPairingState(
+                            status: "The request expired. Copy a new setup prompt to try again."
+                        )
+                    }
+                    return
+                }
+                do {
+                    let status = try await pairingBroker.status(for: pairing)
+                    if status.state == "ready", let host = status.host {
+                        await MainActor.run {
+                            hermesPairingStatus = "Hermes sent the pairing securely."
+                            hermesReadyHost = host
+                            showHermesConfirmation = true
+                        }
+                        return
+                    }
+                } catch {
+                    await MainActor.run {
+                        parseError = error.localizedDescription
+                        clearHermesPairingState(
+                            status: "Could not continue this request. Copy a new prompt to retry."
+                        )
+                    }
+                    return
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    private func claimHermesPairingAndConnect() {
+        guard let pairing = hermesPairingRequest else { return }
+        hermesPollingTask?.cancel()
+        hermesPairingStatus = "Claiming the one-time credential…"
+        Task {
+            do {
+                let payload = try await pairingBroker.claim(pairing)
+                await MainActor.run {
+                    hermesPairingRequest = nil
+                    hermesReadyHost = nil
+                    copiedAgentPrompt = false
+                    hermesPairingStatus = "Pairing received securely."
+                    handleScannedPayload(payload, connectAfterLoading: true)
+                }
+            } catch {
+                await MainActor.run {
+                    parseError = error.localizedDescription
+                    clearHermesPairingState(
+                        status: "The credential could not be claimed. Copy a new prompt to retry."
+                    )
+                }
+            }
+        }
+    }
+
+    private func cancelHermesPairing() {
+        hermesPollingTask?.cancel()
+        if let pairing = hermesPairingRequest {
+            Task { await pairingBroker.cancel(pairing) }
+        }
+        clearHermesPairingState(
+            status: "Create a secure request, then paste the prompt into Hermes."
+        )
+    }
+
+    private func clearHermesPairingState(status: String) {
+        hermesPairingRequest = nil
+        hermesReadyHost = nil
+        copiedAgentPrompt = false
+        isPreparingAgentPrompt = false
+        showHermesConfirmation = false
+        hermesPairingStatus = status
     }
 
     private func loadAgents(params: AppAlleycatPairPayload) {
@@ -413,6 +805,13 @@ struct AlleycatAddServerSheet: View {
                     )
                     isLoadingAgents = false
                     agentError = nil
+                    if connectAfterAgentLoad {
+                        connectAfterAgentLoad = false
+                        Task { @MainActor in
+                            await Task.yield()
+                            connect()
+                        }
+                    }
                 }
             } catch {
                 await MainActor.run {
@@ -421,6 +820,7 @@ struct AlleycatAddServerSheet: View {
                     selectedAgentNames = []
                     isLoadingAgents = false
                     agentError = error.localizedDescription
+                    connectAfterAgentLoad = false
                 }
             }
         }
@@ -539,7 +939,7 @@ private struct QRScannerScreen: View {
     let onCancel: () -> Void
     let onPermissionDenied: () -> Void
 
-    private static let pairCommand = "npx kittylitter"
+    private static let pairCommand = "npx learnfold-link"
 
     @State private var copied = false
 
@@ -593,7 +993,7 @@ private struct QRScannerScreen: View {
 
     private var instructionsCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Pair with kittylitter")
+            Text("Pair with Learnfold Link")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(.white)
 

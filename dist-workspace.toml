@@ -1,8 +1,7 @@
 [workspace]
-# The kittylitter wrapper crate at services/kittylitter re-exports the
-# alleycat daemon under a kittylitter-branded name. cargo-dist runs against
-# that workspace and produces kittylitter-* artifacts hosted on this repo's
-# GitHub Releases.
+# The wrapper crate remains in the legacy services/kittylitter directory for
+# migration compatibility, but cargo-dist publishes it as Learnfold Link and
+# produces learnfold-link-* artifacts hosted on this repo's GitHub Releases.
 members = ["cargo:services/kittylitter"]
 
 [dist]
@@ -19,16 +18,12 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 hosting = "github"
 install-updater = false
-# Code-sign macOS binaries with the Developer ID Application cert in
-# `dnakov/litter`'s repo secrets. Even though npm doesn't trigger Gatekeeper,
-# signing gives the binary a stable identity for TCC (Local Network) and
-# launchd. Required secrets (cargo-dist 0.31 names):
-#   CODESIGN_CERTIFICATE          base64 of MAC_DEVELOPER_ID_CERT_P12_B64
-#   CODESIGN_CERTIFICATE_PASSWORD same as MAC_DEVELOPER_ID_CERT_PASSWORD
-#   CODESIGN_IDENTITY             "Developer ID Application: <Name> (<TEAM>)"
-macos-sign = true
+# This fork does not yet have a Developer ID certificate in GitHub Actions.
+# Unsigned archives remain checksum-verified and are suitable for the npm
+# installer lane; enable signing when those release secrets are configured.
+macos-sign = false
 # Inject sccache (Cloudflare R2 backend, same key/secret as the mobile
-# lanes) into the build-local-artifacts job so kittylitter releases
+# lanes) into the build-local-artifacts job so Learnfold Link releases
 # don't recompile iroh/ring/reqwest from scratch on every bump. Path is
 # resolved relative to .github/workflows/, so `../` escapes to .github/
 # (we don't want this fragment under workflows/ because GitHub would

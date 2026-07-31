@@ -5,6 +5,7 @@ struct CourseExperienceRootView: View {
     @Environment(AppState.self) private var appState
     @Bindable var store: CourseExperienceStore
     var onOpenClassicLitter: () -> Void
+    var onConnectRemoteAgent: () -> Void
 
     var body: some View {
         Group {
@@ -19,7 +20,8 @@ struct CourseExperienceRootView: View {
                 NavigationStack(path: $store.navigationPath) {
                     CourseHomeView(
                         store: store,
-                        onOpenClassicLitter: onOpenClassicLitter
+                        onOpenClassicLitter: onOpenClassicLitter,
+                        onConnectRemoteAgent: onConnectRemoteAgent
                     )
                     .navigationDestination(for: CourseRoute.self) { route in
                         switch route {
@@ -79,7 +81,10 @@ struct CourseExperienceRootView: View {
                 }
                 .tint(.blue)
             } else {
-                CourseAgentSetupView(store: store)
+                CourseAgentSetupView(
+                    store: store,
+                    onConnectRemoteAgent: onConnectRemoteAgent
+                )
             }
         }
         .preferredColorScheme(.light)
@@ -96,13 +101,18 @@ struct CourseExperienceRootView: View {
 private struct CourseAgentSetupView: View {
     @Environment(AppModel.self) private var appModel
     @Bindable var store: CourseExperienceStore
+    let onConnectRemoteAgent: () -> Void
     @State private var selectedAgent: String
     @State private var selectedModelID = ""
     @State private var showsOpenAICompatibleSetup = false
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
 
-    init(store: CourseExperienceStore) {
+    init(
+        store: CourseExperienceStore,
+        onConnectRemoteAgent: @escaping () -> Void
+    ) {
         self.store = store
+        self.onConnectRemoteAgent = onConnectRemoteAgent
         _selectedAgent = State(initialValue: store.preferredSetupAgentID)
     }
 
@@ -150,6 +160,37 @@ private struct CourseAgentSetupView: View {
                             )
                         }
                     }
+
+                    Button(action: onConnectRemoteAgent) {
+                        HStack(spacing: 14) {
+                            Image(systemName: "server.rack")
+                                .font(.title3.weight(.semibold))
+                                .foregroundStyle(.indigo)
+                                .frame(width: 42, height: 42)
+                                .background(.indigo.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Connect Hermes on a server")
+                                    .font(.headline)
+                                    .foregroundStyle(.primary)
+                                Text("Pair with Learnfold Link, then continue in a private remote chat.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.leading)
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(16)
+                        .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(Color.black.opacity(0.07))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("course-agent-add-server")
 
                     if selectedAgent == "codex" {
                         Button {
@@ -250,6 +291,14 @@ private struct CourseAgentSetupView: View {
                 await store.prepareLocalAgentCatalog(appModel: appModel)
             }
         }
+        .onChange(of: store.selectedAgentID) { _, agentID in
+            guard let agentID,
+                  store.agentOptions.first(where: { $0.id == agentID })?.available == true else {
+                return
+            }
+            selectedAgent = agentID
+            selectedModelID = store.selectedModelID ?? ""
+        }
         .sheet(isPresented: $showsOpenAICompatibleSetup) {
             OpenAICompatibleProviderSheet(initialModelID: selectedModelID) { modelID in
                 selectedModelID = modelID
@@ -264,6 +313,7 @@ private struct CourseHomeView: View {
     @Environment(AppModel.self) private var appModel
     @Bindable var store: CourseExperienceStore
     var onOpenClassicLitter: () -> Void
+    var onConnectRemoteAgent: () -> Void
     @State private var showsCourseSettings = false
 
     private let columns = [
@@ -348,7 +398,11 @@ private struct CourseHomeView: View {
         }
         .navigationBarHidden(true)
         .sheet(isPresented: $showsCourseSettings) {
-            CourseAgentSettingsView(store: store, onOpenClassicLitter: onOpenClassicLitter)
+            CourseAgentSettingsView(
+                store: store,
+                onOpenClassicLitter: onOpenClassicLitter,
+                onConnectRemoteAgent: onConnectRemoteAgent
+            )
                 .environment(appModel)
         }
     }
@@ -389,6 +443,7 @@ private struct CourseAgentSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var store: CourseExperienceStore
     let onOpenClassicLitter: () -> Void
+    let onConnectRemoteAgent: () -> Void
     @State private var selectedAgent: String
     @State private var selectedModel: String
     @State private var selectedEffort: String
@@ -396,9 +451,14 @@ private struct CourseAgentSettingsView: View {
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
     @State private var cloudSyncAvailability: CourseCloudSyncAvailability = .missingEntitlement
 
-    init(store: CourseExperienceStore, onOpenClassicLitter: @escaping () -> Void) {
+    init(
+        store: CourseExperienceStore,
+        onOpenClassicLitter: @escaping () -> Void,
+        onConnectRemoteAgent: @escaping () -> Void
+    ) {
         self.store = store
         self.onOpenClassicLitter = onOpenClassicLitter
+        self.onConnectRemoteAgent = onConnectRemoteAgent
         _selectedAgent = State(initialValue: store.selectedAgentID ?? "codex")
         _selectedModel = State(initialValue: store.selectedModelID ?? "")
         _selectedEffort = State(initialValue: store.selectedReasoningEffortID ?? "")
@@ -562,6 +622,23 @@ private struct CourseAgentSettingsView: View {
                     Text("This changes the default for new courses. Existing Codex and Apple courses cannot cross provider families. An Apple course can switch between On‑Device and Private Cloud Compute from its chat.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Button {
+                        dismiss()
+                        Task { @MainActor in
+                            await Task.yield()
+                            onConnectRemoteAgent()
+                        }
+                    } label: {
+                        Label("Connect Hermes or another server", systemImage: "server.rack")
+                    }
+                    .accessibilityIdentifier("course-settings-add-server")
+                } header: {
+                    Text("Remote agents")
+                } footer: {
+                    Text("Pairs through Learnfold Link. Hermes can build and edit native course pages through Learnfold’s approval-gated tool bridge.")
                 }
 
                 Section("Learnfold") {

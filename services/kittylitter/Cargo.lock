@@ -67,7 +67,7 @@ dependencies = [
 [[package]]
 name = "alleycat"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-acp-bridge",
  "alleycat-amp-bridge",
@@ -110,7 +110,7 @@ dependencies = [
 [[package]]
 name = "alleycat-acp-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",
@@ -133,7 +133,7 @@ dependencies = [
 [[package]]
 name = "alleycat-amp-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-claude-bridge",
@@ -156,7 +156,7 @@ dependencies = [
 [[package]]
 name = "alleycat-bridge-core"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-codex-proto",
  "anyhow",
@@ -175,7 +175,7 @@ dependencies = [
 [[package]]
 name = "alleycat-claude-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",
@@ -199,7 +199,7 @@ dependencies = [
 [[package]]
 name = "alleycat-codex-proto"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "chrono",
  "serde",
@@ -210,7 +210,7 @@ dependencies = [
 [[package]]
 name = "alleycat-devin-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-acp-bridge",
  "alleycat-bridge-core",
@@ -225,7 +225,7 @@ dependencies = [
 [[package]]
 name = "alleycat-droid-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",
@@ -244,7 +244,7 @@ dependencies = [
 [[package]]
 name = "alleycat-grok-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-acp-bridge",
  "alleycat-bridge-core",
@@ -260,7 +260,7 @@ dependencies = [
 [[package]]
 name = "alleycat-hermes-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",
@@ -285,7 +285,7 @@ dependencies = [
 [[package]]
 name = "alleycat-opencode-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-bridge-core",
  "anyhow",
@@ -309,7 +309,7 @@ dependencies = [
 [[package]]
 name = "alleycat-pi-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",
@@ -333,7 +333,7 @@ dependencies = [
 [[package]]
 name = "alleycat-shell-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/Schreezer/alleycat.git?rev=a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f#a24798bf9a5c5caf9c86d8f91b2a9380316a2e3f"
 dependencies = [
  "alleycat-bridge-core",
  "anyhow",
@@ -2299,18 +2299,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "kittylitter"
-version = "0.3.4"
-dependencies = [
- "alleycat",
- "anyhow",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "learnfold-link"
+version = "0.3.9"
+dependencies = [
+ "alleycat",
+ "anyhow",
+ "libc",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde_json",
+ "url",
+]
 
 [[package]]
 name = "leb128fmt"
@@ -3364,6 +3369,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
