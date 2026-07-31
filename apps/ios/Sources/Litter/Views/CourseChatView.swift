@@ -3,11 +3,36 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum CourseChatTimelinePolicy {
+    private enum Speaker: Hashable {
+        case learner
+        case agent
+    }
+
+    private struct MessageSignature: Hashable {
+        let speaker: Speaker
+        let text: String
+    }
+
     static func localMessages(
         _ messages: [CourseChatMessage],
-        hasLiveThread: Bool
+        representedBy liveItems: [ConversationItem]
     ) -> [CourseChatMessage] {
-        hasLiveThread ? [] : messages
+        var liveCounts = liveItems.reduce(into: [MessageSignature: Int]()) { counts, item in
+            guard let signature = signature(for: item) else { return }
+            counts[signature, default: 0] += 1
+        }
+
+        return messages.filter { message in
+            let signature = MessageSignature(
+                speaker: message.role == .learner ? .learner : .agent,
+                text: normalized(message.text)
+            )
+            guard let count = liveCounts[signature], count > 0 else {
+                return true
+            }
+            liveCounts[signature] = count - 1
+            return false
+        }
     }
 
     static func projectLiveItems(
@@ -21,6 +46,21 @@ enum CourseChatTimelinePolicy {
 
     static func isAgentWorking(requestPending: Bool, threadHasActiveTurn: Bool) -> Bool {
         requestPending || threadHasActiveTurn
+    }
+
+    private static func signature(for item: ConversationItem) -> MessageSignature? {
+        switch item.content {
+        case .user(let data):
+            return MessageSignature(speaker: .learner, text: normalized(data.text))
+        case .assistant(let data):
+            return MessageSignature(speaker: .agent, text: normalized(data.text))
+        default:
+            return nil
+        }
+    }
+
+    private static func normalized(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func projectLiveItem(
@@ -245,7 +285,7 @@ struct CourseChatView: View {
     private var localMessages: [CourseChatMessage] {
         CourseChatTimelinePolicy.localMessages(
             store.localMessages(for: selectionDiscussionID),
-            hasLiveThread: !liveConversationItems.isEmpty
+            representedBy: liveConversationItems
         )
     }
 

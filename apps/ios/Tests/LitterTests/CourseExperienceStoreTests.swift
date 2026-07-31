@@ -1204,21 +1204,45 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
     }
 
-    func testCourseChatUsesLiveThreadInsteadOfDuplicatingLocalTranscript() {
-        let learner = CourseChatMessage(role: .learner, text: "Swift concurrency")
-        let completedPreview = CourseChatMessage(role: .agent, text: "Let’s start with tasks.")
+    func testCourseChatRemovesOnlyLocalMessagesRepresentedByLiveThread() {
+        let olderLearner = CourseChatMessage(role: .learner, text: "Start with actors.")
+        let olderAgent = CourseChatMessage(role: .agent, text: "Actors protect isolated state.")
+        let currentLearner = CourseChatMessage(role: .learner, text: "Why does await yield?")
+        let currentAgent = CourseChatMessage(role: .agent, text: "It lets other work run.")
+        let liveItems = [
+            ConversationItem(
+                id: "live-user",
+                content: .user(
+                    ConversationUserMessageData(text: currentLearner.text, images: [])
+                )
+            ),
+            ConversationItem(
+                id: "live-assistant",
+                content: .assistant(
+                    ConversationAssistantMessageData(
+                        text: currentAgent.text,
+                        agentNickname: nil,
+                        agentRole: nil,
+                        phase: nil
+                    )
+                )
+            ),
+        ]
 
         let beforeThread = CourseChatTimelinePolicy.localMessages(
-            [learner],
-            hasLiveThread: false
+            [olderLearner, olderAgent, currentLearner, currentAgent],
+            representedBy: []
         )
         let afterThread = CourseChatTimelinePolicy.localMessages(
-            [learner, completedPreview],
-            hasLiveThread: true
+            [olderLearner, olderAgent, currentLearner, currentAgent],
+            representedBy: liveItems
         )
 
-        XCTAssertEqual(beforeThread.map(\.id), [learner.id])
-        XCTAssertTrue(afterThread.isEmpty)
+        XCTAssertEqual(
+            beforeThread.map(\.id),
+            [olderLearner.id, olderAgent.id, currentLearner.id, currentAgent.id]
+        )
+        XCTAssertEqual(afterThread.map(\.id), [olderLearner.id, olderAgent.id])
     }
 
     func testCourseChatKeepsOptimisticMessageUntilLiveItemsAreVisible() {
@@ -1227,7 +1251,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertEqual(
             CourseChatTimelinePolicy.localMessages(
                 [learner],
-                hasLiveThread: false
+                representedBy: []
             ).map(\.id),
             [learner.id]
         )
@@ -1415,7 +1439,9 @@ final class CourseExperienceStoreTests: XCTestCase {
 
     func testCourseChatRejectsLegacySyntheticThreadIDs() {
         XCTAssertFalse(CourseExperienceStore.isValidAppServerThreadID("selection-qa-thread"))
+        XCTAssertFalse(CourseExperienceStore.isValidAppServerThreadID("thread_not-hex"))
         XCTAssertFalse(CourseExperienceStore.isValidAppServerThreadID(""))
+        XCTAssertTrue(CourseExperienceStore.isValidAppServerThreadID("thread_0123456789abcdef01234567"))
         XCTAssertTrue(CourseExperienceStore.isValidAppServerThreadID("019f7e41-81cf-7f22-b5a7-3c00009cec20"))
         XCTAssertTrue(CourseExperienceStore.isValidAppServerThreadID("urn:uuid:019f7e41-81cf-7f22-b5a7-3c00009cec20"))
     }

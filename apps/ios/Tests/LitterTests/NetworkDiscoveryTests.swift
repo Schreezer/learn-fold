@@ -125,7 +125,7 @@ final class AgentAssistedPairingTests: XCTestCase {
         let prompt = AgentAssistedPairing.prompt(submitURL: submitURL)
 
         XCTAssertTrue(prompt.contains("Run exactly this one terminal command"))
-        XCTAssertTrue(prompt.contains("npx -y learnfold-link@0.3.6 handoff"))
+        XCTAssertTrue(prompt.contains("npx -y learnfold-link@0.3.8 handoff"))
         XCTAssertTrue(prompt.contains(submitURL.absoluteString))
         XCTAssertFalse(prompt.contains("HTTP POST"))
         XCTAssertFalse(prompt.contains("capture the first"))
@@ -160,9 +160,9 @@ final class AgentAssistedPairingTests: XCTestCase {
         let prompt = AgentAssistedPairing.disablePrompt(computerName: "Aeon Server")
 
         XCTAssertTrue(prompt.contains("Aeon Server"))
-        XCTAssertTrue(prompt.contains("learnfold-link@0.3.6 rotate"))
-        XCTAssertTrue(prompt.contains("learnfold-link@0.3.6 uninstall"))
-        XCTAssertTrue(prompt.contains("learnfold-link@0.3.6 stop"))
+        XCTAssertTrue(prompt.contains("learnfold-link@0.3.8 rotate"))
+        XCTAssertTrue(prompt.contains("learnfold-link@0.3.8 uninstall"))
+        XCTAssertTrue(prompt.contains("learnfold-link@0.3.8 stop"))
         XCTAssertTrue(prompt.contains("keeping Hermes itself running"))
         XCTAssertTrue(prompt.contains("Do not delete Hermes"))
         XCTAssertTrue(prompt.contains("Do not ask me to run any commands"))

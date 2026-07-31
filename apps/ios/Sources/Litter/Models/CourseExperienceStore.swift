@@ -1302,6 +1302,10 @@ final class CourseExperienceStore {
 
     static func isValidAppServerThreadID(_ value: String) -> Bool {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("thread_") {
+            let suffix = trimmed.dropFirst("thread_".count)
+            return suffix.count >= 16 && suffix.allSatisfy(\.isHexDigit)
+        }
         let prefix = "urn:uuid:"
         let uuidText = trimmed.lowercased().hasPrefix(prefix)
             ? String(trimmed.dropFirst(prefix.count))
@@ -1442,8 +1446,7 @@ final class CourseExperienceStore {
         currentAppleSessionID = course.appleSessionID
         if let serverID = course.agentServerID,
            let threadID = course.agentThreadID,
-           Self.isValidAppServerThreadID(threadID),
-           activatedCourseThreadIDs.contains(threadID) {
+           Self.isValidAppServerThreadID(threadID) {
             agentThreadKey = ThreadKey(serverId: serverID, threadId: threadID)
         }
         // A course can recover from a missing or legacy thread by starting a
@@ -2087,7 +2090,6 @@ final class CourseExperienceStore {
                 existingThreadKey = agentThreadKey.flatMap { key in
                     key.serverId == serverID
                         && Self.isValidAppServerThreadID(key.threadId)
-                        && activatedCourseThreadIDs.contains(key.threadId)
                         ? key
                         : nil
                 }
