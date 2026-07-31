@@ -20,7 +20,7 @@ enum AgentAssistedPairing {
 
     Run exactly this one terminal command now. Do not inspect the environment or run \
     preflight commands first:
-    `npx -y learnfold-link@0.3.8 handoff "\(submitURL.absoluteString)"`
+    `npx -y learnfold-link@0.3.9 handoff "\(submitURL.absoluteString)"`
 
     If it exits successfully, reply only "Connected". Otherwise reply only "Setup failed". \
     Do not display a token or pairing JSON, and do not ask me to run a command.
@@ -46,10 +46,10 @@ enum AgentAssistedPairing {
     Securely disable Learnfold connectivity on \(computerName), while keeping Hermes itself running.
 
     Perform the shutdown yourself in your own terminal:
-    1. Run `npx -y learnfold-link@0.3.8 rotate` to invalidate every existing Learnfold pairing.
-    2. Run `npx -y learnfold-link@0.3.8 uninstall` to disable autostart and stop the managed service.
+    1. Run `npx -y learnfold-link@0.3.9 rotate` to invalidate every existing Learnfold pairing.
+    2. Run `npx -y learnfold-link@0.3.9 uninstall` to disable autostart and stop the managed service.
     3. If a Learnfold Link or Alleycat daemon is still running, run \
-    `npx -y learnfold-link@0.3.8 stop`.
+    `npx -y learnfold-link@0.3.9 stop`.
     4. Verify that autostart is disabled and no Learnfold Link or Alleycat daemon remains running.
 
     Do not display the new token. Do not delete Hermes, projects, configuration, or logs. \
