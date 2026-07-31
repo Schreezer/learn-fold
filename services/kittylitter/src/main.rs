@@ -50,16 +50,7 @@ fn run_handoff(args: &[String]) -> anyhow::Result<()> {
     // user-level autostart when possible, starts/upgrades the daemon, and
     // prints a fresh pairing payload. Capture that payload so the model never
     // has to inspect or relay the credential itself.
-    let output = managed_service_command(&executable, &hermes.home)
-        .output()
-        .context("set up the local Learnfold Link service")?;
-    if !output.status.success() {
-        bail!("Learnfold Link could not create a pairing credential");
-    }
-
-    let stdout =
-        String::from_utf8(output.stdout).context("read Learnfold Link pairing response")?;
-    let payload = pairing_payload_from_output(&stdout)?;
+    let payload = managed_pairing_payload(&executable, &hermes.home)?;
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -85,6 +76,10 @@ struct HermesGateway {
 }
 
 fn prepare_hermes_gateway() -> anyhow::Result<HermesGateway> {
+    if let Some(gateway) = running_hermes_gateway() {
+        return Ok(gateway);
+    }
+
     let home = selected_hermes_home().context("locate the active Hermes profile")?;
     fs::create_dir_all(&home)
         .with_context(|| format!("create Hermes profile directory {}", home.display()))?;
@@ -121,6 +116,14 @@ fn prepare_hermes_gateway() -> anyhow::Result<HermesGateway> {
     Ok(HermesGateway { home })
 }
 
+fn running_hermes_gateway() -> Option<HermesGateway> {
+    hermes_home_candidates().into_iter().find_map(|home| {
+        let existing = fs::read_to_string(home.join(".env")).ok()?;
+        let api_key = dotenv_value(&existing, "API_SERVER_KEY")?;
+        authenticated_gateway_ready(&api_key).then_some(HermesGateway { home })
+    })
+}
+
 fn authenticated_gateway_ready(api_key: &str) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -136,11 +139,15 @@ fn authenticated_gateway_ready(api_key: &str) -> bool {
 }
 
 fn selected_hermes_home() -> Option<PathBuf> {
+    hermes_home_candidates().into_iter().next()
+}
+
+fn hermes_home_candidates() -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("HERMES_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
     {
-        return Some(home);
+        return vec![home];
     }
 
     if let Some(shell_home) = std::env::var_os("HOME").map(PathBuf::from)
@@ -148,20 +155,39 @@ fn selected_hermes_home() -> Option<PathBuf> {
         && let Some(profile_home) = shell_home.parent()
         && profile_home.join("profile.yaml").is_file()
     {
-        return Some(profile_home.to_path_buf());
+        return vec![profile_home.to_path_buf()];
     }
 
-    let root = os_account_home()?.join(".hermes");
+    let Some(root) = os_account_home().map(|home| home.join(".hermes")) else {
+        return Vec::new();
+    };
+    hermes_home_candidates_from_root(&root)
+}
+
+fn hermes_home_candidates_from_root(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
     if let Ok(profile) = fs::read_to_string(root.join("active_profile")) {
         let profile = profile.trim();
         if !profile.is_empty() && profile != "default" {
             let profile_home = root.join("profiles").join(profile);
             if profile_home.is_dir() {
-                return Some(profile_home);
+                candidates.push(profile_home);
             }
         }
     }
-    Some(root)
+    candidates.push(root.to_path_buf());
+
+    if let Ok(entries) = fs::read_dir(root.join("profiles")) {
+        let mut profiles = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        profiles.sort();
+        candidates.extend(profiles);
+    }
+    candidates.dedup();
+    candidates
 }
 
 fn updated_hermes_env(existing: &str, generated_key: &str) -> (String, String) {
@@ -274,6 +300,27 @@ fn managed_service_command(executable: &Path, hermes_home: &Path) -> Command {
     }
 
     command
+}
+
+fn managed_pairing_payload(
+    executable: &Path,
+    hermes_home: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    for attempt in 0..2 {
+        let output = managed_service_command(executable, hermes_home)
+            .output()
+            .context("set up the local Learnfold Link service")?;
+        if output.status.success()
+            && let Ok(stdout) = String::from_utf8(output.stdout)
+            && let Ok(payload) = pairing_payload_from_output(&stdout)
+        {
+            return Ok(payload);
+        }
+        if attempt == 0 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    bail!("Learnfold Link could not create a pairing credential")
 }
 
 #[cfg(unix)]
@@ -391,6 +438,21 @@ mod tests {
         assert!(updated.contains("API_SERVER_KEY=existing-secret\n"));
         assert!(updated.contains("API_SERVER_HOST=127.0.0.1\n"));
         assert!(updated.contains("API_SERVER_PORT=8642\n"));
+    }
+
+    #[test]
+    fn hermes_candidates_include_running_profiles_without_an_active_marker() {
+        let root =
+            std::env::temp_dir().join(format!("learnfold-hermes-candidates-{}", random_api_key()));
+        let alpha = root.join("profiles/alpha");
+        let zeta = root.join("profiles/zeta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&zeta).unwrap();
+
+        let candidates = hermes_home_candidates_from_root(&root);
+        assert_eq!(candidates, vec![root.clone(), alpha, zeta]);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
