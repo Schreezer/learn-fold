@@ -227,7 +227,17 @@ if [[ "$TESTFLIGHT_SKIP_BUILD" != "1" ]]; then
             WATCH_COMP_CODE_SIGN_IDENTITY="$WATCH_COMP_CODE_SIGN_IDENTITY"
         )
     else
-        archive_cmd+=(-allowProvisioningUpdates)
+        # Automatic App Store export re-signs the archive for distribution.
+        # Keep the archive itself development-signed so its requested
+        # entitlements (including CloudKit containers) are preserved for the
+        # exporter when it selects or creates the Store provisioning profile.
+        archive_cmd+=(
+            -allowProvisioningUpdates
+            APP_CODE_SIGN_IDENTITY="Apple Development"
+            LIVE_ACTIVITY_CODE_SIGN_IDENTITY="Apple Development"
+            WATCH_CODE_SIGN_IDENTITY="Apple Development"
+            WATCH_COMP_CODE_SIGN_IDENTITY="Apple Development"
+        )
     fi
 
     if [[ "$EXPORT_SIGNING_STYLE" == "automatic" && "${#auth_args[@]}" -gt 0 ]]; then
@@ -345,7 +355,7 @@ fi
 
 if [[ -n "$build_id" && "$AUTO_ASSIGN_ENCRYPTION_DECLARATION" == "1" ]]; then
     internal_state="$(
-        asc builds build-beta-detail view --build-id "$build_id" --output json |
+        asc builds build-beta-detail get --build "$build_id" --output json |
             jq -r '.data.attributes.internalBuildState // empty'
     )"
     if [[ "$internal_state" == "MISSING_EXPORT_COMPLIANCE" ]]; then
@@ -367,12 +377,12 @@ if [[ -n "$build_id" && -n "$WHAT_TO_TEST" ]]; then
     echo "==> Ensuring What to Test notes are set for $WHAT_TO_TEST_LOCALE"
     # Try update first (works if localization already exists), fall back to create.
     if ! asc builds test-notes update \
-            --build-id "$build_id" \
+            --build "$build_id" \
             --locale "$WHAT_TO_TEST_LOCALE" \
             --whats-new "$WHAT_TO_TEST" \
             --output json >/dev/null 2>&1; then
         asc builds test-notes create \
-            --build-id "$build_id" \
+            --build "$build_id" \
             --locale "$WHAT_TO_TEST_LOCALE" \
             --whats-new "$WHAT_TO_TEST" \
             --output json >/dev/null
@@ -425,7 +435,7 @@ if [[ "$ASSIGN_BETA_GROUP" == "1" && -n "$build_id" ]]; then
         deadline="$(( $(date +%s) + BUILD_POLL_TIMEOUT_SECONDS ))"
         assigned=0
         while [[ "$(date +%s)" -lt "$deadline" ]]; do
-            if asc builds add-groups --build-id "$build_id" --group "$group_csv" --output json >/dev/null 2>&1; then
+            if asc builds add-groups --build "$build_id" --group "$group_csv" --output json >/dev/null 2>&1; then
                 assigned=1
                 break
             fi
@@ -438,7 +448,7 @@ if [[ "$ASSIGN_BETA_GROUP" == "1" && -n "$build_id" ]]; then
 
         if [[ "$SUBMIT_BETA_REVIEW" == "1" && "$external_group_requested" -eq 1 ]]; then
             echo "==> Submitting build $build_id for Beta App Review"
-            asc testflight review submit --build-id "$build_id" --confirm --output json >/dev/null
+            asc testflight review submit --build "$build_id" --confirm --output json >/dev/null
         fi
     fi
 fi
