@@ -142,4 +142,101 @@ final class CourseCloudSyncModelsTests: XCTestCase {
         XCTAssertFalse(first.contains("private-workspace"))
         XCTAssertFalse(first.contains("private-page"))
     }
+
+    func testCourseHeadRecordNameIsStableAcrossGenerations() {
+        let first = CourseSyncRecordName.course(workspaceID: "private-workspace")
+        let second = CourseSyncRecordName.course(workspaceID: "private-workspace")
+
+        XCTAssertEqual(first, second)
+        XCTAssertFalse(first.contains("private-workspace"))
+    }
+
+    func testHeadResolverIgnoresHistoricalDeliveryAfterNewerHead() {
+        let accepted = makeHead(
+            generationID: "generation-2",
+            checksum: "checksum-2",
+            counters: ["iphone": 2]
+        )
+        let historical = makeHead(
+            generationID: "generation-1",
+            checksum: "checksum-1",
+            counters: ["iphone": 1]
+        )
+
+        XCTAssertEqual(
+            CourseCloudHeadResolver.resolve(accepted: accepted, incoming: historical),
+            .ignoreHistorical
+        )
+    }
+
+    func testHeadResolverAcceptsNewerDeliveryAfterOlderHead() {
+        let accepted = makeHead(
+            generationID: "generation-1",
+            checksum: "checksum-1",
+            counters: ["iphone": 1]
+        )
+        let newer = makeHead(
+            generationID: "generation-2",
+            checksum: "checksum-2",
+            counters: ["iphone": 2]
+        )
+
+        XCTAssertEqual(
+            CourseCloudHeadResolver.resolve(accepted: accepted, incoming: newer),
+            .accept
+        )
+    }
+
+    func testHeadResolverMergesConcurrentDeliveries() {
+        let accepted = makeHead(
+            generationID: "generation-iphone",
+            checksum: "checksum-iphone",
+            counters: ["iphone": 1]
+        )
+        let concurrent = makeHead(
+            generationID: "generation-ipad",
+            checksum: "checksum-ipad",
+            counters: ["ipad": 1]
+        )
+
+        XCTAssertEqual(
+            CourseCloudHeadResolver.resolve(accepted: accepted, incoming: concurrent),
+            .mergeConcurrent
+        )
+    }
+
+    func testHeadResolverRejectsDifferentContentAtEqualVersion() {
+        let accepted = makeHead(
+            generationID: "generation-1",
+            checksum: "checksum-1",
+            counters: ["iphone": 1]
+        )
+        let invalid = makeHead(
+            generationID: "generation-2",
+            checksum: "checksum-2",
+            counters: ["iphone": 1]
+        )
+
+        XCTAssertEqual(
+            CourseCloudHeadResolver.resolve(accepted: accepted, incoming: invalid),
+            .invalidEqualVersion
+        )
+    }
+
+    private func makeHead(
+        generationID: String,
+        checksum: String,
+        counters: [String: UInt64]
+    ) -> CourseCloudHead {
+        CourseCloudHead(
+            workspaceID: "workspace",
+            generationID: generationID,
+            generationRecordName: "generation-\(generationID)",
+            commitRecordName: "commit-\(generationID)",
+            checksum: checksum,
+            title: "Course",
+            previousGenerationID: nil,
+            version: CourseSyncVersionVector(counters: counters)
+        )
+    }
 }

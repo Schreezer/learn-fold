@@ -488,6 +488,7 @@
 		AD8DBF675D14EB7F11D17A67 /* SubagentCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8BA1DF8D1BBF028ACFBA7E0 /* SubagentCardView.swift */; };
 		AE8951752569EA6BF8D35E9C /* WatchHapticDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAC3382D3C771B358C1E3CE6 /* WatchHapticDetector.swift */; };
 		AEA64EDA7E749AD2AEDD2359 /* pierre-dark.json in Resources */ = {isa = PBXBuildFile; fileRef = 370F75B42793F9B35D8F4990 /* pierre-dark.json */; };
+		AEAD62BF47E3AE8D89D62068 /* CloudKVSBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AF97EDF41862C065C1B2DD5 /* CloudKVSBridgeTests.swift */; };
 		AEE8509D25C57322EF1A0860 /* solarized-dark.json in Resources */ = {isa = PBXBuildFile; fileRef = 45F4850CDE17E426ECBF4EA5 /* solarized-dark.json */; };
 		AF137CE1A948A9DB6ED381E4 /* DebugSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A485EF4E929239E297A46F5 /* DebugSettings.swift */; };
 		AF1B6BCE059B590F83746824 /* LearnfoldIntroView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D79512A25F0B0A1B4EE1883B /* LearnfoldIntroView.swift */; };
@@ -1038,6 +1039,7 @@
 		9A59EFF7219CFC315A13C34D /* dark-plus-B1yOZ-Hy.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "dark-plus-B1yOZ-Hy.json"; sourceTree = "<group>"; };
 		9AB673AF3C45AA3144F784F4 /* laserwave.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = laserwave.json; sourceTree = "<group>"; };
 		9AF7E00FF3D6A3D37B161855 /* gruvbox-light-hard.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "gruvbox-light-hard.json"; sourceTree = "<group>"; };
+		9AF97EDF41862C065C1B2DD5 /* CloudKVSBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKVSBridgeTests.swift; sourceTree = "<group>"; };
 		9B858CE89BDC1E0974263B28 /* rose-pine-dawn.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "rose-pine-dawn.json"; sourceTree = "<group>"; };
 		9CD31922D3510DA506B0EC85 /* ThemeDefinition.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeDefinition.swift; sourceTree = "<group>"; };
 		9D216CEBFB1B4B71CFC2C0F8 /* AppearanceSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceSettingsView.swift; sourceTree = "<group>"; };
@@ -1319,6 +1321,7 @@
 				49496FAE8491262D2C8CC657 /* AppSnapshotRuntimeTests.swift */,
 				F3474B8EA8D3148C94A7583F /* AppStatePermissionTests.swift */,
 				33402D8F29D5CAA2DD07ED9F /* ChatGPTOAuthTests.swift */,
+				9AF97EDF41862C065C1B2DD5 /* CloudKVSBridgeTests.swift */,
 				EA290B3661144BE9A8C11E20 /* ContinuedTurnBackgroundControllerTests.swift */,
 				347FEEBE4E54174740D93E9D /* ConversationAttachmentSupportTests.swift */,
 				77969543FA36FEA8B621A3B9 /* ConversationDisplayPreferenceTests.swift */,
@@ -2074,6 +2077,9 @@
 							com.apple.BackgroundModes = {
 								enabled = YES;
 							};
+							com.apple.iCloud = {
+								enabled = YES;
+							};
 						};
 					};
 					C0C98C6012493B73CDD5AD6E = {
@@ -2402,6 +2408,7 @@
 				D24451D266FD2443C0D7CBC4 /* AppSnapshotRuntimeTests.swift in Sources */,
 				620FC2343DCFADD1034E9CCB /* AppStatePermissionTests.swift in Sources */,
 				46C5F0B53F9EF54FE8F311A4 /* ChatGPTOAuthTests.swift in Sources */,
+				AEAD62BF47E3AE8D89D62068 /* CloudKVSBridgeTests.swift in Sources */,
 				8E7732572423E53C39053820 /* ContinuedTurnBackgroundControllerTests.swift in Sources */,
 				46B24CBC2FD5FD3799BE207D /* ConversationAttachmentSupportTests.swift in Sources */,
 				2F28DA245F84E87318A4D7E4 /* ConversationDisplayPreferenceTests.swift in Sources */,

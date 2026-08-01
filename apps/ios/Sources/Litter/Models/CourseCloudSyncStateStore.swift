@@ -39,6 +39,17 @@ enum CourseCloudCourseProvenance: String, Codable, Sendable {
     case copiedFromAccount
 }
 
+struct CourseCloudCourseProvenanceRecord: Equatable, Sendable {
+    let provenance: CourseCloudCourseProvenance
+    let accountID: String?
+    let copiedFromAccountID: String?
+}
+
+struct CourseCloudStoredHead: Equatable, Sendable {
+    let head: CourseCloudHead
+    let systemFields: Data
+}
+
 struct CourseCloudAccountChange: Codable, Equatable, Sendable {
     let previousAccountID: String?
     let currentAccountID: String?
@@ -243,11 +254,14 @@ actor CourseCloudSyncStateStore {
         var result: [CourseCloudOutboxEntry] = []
         try query(
             """
-            SELECT id, workspace_id, zone_name, record_name, change_kind,
-                   payload, mutation_version, created_at
+            SELECT outbox.id, outbox.workspace_id, outbox.zone_name,
+                   outbox.record_name, outbox.change_kind, outbox.payload,
+                   outbox.mutation_version, outbox.created_at
             FROM outbox
-            WHERE account_id = ? AND sent_at IS NULL
-            ORDER BY created_at, id
+            JOIN account_partitions USING (account_id)
+            WHERE outbox.account_id = ? AND outbox.sent_at IS NULL
+              AND account_partitions.sealed_at IS NULL
+            ORDER BY outbox.created_at, outbox.id
             LIMIT ?
             """,
             bindings: [.text(accountID), .integer(Int64(max(1, limit)))]
@@ -281,6 +295,75 @@ actor CourseCloudSyncStateStore {
             )
         }
         return result
+    }
+
+    func outboxEntry(
+        accountID: String,
+        recordName: String
+    ) throws -> CourseCloudOutboxEntry? {
+        var result: CourseCloudOutboxEntry?
+        try query(
+            """
+            SELECT id, workspace_id, zone_name, record_name, change_kind,
+                   payload, mutation_version, created_at
+            FROM outbox
+            WHERE account_id = ? AND record_name = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            bindings: [.text(accountID), .text(recordName)]
+        ) { statement in
+            guard let id = Self.text(statement, column: 0),
+                  let workspaceID = Self.text(statement, column: 1),
+                  let zoneName = Self.text(statement, column: 2),
+                  let resolvedRecordName = Self.text(statement, column: 3),
+                  let kindRaw = Self.text(statement, column: 4),
+                  let kind = CourseCloudChangeKind(rawValue: kindRaw) else {
+                throw CourseCloudSyncStateError.corruptRow("outbox")
+            }
+            let version = try Self.data(statement, column: 6).map {
+                try JSONDecoder().decode(CourseSyncMutationVersion.self, from: $0)
+            }
+            result = CourseCloudOutboxEntry(
+                id: id,
+                accountID: accountID,
+                workspaceID: workspaceID,
+                zoneName: zoneName,
+                recordName: resolvedRecordName,
+                changeKind: kind,
+                payload: Self.data(statement, column: 5),
+                mutationVersion: version,
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
+            )
+        }
+        return result
+    }
+
+    func supersedePendingHead(
+        accountID: String,
+        workspaceID: String,
+        recordName: String
+    ) throws {
+        try run(
+            """
+            UPDATE outbox SET sent_at = ?
+            WHERE account_id = ? AND workspace_id = ? AND record_name = ?
+              AND sent_at IS NULL
+            """,
+            bindings: [
+                .double(Date.now.timeIntervalSince1970),
+                .text(accountID),
+                .text(workspaceID),
+                .text(recordName),
+            ]
+        )
+    }
+
+    func replaceOutboxPayload(entryID: String, payload: Data) throws {
+        try run(
+            "UPDATE outbox SET payload = ? WHERE id = ? AND sent_at IS NULL",
+            bindings: [.blob(payload), .text(entryID)]
+        )
     }
 
     func markOutboxSent(accountID: String, entryIDs: [String]) throws {
@@ -336,6 +419,20 @@ actor CourseCloudSyncStateStore {
                     .blob(changeData),
                     .text(accountID),
                 ]
+            )
+        }
+    }
+
+    func activateAccount(_ accountID: String) throws {
+        try transaction {
+            try ensureAccountPartition(accountID)
+            try run(
+                """
+                UPDATE account_partitions
+                SET sealed_at = NULL, account_change = NULL
+                WHERE account_id = ?
+                """,
+                bindings: [.text(accountID)]
             )
         }
     }
@@ -411,6 +508,224 @@ actor CourseCloudSyncStateStore {
                 .double(Date.now.timeIntervalSince1970),
             ]
         )
+    }
+
+    func courseProvenance(
+        workspaceID: String
+    ) throws -> CourseCloudCourseProvenanceRecord? {
+        try queryOne(
+            """
+            SELECT provenance, account_id, copied_from_account_id
+            FROM course_provenance
+            WHERE workspace_id = ?
+            """,
+            bindings: [.text(workspaceID)]
+        ) { statement in
+            guard let rawValue = Self.text(statement, column: 0),
+                  let provenance = CourseCloudCourseProvenance(rawValue: rawValue) else {
+                throw CourseCloudSyncStateError.corruptRow("course_provenance")
+            }
+            return CourseCloudCourseProvenanceRecord(
+                provenance: provenance,
+                accountID: Self.text(statement, column: 1),
+                copiedFromAccountID: Self.text(statement, column: 2)
+            )
+        }
+    }
+
+    func cloudHead(
+        accountID: String,
+        workspaceID: String
+    ) throws -> CourseCloudStoredHead? {
+        try queryOne(
+            """
+            SELECT head_blob, system_fields
+            FROM cloud_heads
+            WHERE account_id = ? AND workspace_id = ?
+            """,
+            bindings: [.text(accountID), .text(workspaceID)]
+        ) { statement in
+            guard let headData = Self.data(statement, column: 0),
+                  let systemFields = Self.data(statement, column: 1) else {
+                throw CourseCloudSyncStateError.corruptRow("cloud_heads")
+            }
+            return CourseCloudStoredHead(
+                head: try JSONDecoder().decode(CourseCloudHead.self, from: headData),
+                systemFields: systemFields
+            )
+        }
+    }
+
+    func setCloudHead(
+        accountID: String,
+        head: CourseCloudHead,
+        systemFields: Data
+    ) throws {
+        let encoded = try JSONEncoder().encode(head)
+        try transaction {
+            try ensureAccountPartition(accountID)
+            try run(
+                """
+                INSERT INTO cloud_heads (
+                  account_id, workspace_id, head_blob, system_fields, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, workspace_id) DO UPDATE SET
+                  head_blob=excluded.head_blob,
+                  system_fields=excluded.system_fields,
+                  updated_at=excluded.updated_at
+                """,
+                bindings: [
+                    .text(accountID),
+                    .text(head.workspaceID),
+                    .blob(encoded),
+                    .blob(systemFields),
+                    .double(Date.now.timeIntervalSince1970),
+                ]
+            )
+        }
+    }
+
+    func acceptSavedHead(
+        accountID: String,
+        entryID: String,
+        head: CourseCloudHead,
+        systemFields: Data,
+        snapshot: Data
+    ) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let headData = try encoder.encode(head)
+        try transaction {
+            try ensureAccountPartition(accountID)
+            try run(
+                """
+                UPDATE outbox SET sent_at = ?
+                WHERE account_id = ? AND id = ? AND sent_at IS NULL
+                """,
+                bindings: [
+                    .double(Date.now.timeIntervalSince1970),
+                    .text(accountID),
+                    .text(entryID),
+                ]
+            )
+            guard sqlite3_changes(database) == 1 else {
+                throw CourseCloudSyncStateError.accountScopeMismatch
+            }
+            try run(
+                """
+                INSERT INTO cloud_heads (
+                  account_id, workspace_id, head_blob, system_fields, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, workspace_id) DO UPDATE SET
+                  head_blob=excluded.head_blob,
+                  system_fields=excluded.system_fields,
+                  updated_at=excluded.updated_at
+                """,
+                bindings: [
+                    .text(accountID),
+                    .text(head.workspaceID),
+                    .blob(headData),
+                    .blob(systemFields),
+                    .double(Date.now.timeIntervalSince1970),
+                ]
+            )
+            try run(
+                """
+                INSERT INTO cloud_bases (
+                  account_id, workspace_id, checksum, snapshot_blob, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, workspace_id) DO UPDATE SET
+                  checksum=excluded.checksum,
+                  snapshot_blob=excluded.snapshot_blob,
+                  updated_at=excluded.updated_at
+                """,
+                bindings: [
+                    .text(accountID),
+                    .text(head.workspaceID),
+                    .text(head.checksum),
+                    .blob(snapshot),
+                    .double(Date.now.timeIntervalSince1970),
+                ]
+            )
+            let current: CourseSyncVersionVector
+            if let data: Data = try queryOne(
+                """
+                SELECT vector_blob FROM workspace_vectors
+                WHERE account_id = ? AND workspace_id = ?
+                """,
+                bindings: [.text(accountID), .text(head.workspaceID)]
+            ) { statement in
+                guard let data = Self.data(statement, column: 0) else {
+                    throw CourseCloudSyncStateError.corruptRow("workspace_vectors")
+                }
+                return data
+            } {
+                current = try JSONDecoder().decode(CourseSyncVersionVector.self, from: data)
+            } else {
+                current = .init()
+            }
+            let vectorData = try encoder.encode(current.merged(with: head.version))
+            try run(
+                """
+                INSERT INTO workspace_vectors (
+                  account_id, workspace_id, vector_blob, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(account_id, workspace_id) DO UPDATE SET
+                  vector_blob=excluded.vector_blob,
+                  updated_at=excluded.updated_at
+                """,
+                bindings: [
+                    .text(accountID),
+                    .text(head.workspaceID),
+                    .blob(vectorData),
+                    .double(Date.now.timeIntervalSince1970),
+                ]
+            )
+        }
+    }
+
+    func observeWorkspaceVector(
+        accountID: String,
+        workspaceID: String,
+        vector: CourseSyncVersionVector
+    ) throws {
+        try transaction {
+            try ensureAccountPartition(accountID)
+            let current: CourseSyncVersionVector
+            if let data: Data = try queryOne(
+                """
+                SELECT vector_blob FROM workspace_vectors
+                WHERE account_id = ? AND workspace_id = ?
+                """,
+                bindings: [.text(accountID), .text(workspaceID)]
+            ) { statement in
+                guard let data = Self.data(statement, column: 0) else {
+                    throw CourseCloudSyncStateError.corruptRow("workspace_vectors")
+                }
+                return data
+            } {
+                current = try JSONDecoder().decode(CourseSyncVersionVector.self, from: data)
+            } else {
+                current = .init()
+            }
+            let encoded = try JSONEncoder().encode(current.merged(with: vector))
+            try run(
+                """
+                INSERT INTO workspace_vectors (
+                  account_id, workspace_id, vector_blob, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(account_id, workspace_id) DO UPDATE SET
+                  vector_blob=excluded.vector_blob,
+                  updated_at=excluded.updated_at
+                """,
+                bindings: [
+                    .text(accountID),
+                    .text(workspaceID),
+                    .blob(encoded),
+                    .double(Date.now.timeIntervalSince1970),
+                ]
+            )
+        }
     }
 
     func cloudBase(accountID: String, workspaceID: String) throws -> Data? {
@@ -642,6 +957,19 @@ actor CourseCloudSyncStateStore {
               account_id TEXT NOT NULL,
               workspace_id TEXT NOT NULL,
               vector_blob BLOB NOT NULL,
+              updated_at REAL NOT NULL,
+              PRIMARY KEY(account_id, workspace_id),
+              FOREIGN KEY(account_id) REFERENCES account_partitions(account_id)
+            )
+            """
+        )
+        try execute(
+            """
+            CREATE TABLE IF NOT EXISTS cloud_heads (
+              account_id TEXT NOT NULL,
+              workspace_id TEXT NOT NULL,
+              head_blob BLOB NOT NULL,
+              system_fields BLOB NOT NULL,
               updated_at REAL NOT NULL,
               PRIMARY KEY(account_id, workspace_id),
               FOREIGN KEY(account_id) REFERENCES account_partitions(account_id)

@@ -15,6 +15,7 @@ import Foundation
 final class CloudKVSBridge {
     static let shared = CloudKVSBridge()
 
+    private static let cloudSyncEnabledInfoKey = "LearnfoldCourseCloudSyncEnabled"
     /// CBOR envelope written to KVS under this key.
     private static let envelopeKey = "litter.cloud_sync_envelope_v1"
     /// Locally-persisted device identifier for `source_device` tagging in
@@ -24,7 +25,10 @@ final class CloudKVSBridge {
     /// rapid local changes.
     private static let debounceInterval: TimeInterval = 0.5
 
-    private let store = NSUbiquitousKeyValueStore.default
+    // Creating NSUbiquitousKeyValueStore without the matching entitlement
+    // emits a client fault. Keep it lazy so builds with cloud sync disabled
+    // never initialize Apple's KVS runtime.
+    private lazy var store = NSUbiquitousKeyValueStore.default
     private let defaults = UserDefaults.standard
     private let preferencesDirectory: String
     private let deviceId: String
@@ -45,6 +49,17 @@ final class CloudKVSBridge {
     /// Wire up KVS + UserDefaults observation. Idempotent. Call from app
     /// launch.
     func start() {
+        guard Self.runtimeSupportsKVS else {
+            // Simulator builds are ad-hoc signed and do not carry the iCloud
+            // KVS entitlement even when Info.plist enables cloud sync.
+            // Touching the default store then causes a fatal client error.
+            LLog.info("cloud_sync", "kvs unavailable in simulator")
+            return
+        }
+        guard Self.isCloudSyncEnabled() else {
+            LLog.info("cloud_sync", "kvs disabled for this build")
+            return
+        }
         guard !started else { return }
         started = true
 
@@ -86,7 +101,22 @@ final class CloudKVSBridge {
     /// new state to KVS. Call this from the existing `SavedThreadsStore` /
     /// `SavedProjectStore` mutation paths.
     func notifyRustPreferencesChanged() {
+        guard started else { return }
         scheduleExport()
+    }
+
+    static func isCloudSyncEnabled(
+        infoDictionary: [String: Any] = Bundle.main.infoDictionary ?? [:]
+    ) -> Bool {
+        infoDictionary[cloudSyncEnabledInfoKey] as? Bool == true
+    }
+
+    static var runtimeSupportsKVS: Bool {
+#if targetEnvironment(simulator)
+        false
+#else
+        true
+#endif
     }
 
     // MARK: - Inbound

@@ -90,6 +90,46 @@ struct CourseSyncMutationVersion: Codable, Hashable, Sendable {
     }
 }
 
+struct CourseCloudHead: Codable, Equatable, Sendable {
+    let workspaceID: String
+    let generationID: String
+    let generationRecordName: String
+    let commitRecordName: String
+    let checksum: String
+    let title: String
+    let previousGenerationID: String?
+    let version: CourseSyncVersionVector
+}
+
+enum CourseCloudHeadResolution: Equatable, Sendable {
+    case ignoreHistorical
+    case accept
+    case mergeConcurrent
+    case invalidEqualVersion
+}
+
+enum CourseCloudHeadResolver {
+    static func resolve(
+        accepted: CourseCloudHead?,
+        incoming: CourseCloudHead
+    ) -> CourseCloudHeadResolution {
+        guard let accepted else { return .accept }
+        switch incoming.version.relation(to: accepted.version) {
+        case .before:
+            return .ignoreHistorical
+        case .after:
+            return .accept
+        case .concurrent:
+            return .mergeConcurrent
+        case .equal:
+            return incoming.generationID == accepted.generationID
+                && incoming.checksum == accepted.checksum
+                ? .accept
+                : .invalidEqualVersion
+        }
+    }
+}
+
 struct CourseSyncLibraryItem: Codable, Hashable, Sendable {
     let id: String
     let kind: LibraryItemKind

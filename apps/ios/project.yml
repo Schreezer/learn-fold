@@ -64,17 +64,13 @@ targets:
         # Re-enable after Apple grants CarPlay Voice Based Conversation to the
         # owned `com.chirag.learnfold` App ID. Keeping an unapproved managed
         # entitlement here prevents development profiles from signing.
-        # Course CloudKit sync. Re-add after creating the
-        # `iCloud.com.chirag.learnfold` container in the Apple Developer Portal
-        # AND enabling it on the iOS app's provisioning profile. Without both,
-        # archive fails: "Provisioning profile doesn't include the iCloud
-        # capability." Then set LearnfoldCourseCloudSyncEnabled=true in
-        # Info.plist.
-        # com.apple.developer.icloud-container-identifiers:
-        #   - iCloud.com.chirag.learnfold
-        # com.apple.developer.icloud-services:
-        #   - CloudKit
-        # com.apple.developer.ubiquity-kvstore-identifier: $(TeamIdentifierPrefix)iCloud.com.chirag.learnfold
+        # Private CloudKit database used to sync generated courses between the
+        # user's Apple devices.
+        com.apple.developer.icloud-container-identifiers:
+          - iCloud.com.chirag.learnfold
+        com.apple.developer.icloud-services:
+          - CloudKit
+        com.apple.developer.ubiquity-kvstore-identifier: $(TeamIdentifierPrefix)iCloud.com.chirag.learnfold
         # Private Cloud Compute (iOS 27). Apple has granted this managed
         # capability to the owned `com.chirag.learnfold` App ID. Development
         # and distribution profiles must be regenerated after enabling it.
@@ -84,6 +80,8 @@ targets:
     attributes:
       SystemCapabilities:
         com.apple.BackgroundModes:
+          enabled: true
+        com.apple.iCloud:
           enabled: true
     sources:
       - path: Sources/Litter

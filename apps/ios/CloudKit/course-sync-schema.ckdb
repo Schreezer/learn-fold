@@ -1,0 +1,30 @@
+DEFINE SCHEMA
+    RECORD TYPE LFWorkspaceGenerationV1 (
+        workspaceID STRING,
+        generationID STRING,
+        checksum STRING,
+        schemaVersion INT64,
+        payload ASSET,
+        payloadChecksum STRING
+    );
+
+    RECORD TYPE LFGenerationCommitV1 (
+        workspaceID STRING,
+        generationID STRING,
+        checksum STRING,
+        schemaVersion INT64,
+        payload ASSET,
+        payloadChecksum STRING
+    );
+
+    RECORD TYPE LFCourseCatalogEntryV1 (
+        workspaceID STRING,
+        generationID STRING,
+        generationRecordName STRING,
+        commitRecordName STRING,
+        checksum STRING,
+        title STRING,
+        previousGenerationID STRING,
+        versionJSON STRING,
+        schemaVersion INT64
+    );

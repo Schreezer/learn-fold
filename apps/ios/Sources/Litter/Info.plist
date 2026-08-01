@@ -34,7 +34,7 @@
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>LearnfoldCourseCloudSyncEnabled</key>
-	<false/>
+	<true/>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>tailscale</string>
