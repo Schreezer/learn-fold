@@ -73,4 +73,23 @@ describe("pairing broker", () => {
       { headers: { authorization: "Bearer wrong" } },
     )).status).toBe(401)
   })
+
+  it("treats an identical submit retry as a successful idempotent handoff", async () => {
+    const pairing = await createPairing()
+
+    expect((await SELF.fetch(pairing.submit_url, {
+      method: "POST",
+      body: JSON.stringify(pairPayload),
+    })).status).toBe(202)
+
+    expect((await SELF.fetch(pairing.submit_url, {
+      method: "POST",
+      body: JSON.stringify(pairPayload),
+    })).status).toBe(202)
+
+    expect((await SELF.fetch(pairing.submit_url, {
+      method: "POST",
+      body: JSON.stringify({ ...pairPayload, node_id: "different-node" }),
+    })).status).toBe(409)
+  })
 })
