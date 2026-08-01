@@ -211,9 +211,30 @@ enum HomeDashboardSupport {
                 )
             }
 
-        var seenServerIds = Set(liveServers.map(\.id))
-        var seenServerKeys = Set(liveServers.map(\.deduplicationKey))
-        var merged = liveServers
+        // Discovery can report the same host through more than one endpoint
+        // (for example, a remembered app-server port and a newly discovered
+        // port). Collapse those live entries before merging saved/offline
+        // servers. When one duplicate is the active connection, preserve it
+        // so navigation continues to use the endpoint the user is on.
+        let preferredLiveServers = liveServers.sorted { lhs, rhs in
+            let lhsIsActive = lhs.id == activeServerId
+            let rhsIsActive = rhs.id == activeServerId
+            if lhsIsActive != rhsIsActive {
+                return lhsIsActive && !rhsIsActive
+            }
+            return lhs.id < rhs.id
+        }
+        var seenServerIds = Set<String>()
+        var seenServerKeys = Set<String>()
+        var merged = preferredLiveServers.filter { server in
+            guard !seenServerIds.contains(server.id),
+                  !seenServerKeys.contains(server.deduplicationKey) else {
+                return false
+            }
+            seenServerIds.insert(server.id)
+            seenServerKeys.insert(server.deduplicationKey)
+            return true
+        }
 
         for saved in savedServers where saved.rememberedByUser {
             let offline = offlineServer(from: saved)
