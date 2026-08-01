@@ -666,7 +666,8 @@ final class VoiceRuntimeController: VoiceActions {
                     model: model,
                     effort: ReasoningEffort(wireValue: effort),
                     serviceTier: fastMode ? .fast : nil
-                )
+                ),
+                mayCreateBackgroundContinuation: false
             )
             handoffManager.reportTurnSent(handoffId: handoffId, baseItemCount: 0)
             startHandoffStreamPolling(handoffId: handoffId, key: key)

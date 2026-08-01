@@ -1853,19 +1853,36 @@ final class AppModel {
         }
     }
 
-    func startTurn(key: ThreadKey, payload: AppComposerPayload) async throws {
-        let backgroundContinuationToken = AppRuntimeController.shared.beginUserInitiatedTurn(
-            key: key,
-            appModel: self
-        )
+    @discardableResult
+    func startTurn(
+        key: ThreadKey,
+        payload: AppComposerPayload,
+        backgroundAgentName: String = "Codex",
+        keepsBackgroundAliveAcrossTurns: Bool = false,
+        mayCreateBackgroundContinuation: Bool
+    ) async throws -> AppTurnSubmissionReceipt {
+        let backgroundContinuationToken = if mayCreateBackgroundContinuation {
+            AppRuntimeController.shared.beginUserInitiatedTurn(
+                key: key,
+                appModel: self,
+                agentName: backgroundAgentName,
+                keepsAliveAcrossTurns: keepsBackgroundAliveAcrossTurns
+            )
+        } else {
+            AppRuntimeController.shared.reuseUserInitiatedMultiTurnIfPresent(
+                key: key,
+                agentName: backgroundAgentName
+            )
+        }
         await restoreStoredLocalAuthIfNeeded(serverId: key.serverId, reason: "startTurn")
 
         do {
-            try await store.startTurn(
+            let receipt = try await store.startTurn(
                 key: key,
                 params: payload.turnStartRequest(threadId: key.threadId)
             )
             AppRuntimeController.shared.markUserInitiatedTurnAccepted(backgroundContinuationToken)
+            return receipt
         } catch {
             AppRuntimeController.shared.markUserInitiatedTurnStartFailed(backgroundContinuationToken)
             lastError = error.localizedDescription

@@ -129,6 +129,34 @@ final class LitterUITests: XCTestCase {
     }
 
     @MainActor
+    func testCourseChatPartialRemoteSnapshotKeepsCompleteLocalTranscript() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("--ui-test-course-chat-continuity")
+        app.launch()
+
+        let harnessTitle = app.staticTexts["courseChatContinuityHarness.title"]
+        XCTAssertTrue(
+            harnessTitle.waitForExistence(timeout: 10),
+            "Course chat continuity harness did not launch"
+        )
+        let splashDismissed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hittable == true"),
+            object: harnessTitle
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [splashDismissed], timeout: 5), .completed)
+        XCTAssertTrue(app.staticTexts["UITEST_COURSE_FIRST_QUESTION"].exists)
+        XCTAssertTrue(app.staticTexts["UITEST_COURSE_FIRST_ANSWER"].exists)
+        XCTAssertTrue(app.staticTexts["UITEST_COURSE_LATEST_QUESTION"].exists)
+        XCTAssertEqual(
+            app.staticTexts.matching(
+                NSPredicate(format: "label == %@", "UITEST_COURSE_LATEST_QUESTION")
+            ).count,
+            1
+        )
+        attachScreenshot(named: "Course chat partial snapshot continuity", app: app)
+    }
+
+    @MainActor
     func testConversationDisplaySettingsRowsAreReachable() throws {
         let app = conversationDisplayHarnessApp()
         app.launch()

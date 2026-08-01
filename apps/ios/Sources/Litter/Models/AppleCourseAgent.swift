@@ -200,8 +200,7 @@ enum AppleCourseApprovalPolicy {
             let presented = try? JSONDecoder().decode(CourseBrief.self, from: presentedData),
             let approved = try? JSONDecoder().decode(CourseBrief.self, from: approvedData),
             !presented.planID.isEmpty,
-            presented.planID == approved.planID,
-            presented.revision == approved.revision
+            presented == approved
         else {
             return false
         }
@@ -564,12 +563,12 @@ enum AppleCourseGenerationRetryPolicy {
 @available(iOS 26.0, *)
 @MainActor
 final class AppleCourseLiveSessionCallbacks {
-    private var onCoursePlan: @MainActor (CourseBrief) throws -> Void
+    private var onCoursePlan: @MainActor (CourseBrief) async throws -> Void
     private var onEditorMutationAttempt: @MainActor @Sendable () -> Void
     private var onEditorMutationCompletion: @MainActor @Sendable () -> Void
 
     init(
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void,
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void,
         onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void,
         onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) {
@@ -579,7 +578,7 @@ final class AppleCourseLiveSessionCallbacks {
     }
 
     func rebind(
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void,
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void,
         onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void,
         onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) {
@@ -588,8 +587,8 @@ final class AppleCourseLiveSessionCallbacks {
         self.onEditorMutationCompletion = onEditorMutationCompletion
     }
 
-    func presentCoursePlan(_ plan: CourseBrief) throws {
-        try onCoursePlan(plan)
+    func presentCoursePlan(_ plan: CourseBrief) async throws {
+        try await onCoursePlan(plan)
     }
 
     func recordEditorMutationAttempt() {
@@ -612,7 +611,7 @@ protocol AppleCourseAgentRuntime: AnyObject {
         workspaceID: String,
         prompt: String,
         onPartialResponse: @escaping @MainActor (String) -> Void,
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws
     func cancel(sessionID: UUID)
     func remove(sessionID: UUID, workspaceID: String)
@@ -621,6 +620,13 @@ protocol AppleCourseAgentRuntime: AnyObject {
 @MainActor
 final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
     static let shared = SystemAppleCourseAgentRuntime()
+    static let courseHierarchyInstructions = """
+    Every planned chapter, subchapter, and lesson must exist as its own clearly titled native page, \
+    including items whose content remains pending, so the learner can see and generate them \
+    separately. A folder is generated when every planned child is generated, pending_generation \
+    when every child is pending, and partially_generated when child states are mixed; never leave \
+    a folder pending_generation when all its children are generated.
+    """
 
     private let environment: [String: String]
 
@@ -664,7 +670,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         workspaceID: String,
         prompt: String,
         onPartialResponse: @escaping @MainActor (String) -> Void,
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
         guard CourseAgentProvider.isApple(providerID) else {
             throw AppleCourseAgentError.invalidProvider
@@ -701,7 +707,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             var didPresentCoursePlan = false
             var didAttemptEditorMutation = false
             var didCompleteEditorMutation = false
-            let trackedOnCoursePlan: @MainActor (CourseBrief) throws -> Void = { plan in
+            let trackedOnCoursePlan: @MainActor (CourseBrief) async throws -> Void = { plan in
                 didPresentCoursePlan = true
                 LLog.info(
                     "AppleCourseAgent",
@@ -712,7 +718,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                         "session_id": sessionID.uuidString.lowercased(),
                     ]
                 )
-                try onCoursePlan(plan)
+                try await onCoursePlan(plan)
             }
             let budget = AppleCourseContextBudget.forProvider(providerID)
             let toolMode = AppleCourseToolMode.forTurn(
@@ -1318,7 +1324,7 @@ private extension SystemAppleCourseAgentRuntime {
         toolMode: AppleCourseToolMode,
         persistedTranscript: Data?,
         compactedSummary: String?,
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void,
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void,
         onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void = {},
         onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) throws -> LanguageModelSession {
@@ -1352,7 +1358,7 @@ private extension SystemAppleCourseAgentRuntime {
             workspaceID: workspaceID,
             mode: toolMode,
             onCoursePlan: { plan in
-                try callbacks.presentCoursePlan(plan)
+                try await callbacks.presentCoursePlan(plan)
             },
             onEditorMutationAttempt: {
                 callbacks.recordEditorMutationAttempt()
@@ -1434,7 +1440,7 @@ private extension SystemAppleCourseAgentRuntime {
         compactedSummary: String?,
         prompt: String,
         toolMode: AppleCourseToolMode,
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
         guard
             providerID == CourseAgentProvider.appleOnDevice,
@@ -1828,7 +1834,8 @@ private extension SystemAppleCourseAgentRuntime {
         learner approves that plan. After approval, use the native-editor tools for all course \
         content. Fetch immediately before updating a page and always use its latest \
         expected_revision. Generate the full course hierarchy but initially write complete learning \
-        content only for Chapter 1. For a selected-passage question, autonomously choose the \
+        content only for Chapter 1. \(courseHierarchyInstructions) For a selected-passage question, \
+        autonomously choose the \
         smallest sufficient response: answer only in chat for a short-lived clarification; add or \
         revise a focused section on the referenced page when it durably improves that lesson; or \
         create an explainer child page and link it from the lesson when a reusable deep dive would \
@@ -1900,7 +1907,7 @@ private enum AppleCourseToolFactory {
         providerID _: String,
         workspaceID: String,
         mode: AppleCourseToolMode,
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void,
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void,
         onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void = {},
         onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) throws -> [any Tool] {
@@ -2196,7 +2203,7 @@ private enum AppleCourseToolFactory {
     private static func present(
         _ brief: CourseBrief,
         retryToolName: String,
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws -> String {
         if let issue = AppleCoursePlanValidator.issue(in: brief) {
             return try rejection(

@@ -292,7 +292,19 @@ enum CourseMCPProtocol {
         }
 
         if name == CourseAgentTools.presentPlan {
-            return toolResult(id: id, value: .object(arguments), isError: false)
+            do {
+                let argumentsData = try JSONEncoder().encode(JSONValue.object(arguments))
+                let plan = try JSONDecoder().decode(CourseBrief.self, from: argumentsData)
+                if let problem = coursePlanSemanticProblem(for: plan) {
+                    return invalidCoursePlanResult(id: id, problem: problem)
+                }
+                return toolResult(id: id, value: .object(arguments), isError: false)
+            } catch {
+                return invalidCoursePlanResult(
+                    id: id,
+                    problem: coursePlanValidationProblem(for: error)
+                )
+            }
         }
 
         guard CourseAgentTools.isEditorTool(name) else {
@@ -340,6 +352,110 @@ enum CourseMCPProtocol {
                 isError: true
             )
         }
+    }
+
+    private static func coursePlanSemanticProblem(for plan: CourseBrief) -> String? {
+        let requiredStrings = [
+            ("plan_id", plan.planID),
+            ("title", plan.title),
+            ("summary", plan.summary),
+            ("outcome", plan.outcome),
+            ("starting_point", plan.startingPoint),
+            ("focus_gap", plan.focusGap),
+            ("estimated_duration", plan.estimatedDuration),
+        ]
+        for (field, value) in requiredStrings
+        where value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "The field '\(field)' must be a non-empty string."
+        }
+        guard plan.revision > 0 else {
+            return "The field 'revision' must be a positive integer."
+        }
+        guard !plan.chapters.isEmpty else {
+            return "The field 'chapters' must contain at least one chapter."
+        }
+        for (chapterIndex, chapter) in plan.chapters.enumerated() {
+            let requiredChapterStrings = [
+                ("id", chapter.id),
+                ("title", chapter.title),
+                ("objective", chapter.objective),
+            ]
+            for (field, value) in requiredChapterStrings
+            where value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "The field 'chapters[\(chapterIndex)].\(field)' must be a non-empty string."
+            }
+            for (deliverableIndex, deliverable) in chapter.deliverables.enumerated()
+            where deliverable.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "The field 'chapters[\(chapterIndex)].deliverables[\(deliverableIndex)]' must be a non-empty string."
+            }
+        }
+        return nil
+    }
+
+    private static func invalidCoursePlanResult(
+        id: JSONValue,
+        problem: String
+    ) -> CourseMCPHTTPResponse {
+        toolResult(
+            id: id,
+            value: [
+                "error": .string(
+                    """
+                    Invalid course plan: \(problem) Correct the arguments and call \
+                    \(CourseAgentTools.presentPlan) again with every required typed field. \
+                    Do not ask the learner to approve the plan until this tool succeeds.
+                    """
+                )
+            ],
+            isError: true
+        )
+    }
+
+    private static func coursePlanValidationProblem(for error: Error) -> String {
+        guard let decodingError = error as? DecodingError else {
+            return "The arguments are not valid typed JSON."
+        }
+
+        switch decodingError {
+        case .keyNotFound(let key, let context):
+            let path = codingPath(context.codingPath, appending: key)
+            return "The required field '\(path)' is missing."
+        case .typeMismatch(let type, let context):
+            let path = codingPath(context.codingPath)
+            return "The field '\(path)' has the wrong type; expected \(type)."
+        case .valueNotFound(let type, let context):
+            let path = codingPath(context.codingPath)
+            return "The field '\(path)' cannot be null; expected \(type)."
+        case .dataCorrupted(let context):
+            let path = codingPath(context.codingPath)
+            if path.isEmpty {
+                return "The arguments contain invalid data."
+            }
+            return "The field '\(path)' contains invalid data."
+        @unknown default:
+            return "The arguments do not match the required course-plan schema."
+        }
+    }
+
+    private static func codingPath(
+        _ codingPath: [CodingKey],
+        appending finalKey: CodingKey? = nil
+    ) -> String {
+        var keys = codingPath
+        if let finalKey {
+            keys.append(finalKey)
+        }
+        var result = ""
+        for key in keys {
+            if let index = key.intValue {
+                result += "[\(index)]"
+            } else if result.isEmpty {
+                result = key.stringValue
+            } else {
+                result += ".\(key.stringValue)"
+            }
+        }
+        return result
     }
 
     private static func workspaceURL(for workspaceID: String) -> URL? {

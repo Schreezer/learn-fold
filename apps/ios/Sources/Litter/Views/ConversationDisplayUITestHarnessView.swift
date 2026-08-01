@@ -1,6 +1,78 @@
 import SwiftUI
 
 #if DEBUG
+struct CourseChatContinuityUITestHarnessView: View {
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-test-course-chat-continuity")
+    }
+
+    private static let firstLearner = CourseChatMessage(
+        role: .learner,
+        text: "UITEST_COURSE_FIRST_QUESTION"
+    )
+    private static let firstAgent = CourseChatMessage(
+        role: .agent,
+        text: "UITEST_COURSE_FIRST_ANSWER"
+    )
+    private static let latestLearner = CourseChatMessage(
+        role: .learner,
+        text: "UITEST_COURSE_LATEST_QUESTION"
+    )
+    private static let partialLiveItems = [
+        ConversationItem(
+            id: "ui-test-course-partial-live-user",
+            content: .user(
+                ConversationUserMessageData(
+                    text: "UITEST_COURSE_LATEST_QUESTION",
+                    images: []
+                )
+            )
+        )
+    ]
+
+    private var mergedItems: [ConversationItem] {
+        CourseChatTimelinePolicy.mergedConversationItems(
+            localMessages: [Self.firstLearner, Self.firstAgent, Self.latestLearner],
+            liveItems: Self.partialLiveItems
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Course Chat Continuity Test")
+                        .font(.headline)
+                        .accessibilityIdentifier("courseChatContinuityHarness.title")
+
+                    ConversationTurnTimeline(
+                        items: mergedItems,
+                        isLive: true,
+                        serverId: "ui-test-hermes",
+                        originThreadId: "ui-test-course-thread",
+                        agentDirectoryVersion: 0,
+                        messageActionsDisabled: true,
+                        onStreamingSnapshotRendered: nil,
+                        onLiveContentLayoutChanged: nil,
+                        resolveTargetLabel: { _ in nil },
+                        onWidgetPrompt: { _ in },
+                        onEditUserItem: { _ in },
+                        onForkFromUserItem: { _ in }
+                    )
+                    .accessibilityIdentifier("courseChatContinuityHarness.timeline")
+                }
+                .padding(16)
+            }
+            .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+            .navigationTitle("Course Chat")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .onAppear {
+            (UIApplication.shared.delegate as? AppDelegate)?.signalContentReady()
+        }
+    }
+}
+
 struct ConversationDisplayUITestHarnessView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(AppState.self) private var appState

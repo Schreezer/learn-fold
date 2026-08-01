@@ -594,7 +594,10 @@ impl TerminalRenderer {
             effort: None,
             output_schema: None,
         };
-        store.start_turn(payload.thread_key, request).await
+        store
+            .start_turn(payload.thread_key, request)
+            .await
+            .map(|_| ())
     }
 }
 

@@ -56,6 +56,110 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         XCTAssertEqual(identities.count, 1)
     }
 
+    func testRemoteDynamicMutationIsRejectedUntilLatestPlanIsApproved() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CourseDocumentApprovalTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspaceID = UUID().uuidString
+        let threadID = "hermes-thread-\(UUID().uuidString)"
+        _ = try await CourseDocumentRegistry.shared.repository(
+            workspaceID: workspaceID,
+            databaseURL: directory.appendingPathComponent(".course/course-library.sqlite"),
+            rootTitle: "Approval-gated course"
+        )
+        await CourseDocumentRegistry.shared.register(
+            threadID: threadID,
+            workspaceID: workspaceID
+        )
+
+        let result = await Task.detached {
+            CourseDocumentToolRouter.shared.handleDynamicTool(
+                invocation: AppPlatformDynamicToolInvocation(
+                    threadId: threadID,
+                    tool: NativeEditorMCPToolCatalog.updatePage,
+                    argumentsJson: "{}"
+                )
+            )
+        }.value
+
+        XCTAssertEqual(result?.success, false)
+        XCTAssertTrue(result?.output.contains("course_plan_not_approved") == true)
+    }
+
+    func testApprovalCommitsOnlyTheExactPresentedPlanRevision() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CourseDocumentPlanIdentityTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try await CourseDocumentRepository.open(
+            workspaceID: UUID().uuidString,
+            databaseURL: directory.appendingPathComponent(".course/course-library.sqlite"),
+            rootTitle: "Approval identity"
+        )
+        var revisionOne = CourseBrief()
+        revisionOne.planID = "swift-concurrency"
+        revisionOne.revision = 1
+        try await repository.presentPlan(revisionOne)
+
+        var changedContent = revisionOne
+        changedContent.title = "Changed without a revision bump"
+        do {
+            try await repository.approvePlan(changedContent)
+            XCTFail("Changed content must not be approved under a reused plan identity")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("plan changed"))
+        }
+
+        var revisionTwo = revisionOne
+        revisionTwo.revision = 2
+        do {
+            try await repository.approvePlan(revisionTwo)
+            XCTFail("A revision that was never presented must not be approved")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("plan changed"))
+        }
+        var latestPlanIsApproved = await repository.isLatestPlanApproved()
+        XCTAssertFalse(latestPlanIsApproved)
+
+        try await repository.approvePlan(revisionOne)
+        latestPlanIsApproved = await repository.isLatestPlanApproved()
+        XCTAssertTrue(latestPlanIsApproved)
+        try await repository.presentPlan(changedContent)
+        latestPlanIsApproved = await repository.isLatestPlanApproved()
+        XCTAssertFalse(latestPlanIsApproved)
+        try await repository.presentPlan(revisionTwo)
+        latestPlanIsApproved = await repository.isLatestPlanApproved()
+        XCTAssertFalse(latestPlanIsApproved)
+    }
+
+    func testInterruptedPlanRecoveryPreservesANewerPresentedPlan() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CourseDocumentPlanRecoveryTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try await CourseDocumentRepository.open(
+            workspaceID: UUID().uuidString,
+            databaseURL: directory.appendingPathComponent(".course/course-library.sqlite"),
+            rootTitle: "Recovery identity"
+        )
+        var oldPlan = CourseBrief()
+        oldPlan.planID = "old-hermes-plan"
+        oldPlan.revision = 1
+        var newerPlan = CourseBrief()
+        newerPlan.planID = "newer-device-plan"
+        newerPlan.revision = 2
+        newerPlan.title = "Plan currently under review"
+        try await repository.presentPlan(newerPlan)
+
+        do {
+            try await repository.presentPlanForRecoveryIfUnchanged(oldPlan)
+            XCTFail("Recovery must not overwrite a different plan already under review")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("preserved"))
+        }
+        try await repository.approvePlan(newerPlan)
+        let newerPlanRemainsCurrent = await repository.isLatestPlanApproved()
+        XCTAssertTrue(newerPlanRemainsCurrent)
+    }
+
     func testOpeningLegacyCourseImportsMarkdownHierarchyOnceIntoNativePages() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CourseDocumentMigrationTests-\(UUID().uuidString)", isDirectory: true)
@@ -542,11 +646,54 @@ final class CourseDocumentRepositoryTests: XCTestCase {
             argumentsJSON: request
         )
         XCTAssertFalse(queued.isError)
-        XCTAssertEqual(queued.value.objectValue?["status"]?.stringValue, "queued")
+        XCTAssertEqual(queued.value.objectValue?["status"]?.stringValue, "succeeded")
 
         await fulfillment(of: [committed], timeout: 3)
         let workspace = try await repository.workspaceSnapshot()
         XCTAssertTrue(workspace.pages.values.contains { $0.title == "Async lesson" })
+    }
+
+    @MainActor
+    func testAsyncMutationKeepsOldPlanLeaseUntilCommitBeforeNewPlanPresentation() async throws {
+        let (repository, directory) = try await makeRepository()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = try await repository.rootPageSnapshot()
+        let request = try jsonString([
+            "parent": ["page_id": root.id],
+            "pages": (0..<40).map { index in
+                [
+                    "properties": ["title": "Leased async lesson \(index)"],
+                    "content": "# Leased async lesson \(index)\nCommitted under revision one.",
+                ]
+            },
+            "allow_async": true,
+        ])
+
+        let mutation = Task {
+            await repository.callTool(
+                named: NativeEditorMCPToolCatalog.createPages,
+                argumentsJSON: request
+            )
+        }
+        await Task.yield()
+        var replacement = CourseBrief()
+        replacement.planID = "replacement-plan"
+        replacement.revision = 2
+        let presentation = Task {
+            try await repository.presentPlan(replacement)
+        }
+
+        let mutationResult = await mutation.value
+        XCTAssertFalse(mutationResult.isError)
+        XCTAssertEqual(mutationResult.value.objectValue?["status"]?.stringValue, "succeeded")
+        try await presentation.value
+        let latestPlanIsApproved = await repository.isLatestPlanApproved()
+        XCTAssertFalse(latestPlanIsApproved)
+        let workspace = try await repository.workspaceSnapshot()
+        XCTAssertEqual(
+            workspace.pages.values.filter { $0.title.hasPrefix("Leased async lesson") }.count,
+            40
+        )
     }
 
     func testCourseOutlineUsesNativePageMetadataAndFiltersContextFromLearnTab() async throws {
@@ -617,7 +764,7 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         XCTAssertTrue(outline.learningPages.allSatisfy { $0.pageID != nil })
     }
 
-    func testCourseOutlineIsReadyWhenGeneratedLessonIsNestedUnderPendingChapter() async throws {
+    func testCourseOutlineMarksPendingChapterGeneratedWhenAllChildrenAreGenerated() async throws {
         let (repository, directory) = try await makeRepository()
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -674,9 +821,104 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         XCTAssertFalse(lessonResult.isError)
 
         let outline = try await repository.outline()
-        XCTAssertEqual(outline.learningPages.first?.status, .pendingGeneration)
+        XCTAssertEqual(outline.learningPages.first?.status, .generated)
         XCTAssertEqual(outline.learningPages.first?.children.first?.status, .generated)
         XCTAssertTrue(outline.isReadyForLearning)
+    }
+
+    func testCourseOutlineKeepsTitledPendingChildrenGeneratableAndRollsUpMixedFolders() async throws {
+        let (repository, directory) = try await makeRepository()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let root = try await repository.rootPageSnapshot()
+        let chapterResult = await repository.callTool(
+            named: NativeEditorMCPToolCatalog.createPages,
+            argumentsJSON: try jsonString([
+                "parent": ["page_id": root.id],
+                "pages": [
+                    [
+                        "properties": [
+                            "title": "All pending",
+                            "course_node_id": "all-pending",
+                            "course_role": "chapter",
+                            "generation_status": "generated",
+                        ],
+                        "content": "# All pending",
+                    ],
+                    [
+                        "properties": [
+                            "title": "Mixed progress",
+                            "course_node_id": "mixed-progress",
+                            "course_role": "chapter",
+                            "generation_status": "pending_generation",
+                        ],
+                        "content": "# Mixed progress",
+                    ],
+                ],
+            ])
+        )
+        XCTAssertFalse(chapterResult.isError)
+
+        var outline = try await repository.outline()
+        let allPendingPageID = try XCTUnwrap(
+            outline.learningPages.first(where: { $0.id == "all-pending" })?.pageID
+        )
+        let mixedPageID = try XCTUnwrap(
+            outline.learningPages.first(where: { $0.id == "mixed-progress" })?.pageID
+        )
+
+        for (parentPageID, pages) in [
+            (
+                allPendingPageID,
+                [
+                    ("pending-1", "1.1 · Planned title", "pending_generation"),
+                    ("pending-2", "1.2 · Another planned title", "pending_generation"),
+                ]
+            ),
+            (
+                mixedPageID,
+                [
+                    ("mixed-1", "2.1 · Ready lesson", "generated"),
+                    ("mixed-2", "2.2 · Pending lesson", "pending_generation"),
+                ]
+            ),
+        ] {
+            let result = await repository.callTool(
+                named: NativeEditorMCPToolCatalog.createPages,
+                argumentsJSON: try jsonString([
+                    "parent": ["page_id": parentPageID],
+                    "pages": pages.map { id, title, status in
+                        [
+                            "properties": [
+                                "title": title,
+                                "course_node_id": id,
+                                "course_role": "lesson",
+                                "generation_status": status,
+                            ],
+                            "content": "# \(title)",
+                        ]
+                    },
+                ])
+            )
+            XCTAssertFalse(result.isError)
+        }
+
+        outline = try await repository.outline()
+        let allPending = try XCTUnwrap(
+            outline.learningPages.first(where: { $0.id == "all-pending" })
+        )
+        XCTAssertEqual(allPending.status, .pendingGeneration)
+        XCTAssertEqual(
+            allPending.children.map(\.title),
+            ["1.1 · Planned title", "1.2 · Another planned title"]
+        )
+        XCTAssertTrue(allPending.children.allSatisfy { $0.status == .pendingGeneration })
+
+        let mixed = try XCTUnwrap(
+            outline.learningPages.first(where: { $0.id == "mixed-progress" })
+        )
+        XCTAssertEqual(mixed.status, .partiallyGenerated)
+        XCTAssertEqual(mixed.children.map(\.status), [.generated, .pendingGeneration])
     }
 
     private func makeRepository() async throws -> (CourseDocumentRepository, URL) {
@@ -688,6 +930,11 @@ final class CourseDocumentRepositoryTests: XCTestCase {
             databaseURL: databaseURL,
             rootTitle: "Test course"
         )
+        var plan = CourseBrief()
+        plan.planID = "test-course-plan"
+        plan.revision = 1
+        try await repository.presentPlan(plan)
+        try await repository.approvePlan(plan)
         return (repository, directory)
     }
 

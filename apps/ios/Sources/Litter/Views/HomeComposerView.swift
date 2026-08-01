@@ -285,7 +285,11 @@ struct HomeComposerView: View {
                     effort: effortOverride,
                     serviceTier: nil
                 )
-                try await appModel.startTurn(key: threadKey, payload: payload)
+                try await appModel.startTurn(
+                    key: threadKey,
+                    payload: payload,
+                    mayCreateBackgroundContinuation: true
+                )
                 await appModel.refreshThreadSnapshot(key: threadKey)
                 onThreadCreated(threadKey)
             } catch {

@@ -84,6 +84,7 @@ actor CourseDocumentRepository {
     }
 
     private let service: NativeEditorMCPService
+    private let courseRoot: URL
     private let pendingEditsURL: URL
     private let autosaveDelay: Duration
     private var pendingUserEdits: [String: PendingUserEdit] = [:]
@@ -94,16 +95,20 @@ actor CourseDocumentRepository {
     private var asyncTaskMonitors: [String: Task<Void, Never>] = [:]
     private var continuations: [UUID: AsyncStream<CourseDocumentChange>.Continuation] = [:]
     private var changeSequence = 0
+    private var planOperationIsLocked = false
+    private var planOperationWaiters: [CheckedContinuation<Void, Never>] = []
 
     private init(
         workspaceID: String,
         service: NativeEditorMCPService,
+        courseRoot: URL,
         pendingEditsURL: URL,
         autosaveDelay: Duration,
         recoveredUserEdits: [String: PendingUserEdit]
     ) {
         self.workspaceID = workspaceID
         self.service = service
+        self.courseRoot = courseRoot
         self.pendingEditsURL = pendingEditsURL
         self.autosaveDelay = autosaveDelay
         pendingUserEdits = recoveredUserEdits
@@ -138,6 +143,7 @@ actor CourseDocumentRepository {
         let repository = CourseDocumentRepository(
             workspaceID: workspaceID,
             service: service,
+            courseRoot: courseRoot,
             pendingEditsURL: pendingEditsURL,
             autosaveDelay: autosaveDelay,
             recoveredUserEdits: recoveredUserEdits
@@ -546,15 +552,40 @@ actor CourseDocumentRepository {
     }
 
     func callTool(named name: String, argumentsJSON: String) async -> NativeEditorMCPToolResult {
+        let requiresApprovedPlan = Self.mutatingTools.contains(name)
+        if requiresApprovedPlan {
+            await acquirePlanOperation()
+        }
+        defer {
+            if requiresApprovedPlan {
+                releasePlanOperation()
+            }
+        }
         do {
             try Task.checkCancellation()
             try await flushPendingUserEdits()
             try Task.checkCancellation()
+            if requiresApprovedPlan,
+               !AppleCourseApprovalPolicy.isLatestPlanApproved(courseDirectory: courseRoot) {
+                return Self.planNotApprovedResult()
+            }
             let data = Data(argumentsJSON.utf8)
             let arguments = try JSONDecoder().decode([String: JSONValue].self, from: data)
             let result = await service.callTool(named: name, arguments: arguments)
             if !result.isError {
                 if let task = Self.asyncTaskDescriptor(result.value) {
+                    if requiresApprovedPlan {
+                        // Native async tasks are in-memory and may commit after
+                        // the initial queued descriptor. Keep the plan lease
+                        // until the device has actually finished the mutation,
+                        // and return that terminal result to Hermes.
+                        let terminal = await awaitAsyncTaskTerminal(id: task.id)
+                        handleAsyncTask(terminal.descriptor)
+                        return NativeEditorMCPToolResult(
+                            value: terminal.value,
+                            isError: terminal.descriptor.status == "failed"
+                        )
+                    }
                     handleAsyncTask(task)
                 } else if Self.mutatingTools.contains(name) {
                     let pageID = arguments["page_id"]?.stringValue
@@ -574,6 +605,105 @@ actor CourseDocumentRepository {
                 isError: true
             )
         }
+    }
+
+    func isLatestPlanApproved() -> Bool {
+        AppleCourseApprovalPolicy.isLatestPlanApproved(courseDirectory: courseRoot)
+    }
+
+    func presentPlan(_ plan: CourseBrief) async throws {
+        await acquirePlanOperation()
+        defer { releasePlanOperation() }
+        try writePresentedPlan(plan)
+    }
+
+    func presentPlanForRecoveryIfUnchanged(_ plan: CourseBrief) async throws {
+        await acquirePlanOperation()
+        defer { releasePlanOperation() }
+        let presentedURL = courseRoot
+            .appendingPathComponent(".course", isDirectory: true)
+            .appendingPathComponent(AppleCourseApprovalPolicy.presentedPlanFilename)
+        if FileManager.default.fileExists(atPath: presentedURL.path) {
+            let current = try JSONDecoder().decode(
+                CourseBrief.self,
+                from: Data(contentsOf: presentedURL)
+            )
+            guard current == plan else {
+                throw AppleCourseAgentError.toolFailed(
+                    "A different course plan is already being reviewed. Learnfold preserved it and did not replay the older Hermes presentation."
+                )
+            }
+            return
+        }
+        try writePresentedPlan(plan)
+    }
+
+    private func writePresentedPlan(_ plan: CourseBrief) throws {
+        guard !plan.planID.isEmpty else {
+            throw AppleCourseAgentError.toolFailed(
+                "The generated course plan is missing its plan identifier."
+            )
+        }
+        let metadataDirectory = courseRoot.appendingPathComponent(".course", isDirectory: true)
+        try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
+        let data = try JSONEncoder.courseFileEncoder.encode(plan)
+        try data.write(
+            to: metadataDirectory.appendingPathComponent(
+                AppleCourseApprovalPolicy.presentedPlanFilename
+            ),
+            options: .atomic
+        )
+    }
+
+    func approvePlan(_ plan: CourseBrief) async throws {
+        await acquirePlanOperation()
+        defer { releasePlanOperation() }
+        let metadataDirectory = courseRoot.appendingPathComponent(".course", isDirectory: true)
+        let presentedURL = metadataDirectory.appendingPathComponent(
+            AppleCourseApprovalPolicy.presentedPlanFilename
+        )
+        let presented = try JSONDecoder().decode(CourseBrief.self, from: Data(contentsOf: presentedURL))
+        guard presented == plan else {
+            throw AppleCourseAgentError.toolFailed(
+                "The plan changed before approval was committed. Review the latest revision and approve it explicitly."
+            )
+        }
+        let data = try JSONEncoder.courseFileEncoder.encode(presented)
+        try data.write(
+            to: metadataDirectory.appendingPathComponent(
+                AppleCourseApprovalPolicy.approvedPlanFilename
+            ),
+            options: .atomic
+        )
+    }
+
+    private func acquirePlanOperation() async {
+        if !planOperationIsLocked {
+            planOperationIsLocked = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            planOperationWaiters.append(continuation)
+        }
+    }
+
+    private func releasePlanOperation() {
+        if planOperationWaiters.isEmpty {
+            planOperationIsLocked = false
+        } else {
+            planOperationWaiters.removeFirst().resume()
+        }
+    }
+
+    private static func planNotApprovedResult() -> NativeEditorMCPToolResult {
+        NativeEditorMCPToolResult(
+            value: .object([
+                "object": "error",
+                "code": "course_plan_not_approved",
+                "message": "The latest presented course plan has not been approved. Wait for explicit learner approval before changing native pages.",
+            ]),
+            isError: true
+        )
     }
 
     func changes() -> AsyncStream<CourseDocumentChange> {
@@ -635,6 +765,11 @@ actor CourseDocumentRepository {
         var status: String
     }
 
+    private struct TerminalAsyncTask: Sendable {
+        var descriptor: AsyncTaskDescriptor
+        var value: JSONValue
+    }
+
     private static func asyncTaskDescriptor(_ value: JSONValue) -> AsyncTaskDescriptor? {
         guard let object = value.objectValue,
               object["object"]?.stringValue == "async_task",
@@ -649,11 +784,35 @@ actor CourseDocumentRepository {
             asyncTaskMonitors.removeValue(forKey: task.id)?.cancel()
             latestSnapshots.removeAll()
             publish(pageID: nil, replacesDocument: true)
+            scheduleCloudSync()
         case "failed":
             asyncTaskMonitors.removeValue(forKey: task.id)?.cancel()
         default:
             startAsyncTaskMonitor(id: task.id)
         }
+    }
+
+    private func awaitAsyncTaskTerminal(id: String) async -> TerminalAsyncTask {
+        let service = self.service
+        return await Task.detached {
+            var pollDelay: Duration = .milliseconds(100)
+            while true {
+                do {
+                    let value = try await service.asyncTask(["task_id": .string(id)])
+                    if let descriptor = Self.asyncTaskDescriptor(value),
+                       descriptor.status == "succeeded" || descriptor.status == "failed" {
+                        return TerminalAsyncTask(descriptor: descriptor, value: value)
+                    }
+                    pollDelay = .milliseconds(100)
+                } catch {
+                    pollDelay = .milliseconds(500)
+                }
+                // Detached polling intentionally outlives cancellation of the
+                // Hermes request. Releasing the authorization lease while the
+                // native mutation can still commit would be unsafe.
+                try? await Task.sleep(for: pollDelay)
+            }
+        }.value
     }
 
     private func startAsyncTaskMonitor(id: String) {
@@ -703,7 +862,16 @@ actor CourseDocumentRepository {
             $0.type != "nbe/child_page" && $0.type != "nbe/page_reference"
         }
         let derivedStatus: CourseLearningNode.GenerationStatus
-        if let explicitStatus {
+        if kind == .folder, !children.isEmpty, explicitStatus != .generating {
+            let childStatuses = children.map(\.status)
+            if childStatuses.allSatisfy({ $0 == .generated }) {
+                derivedStatus = .generated
+            } else if childStatuses.allSatisfy({ $0 == .pendingGeneration }) {
+                derivedStatus = .pendingGeneration
+            } else {
+                derivedStatus = .partiallyGenerated
+            }
+        } else if let explicitStatus {
             derivedStatus = explicitStatus
         } else if !contentBlocks.isEmpty || !children.isEmpty {
             derivedStatus = .generated
@@ -1454,7 +1622,7 @@ final class CourseDocumentToolRouter: PlatformDynamicToolHandler, @unchecked Sen
 
         let semaphore = DispatchSemaphore(value: 0)
         let box = CourseToolResultBox()
-        let routingTask = Task {
+        Task {
             defer { semaphore.signal() }
             guard !Task.isCancelled else { return }
             let result = await CourseDocumentRegistry.shared.handle(
@@ -1471,13 +1639,11 @@ final class CourseDocumentToolRouter: PlatformDynamicToolHandler, @unchecked Sen
             box.store(encoded)
         }
 
-        guard semaphore.wait(timeout: .now() + 45) == .success else {
-            routingTask.cancel()
-            return AppPlatformDynamicToolResult(
-                success: false,
-                output: "The course document tool timed out. Its operation may still finish; fetch the current page state before deciding whether to retry."
-            )
-        }
+        // The callback boundary is synchronous, but returning a timeout while
+        // this task can still commit would turn an unknown outcome into a
+        // terminal failure and invite a duplicate retry. Wait for the native
+        // transaction's authoritative result instead.
+        semaphore.wait()
         return box.load()
     }
 }

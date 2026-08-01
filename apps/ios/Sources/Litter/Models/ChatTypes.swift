@@ -175,7 +175,6 @@ struct ChatImage: Identifiable, Equatable {
 }
 
 enum ConversationStatus: Equatable {
-    case idle
     case connecting
     case ready
     case thinking

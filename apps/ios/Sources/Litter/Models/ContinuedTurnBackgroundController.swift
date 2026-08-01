@@ -5,23 +5,54 @@ import Foundation
 protocol ContinuedTurnBackgroundControlling: AnyObject {
     var hasScheduledOrRunningTasks: Bool { get }
 
-    func beginUserInitiatedTurn(key: ThreadKey, title: String) -> UUID?
+    func beginUserInitiatedTurn(
+        key: ThreadKey,
+        title: String,
+        agentName: String,
+        keepsAliveAcrossTurns: Bool
+    ) -> UUID?
     func markTurnAccepted(_ token: UUID)
     func markTurnStartFailed(_ token: UUID)
+    func reuseMultiTurnSessionIfPresent(key: ThreadKey, agentName: String) -> UUID?
+    func finishMultiTurnSession(key: ThreadKey, success: Bool)
     func handleSnapshot(_ snapshot: AppSnapshotRecord?)
 }
 
 @available(iOS 26.0, *)
+protocol ContinuedProcessingTaskHandling: AnyObject {
+    var progress: Progress { get }
+    var expirationHandler: (() -> Void)? { get set }
+
+    func updateTitle(_ title: String, subtitle: String)
+    func setTaskCompleted(success: Bool)
+}
+
+@available(iOS 26.0, *)
+extension BGContinuedProcessingTask: ContinuedProcessingTaskHandling {}
+
+@available(iOS 26.0, *)
 protocol ContinuedProcessingTaskScheduling: AnyObject {
-    func register(identifier: String, handler: @escaping (BGTask) -> Void) -> Bool
+    func register(
+        identifier: String,
+        handler: @escaping (any ContinuedProcessingTaskHandling) -> Void
+    ) -> Bool
     func submit(_ request: BGTaskRequest) throws
     func cancel(identifier: String)
 }
 
 @available(iOS 26.0, *)
 extension BGTaskScheduler: ContinuedProcessingTaskScheduling {
-    func register(identifier: String, handler: @escaping (BGTask) -> Void) -> Bool {
-        register(forTaskWithIdentifier: identifier, using: nil, launchHandler: handler)
+    func register(
+        identifier: String,
+        handler: @escaping (any ContinuedProcessingTaskHandling) -> Void
+    ) -> Bool {
+        register(forTaskWithIdentifier: identifier, using: nil) { task in
+            guard let continuedTask = task as? BGContinuedProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            handler(continuedTask)
+        }
     }
 
     func cancel(identifier: String) {
@@ -46,20 +77,26 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
         let initialAssistantItemID: String?
         var accepted = false
         var observedActiveTurn = false
-        var backgroundTask: BGContinuedProcessingTask?
+        var backgroundTask: (any ContinuedProcessingTaskHandling)?
         var heartbeatTask: Task<Void, Never>?
         var lastProgressUpdate = Date.distantPast
+        var agentName: String
+        var keepsAliveAcrossTurns: Bool
 
         init(
             token: UUID,
             identifier: String,
             key: ThreadKey,
-            initialAssistantItemID: String?
+            initialAssistantItemID: String?,
+            agentName: String,
+            keepsAliveAcrossTurns: Bool
         ) {
             self.token = token
             self.identifier = identifier
             self.key = key
             self.initialAssistantItemID = initialAssistantItemID
+            self.agentName = agentName
+            self.keepsAliveAcrossTurns = keepsAliveAcrossTurns
         }
     }
 
@@ -92,8 +129,17 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
         self.onExpiration = onExpiration
     }
 
-    func beginUserInitiatedTurn(key: ThreadKey, title: String) -> UUID? {
-        if let existingToken = tokenByThreadKey[key], sessions[existingToken] != nil {
+    func beginUserInitiatedTurn(
+        key: ThreadKey,
+        title: String,
+        agentName: String,
+        keepsAliveAcrossTurns: Bool
+    ) -> UUID? {
+        if let existingToken = tokenByThreadKey[key],
+           let existing = sessions[existingToken] {
+            existing.agentName = agentName
+            existing.keepsAliveAcrossTurns = existing.keepsAliveAcrossTurns
+                || keepsAliveAcrossTurns
             return existingToken
         }
 
@@ -107,16 +153,14 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
             token: token,
             identifier: identifier,
             key: key,
-            initialAssistantItemID: initialAssistantItemID
+            initialAssistantItemID: initialAssistantItemID,
+            agentName: agentName,
+            keepsAliveAcrossTurns: keepsAliveAcrossTurns
         )
 
         let registered = scheduler.register(identifier: identifier) { [weak self] task in
-            guard let continuedTask = task as? BGContinuedProcessingTask else {
-                task.setTaskCompleted(success: false)
-                return
-            }
             Task { @MainActor [weak self] in
-                self?.activate(continuedTask, token: token)
+                self?.activate(task, token: token)
             }
         }
 
@@ -134,7 +178,7 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
 
         let request = BGContinuedProcessingTaskRequest(
             identifier: identifier,
-            title: "Codex is working",
+            title: "\(agentName) is working",
             subtitle: Self.taskSubtitle(title)
         )
         request.strategy = .queue
@@ -166,7 +210,23 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
     }
 
     func markTurnStartFailed(_ token: UUID) {
+        if sessions[token]?.keepsAliveAcrossTurns == true {
+            return
+        }
         finish(token: token, success: false)
+    }
+
+    func reuseMultiTurnSessionIfPresent(key: ThreadKey, agentName: String) -> UUID? {
+        guard let token = tokenByThreadKey[key], let session = sessions[token] else {
+            return nil
+        }
+        session.agentName = agentName
+        return token
+    }
+
+    func finishMultiTurnSession(key: ThreadKey, success: Bool) {
+        guard let token = tokenByThreadKey[key] else { return }
+        finish(token: token, success: success)
     }
 
     func handleSnapshot(_ snapshot: AppSnapshotRecord?) {
@@ -186,13 +246,14 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
                 && assistantItemID != nil
                 && assistantItemID != session.initialAssistantItemID
 
-            if session.observedActiveTurn || receivedNewAssistantOutput {
+            if !session.keepsAliveAcrossTurns
+                && (session.observedActiveTurn || receivedNewAssistantOutput) {
                 finish(token: session.token, success: true)
             }
         }
     }
 
-    private func activate(_ task: BGContinuedProcessingTask, token: UUID) {
+    private func activate(_ task: any ContinuedProcessingTaskHandling, token: UUID) {
         guard let session = sessions[token] else {
             task.setTaskCompleted(success: false)
             return
@@ -204,8 +265,7 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
         session.lastProgressUpdate = Date()
         updatePresentation(for: session, snapshot: snapshotProvider())
 
-        task.expirationHandler = { [weak self, weak task] in
-            guard task != nil else { return }
+        task.expirationHandler = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.expire(token: token)
             }
@@ -283,7 +343,7 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let subtitle = toolLabel.flatMap { $0.isEmpty ? nil : $0 }
             ?? Self.taskSubtitle(threadTitle)
-        task.updateTitle("Codex is working", subtitle: subtitle)
+        task.updateTitle("\(session.agentName) is working", subtitle: subtitle)
     }
 
     private func expire(token: UUID) {
@@ -308,7 +368,7 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
                 let finalUnit = max(1, task.progress.completedUnitCount + 1)
                 task.progress.totalUnitCount = finalUnit
                 task.progress.completedUnitCount = finalUnit
-                task.updateTitle("Codex finished", subtitle: "Your task is ready")
+                task.updateTitle("\(session.agentName) finished", subtitle: "Your task is ready")
             }
             task.expirationHandler = nil
             task.setTaskCompleted(success: success)

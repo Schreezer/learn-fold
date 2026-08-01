@@ -98,9 +98,14 @@ final class CourseExperienceStoreTests: XCTestCase {
             at: databaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try JSONEncoder().encode(brief).write(
+        let encodedBrief = try JSONEncoder().encode(brief)
+        try encodedBrief.write(
             to: databaseURL.deletingLastPathComponent()
-                .appendingPathComponent("approved-plan.json")
+                .appendingPathComponent(AppleCourseApprovalPolicy.presentedPlanFilename)
+        )
+        try encodedBrief.write(
+            to: databaseURL.deletingLastPathComponent()
+                .appendingPathComponent(AppleCourseApprovalPolicy.approvedPlanFilename)
         )
 
         let repository = try await CourseDocumentRegistry.shared.repository(
@@ -165,6 +170,100 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertEqual(store.courses.first?.id, "recovered-swift")
         XCTAssertEqual(store.courses.first?.workspaceID, workspaceID)
         XCTAssertNotNil(defaults.data(forKey: "snappy.course.savedCourses"))
+    }
+
+    func testColdHermesReadyWorkspaceReconcilesMetadataBeforePendingIdentityClears() async throws {
+        let defaults = try makeDefaults()
+        let workspaceID = "ready-hermes-\(UUID().uuidString.lowercased())"
+        let threadID = UUID().uuidString.lowercased()
+        var brief = CourseBrief()
+        brief.planID = "ready-hermes-plan"
+        brief.revision = 2
+        brief.title = "Recovered Hermes Course"
+        brief.summary = "Recovered after the ready database committed."
+        brief.estimatedDuration = "45 minutes"
+        let identity = PendingHermesCourseIdentity(
+            workspaceID: workspaceID,
+            serverID: "server-hermes",
+            threadID: threadID,
+            runtimeID: "hermes",
+            modelID: "hermes-model",
+            brief: brief,
+            showsBrief: false,
+            expectedTurnID: nil,
+            terminalError: nil
+        )
+        defaults.set(
+            try JSONEncoder().encode(identity),
+            forKey: CourseExperienceStore.pendingHermesCourseKey
+        )
+        let store = CourseExperienceStore(defaults: defaults)
+        let databaseURL = store.courseDatabaseURL(workspaceID: workspaceID)
+        let workspaceURL = databaseURL.deletingLastPathComponent().deletingLastPathComponent()
+        let coursesRoot = workspaceURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: workspaceURL) }
+        try FileManager.default.createDirectory(
+            at: databaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let encodedBrief = try JSONEncoder().encode(brief)
+        try encodedBrief.write(
+            to: databaseURL.deletingLastPathComponent()
+                .appendingPathComponent(AppleCourseApprovalPolicy.presentedPlanFilename)
+        )
+        try encodedBrief.write(
+            to: databaseURL.deletingLastPathComponent()
+                .appendingPathComponent(AppleCourseApprovalPolicy.approvedPlanFilename)
+        )
+        let repository = try await CourseDocumentRegistry.shared.repository(
+            workspaceID: workspaceID,
+            databaseURL: databaseURL,
+            rootTitle: brief.title
+        )
+        try await store.markCourseReadyForLearning(repository: repository, brief: brief)
+        let root = try await repository.rootPageSnapshot()
+        let generatedPage = await repository.callTool(
+            named: NativeEditorMCPToolCatalog.createPages,
+            argumentsJSON: try jsonString([
+                "parent": ["page_id": root.id],
+                "pages": [[
+                    "properties": [
+                        "title": "Recovered lesson",
+                        "course_node_id": "recovered-lesson",
+                        "course_role": "lesson",
+                        "generation_status": "generated",
+                    ],
+                    "content": "# Recovered lesson\nReady.",
+                ]],
+            ])
+        )
+        XCTAssertFalse(generatedPage.isError)
+
+        await store.recoverReadyCourses(in: coursesRoot)
+
+        let recovered = try XCTUnwrap(store.courses.first(where: {
+            $0.workspaceID == workspaceID
+        }))
+        XCTAssertEqual(recovered.agentServerID, "server-hermes")
+        XCTAssertEqual(recovered.agentThreadID, threadID)
+        XCTAssertEqual(recovered.agentRuntimeKind, "hermes")
+        XCTAssertEqual(recovered.agentModelID, "hermes-model")
+        XCTAssertEqual(store.navigationPath, [.course(recovered.id)])
+        XCTAssertNil(defaults.data(forKey: CourseExperienceStore.pendingHermesCourseKey))
+
+        // Simulate a second crash after persistCourses but before pending
+        // identity cleanup. The known workspace must still reconcile.
+        defaults.set(
+            try JSONEncoder().encode(identity),
+            forKey: CourseExperienceStore.pendingHermesCourseKey
+        )
+        let relaunched = CourseExperienceStore(defaults: defaults)
+        await relaunched.recoverReadyCourses(in: coursesRoot)
+        XCTAssertEqual(relaunched.navigationPath, [.course(recovered.id)])
+        XCTAssertNil(defaults.data(forKey: CourseExperienceStore.pendingHermesCourseKey))
+
+        relaunched.beginNewCourse()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspaceURL.path))
     }
 
     func testPrivateCloudComputeIsPreferredWhenBothAppleModesAreAvailable() throws {
@@ -675,7 +774,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
     }
 
-    func testAppleLiveSessionCallbacksRebindForApprovedTurn() throws {
+    func testAppleLiveSessionCallbacksRebindForApprovedTurn() async throws {
         guard #available(iOS 26.0, *) else { return }
 
         var firstPlanCount = 0
@@ -689,13 +788,13 @@ final class CourseExperienceStoreTests: XCTestCase {
         var plan = CourseBrief()
         plan.title = "Swift Concurrency"
 
-        try callbacks.presentCoursePlan(plan)
+        try await callbacks.presentCoursePlan(plan)
         callbacks.recordEditorMutationAttempt()
         callbacks.rebind(
             onCoursePlan: { _ in approvedPlanCount += 1 },
             onEditorMutationAttempt: { approvedMutationCount += 1 }
         )
-        try callbacks.presentCoursePlan(plan)
+        try await callbacks.presentCoursePlan(plan)
         callbacks.recordEditorMutationAttempt()
 
         XCTAssertEqual(firstPlanCount, 1)
@@ -1171,6 +1270,187 @@ final class CourseExperienceStoreTests: XCTestCase {
         })
     }
 
+    func testCourseMCPReturnsActionableErrorThenAcceptsCorrectedPlan() async throws {
+        let workspaceID = "mcp-plan-validation-\(UUID().uuidString)"
+        let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Apps/Courses/\(workspaceID)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let invalidRequest = JSONValue.object([
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": [
+                "name": .string(CourseAgentTools.presentPlan),
+                "arguments": [
+                    CourseAgentTools.workspaceIDArgument: .string(workspaceID),
+                    "plan_id": "swift-concurrency",
+                    "revision": 1,
+                    "title": "Swift Concurrency",
+                ],
+            ],
+        ])
+        let invalidResponse = await CourseMCPProtocol.handleJSONRPC(
+            body: try JSONEncoder().encode(invalidRequest)
+        )
+        let invalidBody = try XCTUnwrap(invalidResponse.body)
+        let invalidJSON = try JSONDecoder().decode(JSONValue.self, from: invalidBody)
+        let invalidResult = try XCTUnwrap(
+            invalidJSON.objectValue?["result"]?.objectValue
+        )
+        let invalidMessage = try XCTUnwrap(
+            invalidResult["structuredContent"]?.objectValue?["error"]?.stringValue
+        )
+
+        XCTAssertEqual(invalidResult["isError"]?.boolValue, true)
+        XCTAssertTrue(invalidMessage.contains("required field 'summary' is missing"))
+        XCTAssertTrue(invalidMessage.contains("call present_course_plan again"))
+        XCTAssertTrue(invalidMessage.contains("Do not ask the learner to approve"))
+
+        let correctedRequest = JSONValue.object([
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": [
+                "name": .string(CourseAgentTools.presentPlan),
+                "arguments": [
+                    CourseAgentTools.workspaceIDArgument: .string(workspaceID),
+                    "plan_id": "swift-concurrency",
+                    "revision": 1,
+                    "title": "Swift Concurrency",
+                    "summary": "Learn concurrency by building a small app.",
+                    "outcome": "Use tasks, actors, and cancellation safely.",
+                    "starting_point": "Comfortable with basic Swift.",
+                    "focus_gap": "Reasoning about isolation and cancellation.",
+                    "estimated_duration": "3h 30m",
+                    "chapters": .array([
+                        [
+                            "id": "tasks",
+                            "title": "Tasks",
+                            "objective": "Understand structured task lifetimes.",
+                            "deliverables": ["lesson", "exercise"],
+                        ]
+                    ]),
+                ],
+            ],
+        ])
+        let correctedResponse = await CourseMCPProtocol.handleJSONRPC(
+            body: try JSONEncoder().encode(correctedRequest)
+        )
+        let correctedBody = try XCTUnwrap(correctedResponse.body)
+        let correctedJSON = try JSONDecoder().decode(JSONValue.self, from: correctedBody)
+        let correctedResult = try XCTUnwrap(
+            correctedJSON.objectValue?["result"]?.objectValue
+        )
+
+        XCTAssertEqual(correctedResult["isError"]?.boolValue, false)
+        XCTAssertEqual(
+            correctedResult["structuredContent"]?.objectValue?["plan_id"]?.stringValue,
+            "swift-concurrency"
+        )
+    }
+
+    func testCourseMCPPlanErrorIdentifiesInvalidNestedField() async throws {
+        let workspaceID = "mcp-plan-nested-\(UUID().uuidString)"
+        let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Apps/Courses/\(workspaceID)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let request = JSONValue.object([
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": [
+                "name": .string(CourseAgentTools.presentPlan),
+                "arguments": [
+                    CourseAgentTools.workspaceIDArgument: .string(workspaceID),
+                    "plan_id": "swift-concurrency",
+                    "revision": 1,
+                    "title": "Swift Concurrency",
+                    "summary": "Learn concurrency by building a small app.",
+                    "outcome": "Use tasks safely.",
+                    "starting_point": "Comfortable with basic Swift.",
+                    "focus_gap": "Reasoning about isolation.",
+                    "estimated_duration": "3h 30m",
+                    "chapters": .array([
+                        [
+                            "id": "tasks",
+                            "title": "Tasks",
+                            "objective": "Understand structured task lifetimes.",
+                            "deliverables": "lesson",
+                        ]
+                    ]),
+                ],
+            ],
+        ])
+        let response = await CourseMCPProtocol.handleJSONRPC(
+            body: try JSONEncoder().encode(request)
+        )
+        let body = try XCTUnwrap(response.body)
+        let decoded = try JSONDecoder().decode(JSONValue.self, from: body)
+        let result = try XCTUnwrap(decoded.objectValue?["result"]?.objectValue)
+        let message = try XCTUnwrap(
+            result["structuredContent"]?.objectValue?["error"]?.stringValue
+        )
+
+        XCTAssertEqual(result["isError"]?.boolValue, true)
+        XCTAssertTrue(message.contains("field 'chapters[0].deliverables' has the wrong type"))
+        XCTAssertTrue(message.contains("call present_course_plan again"))
+    }
+
+    func testCourseMCPRejectsSemanticallyEmptyPlanContent() async throws {
+        let workspaceID = "mcp-plan-semantic-\(UUID().uuidString)"
+        let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Apps/Courses/\(workspaceID)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let request = JSONValue.object([
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": [
+                "name": .string(CourseAgentTools.presentPlan),
+                "arguments": [
+                    CourseAgentTools.workspaceIDArgument: .string(workspaceID),
+                    "plan_id": "swift-concurrency",
+                    "revision": 1,
+                    "title": "Swift Concurrency",
+                    "summary": "Learn concurrency by building a small app.",
+                    "outcome": "Use tasks safely.",
+                    "starting_point": "Comfortable with basic Swift.",
+                    "focus_gap": "Reasoning about isolation.",
+                    "estimated_duration": "3h 30m",
+                    "chapters": .array([
+                        [
+                            "id": "tasks",
+                            "title": "Tasks",
+                            "objective": "Understand structured task lifetimes.",
+                            "deliverables": ["   "],
+                        ]
+                    ]),
+                ],
+            ],
+        ])
+        let response = await CourseMCPProtocol.handleJSONRPC(
+            body: try JSONEncoder().encode(request)
+        )
+        let body = try XCTUnwrap(response.body)
+        let decoded = try JSONDecoder().decode(JSONValue.self, from: body)
+        let result = try XCTUnwrap(decoded.objectValue?["result"]?.objectValue)
+        let message = try XCTUnwrap(
+            result["structuredContent"]?.objectValue?["error"]?.stringValue
+        )
+
+        XCTAssertEqual(result["isError"]?.boolValue, true)
+        XCTAssertTrue(
+            message.contains("field 'chapters[0].deliverables[0]' must be a non-empty string")
+        )
+        XCTAssertTrue(message.contains("call present_course_plan again"))
+    }
+
     func testCourseMCPRejectsPageMutationBeforePlanApproval() async throws {
         let workspaceID = "mcp-approval-\(UUID().uuidString)"
         let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -1204,33 +1484,75 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
     }
 
-    func testCourseChatUsesLiveThreadInsteadOfDuplicatingLocalTranscript() {
-        let learner = CourseChatMessage(role: .learner, text: "Swift concurrency")
-        let completedPreview = CourseChatMessage(role: .agent, text: "Let’s start with tasks.")
+    func testCourseChatPartialLiveSnapshotCannotEraseLocalTranscript() {
+        let firstLearner = CourseChatMessage(role: .learner, text: "Explain actors.")
+        let firstAgent = CourseChatMessage(role: .agent, text: "Actors protect isolated state.")
+        let latestLearner = CourseChatMessage(role: .learner, text: "What about reentrancy?")
+        let partialLiveItems = [
+            ConversationItem(
+                id: "remote-latest-user",
+                content: .user(
+                    ConversationUserMessageData(
+                        text: "What about reentrancy?",
+                        images: []
+                    )
+                )
+            )
+        ]
 
-        let beforeThread = CourseChatTimelinePolicy.localMessages(
-            [learner],
-            hasLiveThread: false
-        )
-        let afterThread = CourseChatTimelinePolicy.localMessages(
-            [learner, completedPreview],
-            hasLiveThread: true
+        let merged = CourseChatTimelinePolicy.mergedConversationItems(
+            localMessages: [firstLearner, firstAgent, latestLearner],
+            liveItems: partialLiveItems
         )
 
-        XCTAssertEqual(beforeThread.map(\.id), [learner.id])
-        XCTAssertTrue(afterThread.isEmpty)
+        XCTAssertEqual(messageTexts(in: merged), [
+            "Explain actors.",
+            "Actors protect isolated state.",
+            "What about reentrancy?",
+        ])
+        XCTAssertEqual(merged.count, 3)
+        XCTAssertEqual(
+            merged.last?.id,
+            "course-local-\(latestLearner.id.uuidString.lowercased())"
+        )
     }
 
-    func testCourseChatKeepsOptimisticMessageUntilLiveItemsAreVisible() {
+    func testCourseChatCanonicalItemsReplaceMatchingFallbacksWithStableIDs() {
         let learner = CourseChatMessage(role: .learner, text: "Why does await yield?")
+        let agent = CourseChatMessage(role: .agent, text: "It suspends the current task.")
+        let liveItems = [
+            ConversationItem(
+                id: "remote-user",
+                content: .user(
+                    ConversationUserMessageData(text: learner.text, images: [])
+                )
+            ),
+            ConversationItem(
+                id: "remote-agent",
+                content: .assistant(
+                    ConversationAssistantMessageData(
+                        text: "It suspends the current task. More detail follows.",
+                        agentNickname: nil,
+                        agentRole: nil,
+                        phase: nil
+                    )
+                )
+            ),
+        ]
 
-        XCTAssertEqual(
-            CourseChatTimelinePolicy.localMessages(
-                [learner],
-                hasLiveThread: false
-            ).map(\.id),
-            [learner.id]
+        let merged = CourseChatTimelinePolicy.mergedConversationItems(
+            localMessages: [learner, agent],
+            liveItems: liveItems
         )
+
+        XCTAssertEqual(merged.map(\.id), [
+            "course-local-\(learner.id.uuidString.lowercased())",
+            "course-local-\(agent.id.uuidString.lowercased())",
+        ])
+        XCTAssertEqual(messageTexts(in: merged), [
+            "Why does await yield?",
+            "It suspends the current task. More detail follows.",
+        ])
     }
 
     func testSelectionDiscussionRoundTripsItsAnchorAndThread() throws {
@@ -1309,6 +1631,63 @@ final class CourseExperienceStoreTests: XCTestCase {
             requestPending: false,
             threadHasActiveTurn: false
         ))
+        XCTAssertFalse(CourseChatTimelinePolicy.isAgentWorking(
+            requestPending: false,
+            threadHasActiveTurn: true,
+            usesDurableHermesLifecycle: true,
+            durableHermesRecoveryPending: false
+        ))
+        XCTAssertTrue(CourseChatTimelinePolicy.isAgentWorking(
+            requestPending: false,
+            threadHasActiveTurn: false,
+            usesDurableHermesLifecycle: true,
+            durableHermesRecoveryPending: true
+        ))
+    }
+
+    func testCourseChatRunRegistryScopesMainAndSelectionIndependently() throws {
+        var registry = CourseChatRunRegistry()
+        let discussionID = UUID()
+        let mainToken = try XCTUnwrap(registry.begin(.main))
+        let discussionToken = try XCTUnwrap(registry.begin(.selection(discussionID)))
+
+        XCTAssertEqual(registry.phase(for: .main), .submitting)
+        XCTAssertEqual(registry.phase(for: .selection(discussionID)), .submitting)
+        XCTAssertTrue(registry.transition(.main, token: mainToken, to: .running))
+        XCTAssertTrue(registry.finish(.selection(discussionID), token: discussionToken))
+
+        XCTAssertEqual(registry.phase(for: .main), .running)
+        XCTAssertEqual(registry.phase(for: .selection(discussionID)), .idle)
+        XCTAssertTrue(registry.hasActiveRun)
+    }
+
+    func testCourseChatRunRegistryRejectsStaleCompletionAfterRetry() throws {
+        var registry = CourseChatRunRegistry()
+        let firstToken = try XCTUnwrap(registry.begin(.main))
+        XCTAssertTrue(registry.transition(
+            .main,
+            token: firstToken,
+            to: .failed("Network failed")
+        ))
+        let retryToken = try XCTUnwrap(registry.begin(.main))
+
+        XCTAssertFalse(registry.finish(.main, token: firstToken))
+        XCTAssertEqual(registry.token(for: .main), retryToken)
+        XCTAssertEqual(registry.phase(for: .main), .submitting)
+    }
+
+    func testCourseChatRunRegistryStopFailureIsTerminalNotPending() throws {
+        var registry = CourseChatRunRegistry()
+        _ = try XCTUnwrap(registry.begin(.main))
+        let stopToken = registry.beginStopping(.main)
+
+        XCTAssertTrue(registry.transition(
+            .main,
+            token: stopToken,
+            to: .failed("Interrupt failed")
+        ))
+        XCTAssertFalse(registry.phase(for: .main).isWorking)
+        XCTAssertFalse(registry.hasActiveRun)
     }
 
     func testCourseAgentHydrationTimeoutDoesNotWarnWhileTurnIsStillActive() {
@@ -1323,6 +1702,25 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(CourseAgentHydrationPolicy.shouldSurfaceTimeoutError(
             summaryHasActiveTurn: false,
             threadHasActiveTurn: false
+        ))
+    }
+
+    func testRemoteHermesIdlePolicyUsesAuthoritativeTurnsWhenSnapshotIsMissingOrStale() {
+        XCTAssertTrue(RemoteHermesThreadIdlePolicy.isIdle(
+            localHasActiveTurn: nil,
+            authoritativeTurns: []
+        ))
+        XCTAssertTrue(RemoteHermesThreadIdlePolicy.isIdle(
+            localHasActiveTurn: true,
+            authoritativeTurns: [
+                AppTurnState(turnId: "done", status: .completed, errorMessage: nil)
+            ]
+        ))
+        XCTAssertFalse(RemoteHermesThreadIdlePolicy.isIdle(
+            localHasActiveTurn: nil,
+            authoritativeTurns: [
+                AppTurnState(turnId: "running", status: .inProgress, errorMessage: nil)
+            ]
         ))
     }
 
@@ -1474,8 +1872,11 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(instructions.contains("MUST assess the learner"))
         XCTAssertTrue(instructions.contains("at least one diagnostic question"))
         XCTAssertTrue(instructions.contains("full learning content ONLY for Chapter 1"))
-        XCTAssertTrue(instructions.contains("complete ordered chapter and subchapter page hierarchy"))
+        XCTAssertTrue(instructions.contains("complete ordered chapter, subchapter, and lesson page hierarchy"))
+        XCTAssertTrue(instructions.contains("must exist as its own clearly titled native page"))
         XCTAssertTrue(instructions.contains("pending_generation"))
+        XCTAssertTrue(instructions.contains("Folder status is a strict roll-up"))
+        XCTAssertTrue(instructions.contains("Never leave a folder `pending_generation` when all of its children are generated"))
         XCTAssertTrue(instructions.contains("bootstrap_status` to `ready_for_learning`"))
         XCTAssertTrue(instructions.contains("mark only that page `generating`"))
         XCTAssertTrue(instructions.contains("A selected-passage question"))
@@ -1485,6 +1886,161 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(instructions.contains("Do not edit merely because editing tools are available"))
         XCTAssertTrue(instructions.contains("expected_revision"))
         XCTAssertTrue(instructions.contains("Never create Markdown lesson files"))
+    }
+
+    func testAppleInstructionsRequireVisiblePendingHierarchyAndFolderRollup() {
+        let instructions = SystemAppleCourseAgentRuntime.courseHierarchyInstructions
+
+        XCTAssertTrue(instructions.contains("own clearly titled native page"))
+        XCTAssertTrue(instructions.contains("pending_generation when every child is pending"))
+        XCTAssertTrue(instructions.contains("partially_generated when child states are mixed"))
+        XCTAssertTrue(instructions.contains("never leave a folder pending_generation"))
+    }
+
+    func testAppleCourseShellCreatesEveryPlannedLessonTitleBeforeGeneration() async throws {
+        let defaults = try makeDefaults()
+        let coursesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppleCourseShellTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: coursesRoot) }
+        let workspaceID = UUID().uuidString.lowercased()
+        let store = CourseExperienceStore(
+            defaults: defaults,
+            environment: ["SNAPPY_SKIP_AGENT_SETUP": "1"],
+            coursesRootURL: coursesRoot
+        )
+        var plan = CourseBrief()
+        plan.planID = "visible-apple-outline"
+        plan.revision = 1
+        plan.title = "Visible Apple Outline"
+        plan.chapters = [
+            CourseChapter(
+                id: "foundations",
+                title: "Foundations",
+                objective: "Build the foundation.",
+                deliverables: ["Core idea", "Guided exercise"]
+            ),
+            CourseChapter(
+                id: "application",
+                title: "Application",
+                objective: "Apply the idea.",
+                deliverables: ["Worked example", "Independent practice"]
+            ),
+        ]
+        let metadataDirectory = store.courseDatabaseURL(workspaceID: workspaceID)
+            .deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: metadataDirectory,
+            withIntermediateDirectories: true
+        )
+        let planData = try JSONEncoder().encode(plan)
+        try planData.write(
+            to: metadataDirectory.appendingPathComponent(
+                AppleCourseApprovalPolicy.presentedPlanFilename
+            )
+        )
+        try planData.write(
+            to: metadataDirectory.appendingPathComponent(
+                AppleCourseApprovalPolicy.approvedPlanFilename
+            )
+        )
+
+        let target = try await store.prepareApprovedCourseShell(
+            brief: plan,
+            workspaceID: workspaceID
+        )
+        let repository = try await store.documentRepository(
+            for: LearningCourse(
+                id: plan.planID,
+                title: plan.title,
+                subtitle: "",
+                accentHex: "000000",
+                progress: 0,
+                lessonCount: 4,
+                duration: "Adaptive",
+                status: .ready,
+                workspaceID: workspaceID
+            )
+        )
+        let outline = try await repository.outline()
+
+        XCTAssertEqual(target.nodeID, "foundations-lesson-1")
+        XCTAssertEqual(outline.learningPages.map(\.status), [.pendingGeneration, .pendingGeneration])
+        XCTAssertEqual(
+            outline.learningPages[0].children.map(\.title),
+            ["1.1 · Core idea", "1.2 · Guided exercise"]
+        )
+        XCTAssertEqual(
+            outline.learningPages[1].children.map(\.title),
+            ["2.1 · Worked example", "2.2 · Independent practice"]
+        )
+        XCTAssertTrue(
+            outline.learningPages
+                .flatMap(\.children)
+                .allSatisfy { $0.status == .pendingGeneration }
+        )
+
+        let laterLesson = outline.learningPages[1].children[1]
+        try await store.persistAppleGenerationTarget(
+            for: laterLesson,
+            workspaceID: workspaceID
+        )
+        let persistedTargetData = try Data(contentsOf: metadataDirectory.appendingPathComponent(
+            AppleCourseApprovalPolicy.lessonTargetFilename
+        ))
+        let persistedTarget = try JSONDecoder().decode(
+            PreparedCourseLessonTarget.self,
+            from: persistedTargetData
+        )
+        XCTAssertEqual(persistedTarget.nodeID, "application-lesson-2")
+        XCTAssertEqual(persistedTarget.pageID, laterLesson.pageID)
+        XCTAssertNotEqual(persistedTarget.pageID, target.pageID)
+    }
+
+    @MainActor
+    func testGenerationControlsUseTitledLeafPagesAndDoNotOfferAppleFolderGeneration() {
+        let pendingLesson = CourseLearningNode(
+            id: "lesson-2",
+            title: "1.2 · Guided exercise",
+            kind: .markdown,
+            status: .pendingGeneration,
+            pageID: "page-lesson-2"
+        )
+        let pendingChapter = CourseLearningNode(
+            id: "chapter-1",
+            title: "Foundations",
+            kind: .folder,
+            status: .pendingGeneration,
+            pageID: "page-chapter-1",
+            children: [pendingLesson]
+        )
+        let legacyEmptyChapter = CourseLearningNode(
+            id: "legacy-chapter",
+            title: "Legacy chapter",
+            kind: .folder,
+            status: .pendingGeneration,
+            pageID: "page-legacy-chapter"
+        )
+
+        XCTAssertTrue(CourseExperienceStore.allowsDirectGeneration(
+            of: pendingLesson,
+            runtimeID: CourseAgentProvider.appleOnDevice
+        ))
+        XCTAssertFalse(CourseExperienceStore.allowsDirectGeneration(
+            of: pendingChapter,
+            runtimeID: CourseAgentProvider.appleOnDevice
+        ))
+        XCTAssertTrue(CourseExperienceStore.allowsDirectGeneration(
+            of: pendingChapter,
+            runtimeID: CourseAgentProvider.codex
+        ))
+        XCTAssertFalse(CourseExperienceStore.allowsDirectGeneration(
+            of: legacyEmptyChapter,
+            runtimeID: CourseAgentProvider.applePrivateCloud
+        ))
+        XCTAssertTrue(CourseExperienceStore.allowsDirectGeneration(
+            of: legacyEmptyChapter,
+            runtimeID: CourseAgentProvider.codex
+        ))
     }
 
     func testSelectedCoursePassageBecomesBoundedUntrustedAgentContext() throws {
@@ -1535,7 +2091,8 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(prompt.contains("work autonomously without asking for confirmation"))
         XCTAssertTrue(prompt.contains("Mark only this page generating"))
         XCTAssertTrue(prompt.contains("mark completed pages generated"))
-        XCTAssertTrue(prompt.contains("generated or partially_generated"))
+        XCTAssertTrue(prompt.contains("titled native page for every planned child"))
+        XCTAssertTrue(prompt.contains("never leave a folder pending_generation when all of its children are generated"))
         XCTAssertTrue(prompt.contains("Never generate siblings or later sections"))
     }
 
@@ -1665,6 +2222,29 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertEqual(decoded.appleSessionID, appleSessionID)
     }
 
+    func testPersistedCourseThreadIsImmediatelyRestorableAfterRelaunch() throws {
+        let threadID = UUID().uuidString.lowercased()
+        let course = LearningCourse(
+            id: "swift-concurrency",
+            title: "Swift Concurrency",
+            subtitle: "Tasks to actors",
+            accentHex: "1F6FEB",
+            progress: 0,
+            lessonCount: 4,
+            duration: "Adaptive",
+            status: .ready,
+            workspaceID: "workspace-1",
+            agentServerID: "personal-claw",
+            agentThreadID: threadID,
+            agentRuntimeKind: "hermes"
+        )
+
+        XCTAssertEqual(
+            CourseExperienceStore.persistedAgentThreadKey(for: course),
+            ThreadKey(serverId: "personal-claw", threadId: threadID)
+        )
+    }
+
     func testCourseAgentCatalogCombinesLitterRegistryWithRuntimeAvailability() {
         let runtimes = [
             AgentRuntimeInfo(kind: "codex", name: "codex", displayName: "Codex", available: true),
@@ -1683,20 +2263,14 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertEqual(catalog.first(where: { $0.id == "future-agent" })?.available, true)
     }
 
-    func testRemoteCourseToolCallParsesNestedArgumentsAndKeepsVisibleIntroduction() throws {
+    func testRemoteCourseToolCallRequiresOneBareAllowlistedEnvelope() throws {
         let response = """
-        I have enough context to propose the course.
-        ```json
         {"learnfold_tool_call":{"name":"present_course_plan","arguments":{"workspace_id":"workspace-1","plan_id":"swift-actors","revision":1,"title":"Swift Actors","chapters":[{"id":"one","title":"Foundations","objective":"Understand { isolation }","deliverables":[]}]}}}
-        ```
         """
 
         let call = try XCTUnwrap(CourseExperienceStore.remoteCourseToolCall(from: response))
         XCTAssertEqual(call.name, "present_course_plan")
-        XCTAssertEqual(
-            call.visibleText,
-            "I have enough context to propose the course."
-        )
+        XCTAssertEqual(call.visibleText, "")
         let arguments = try XCTUnwrap(
             JSONSerialization.jsonObject(
                 with: try XCTUnwrap(call.argumentsJSON.data(using: .utf8))
@@ -1704,19 +2278,886 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
         XCTAssertEqual(arguments["workspace_id"] as? String, "workspace-1")
         XCTAssertEqual(arguments["plan_id"] as? String, "swift-actors")
+
+        XCTAssertNil(CourseExperienceStore.remoteCourseToolCall(from: "Introduction\n\(response)"))
+        XCTAssertNil(CourseExperienceStore.remoteCourseToolCall(from: "```json\n\(response)\n```"))
+        XCTAssertTrue(
+            CourseExperienceStore.looksLikeMalformedRemoteCourseToolEnvelope(
+                "Introduction\n\(response)"
+            )
+        )
+        XCTAssertTrue(
+            CourseExperienceStore.looksLikeMalformedRemoteCourseToolEnvelope(
+                "```json\n\(response)\n```"
+            )
+        )
+
+        let updateWithFencedMarkdown = ##"{"learnfold_tool_call":{"name":"native-editor-update-page","arguments":{"workspace_id":"workspace-1","page_id":"page-1","command":"replace_content","new_str":"# Example\n```swift\nprint(\"blue\")\n```"}}}"##
+        let updateCall = try XCTUnwrap(
+            CourseExperienceStore.remoteCourseToolCall(from: updateWithFencedMarkdown)
+        )
+        XCTAssertEqual(updateCall.name, "native-editor-update-page")
+        XCTAssertTrue(updateCall.argumentsJSON.contains("```swift"))
+
+        XCTAssertNil(CourseExperienceStore.remoteCourseToolCall(
+            from: #"{"learnfold_tool_call":{"name":"shell_command","arguments":{}}}"#
+        ))
+        XCTAssertNil(CourseExperienceStore.remoteCourseToolCall(
+            from: #"{"learnfold_tool_call":{"name":"present_course_plan","arguments":{}},"extra":true}"#
+        ))
     }
 
     func testRemoteCourseToolCallRejectsMalformedEnvelope() {
-        XCTAssertNil(
-            CourseExperienceStore.remoteCourseToolCall(
-                from: #"{"learnfold_tool_call":{"name":"native-editor-fetch"}}"#
-            )
+        let missingArguments = #"{"learnfold_tool_call":{"name":"native-editor-fetch"}}"#
+        XCTAssertNil(CourseExperienceStore.remoteCourseToolCall(from: missingArguments))
+        XCTAssertTrue(
+            CourseExperienceStore.looksLikeMalformedRemoteCourseToolEnvelope(missingArguments)
+        )
+        let missingClosingBrace = #"{"learnfold_tool_call":{"name":"native-editor-update-page","arguments":{"workspace_id":"workspace-1","page_id":"page-1","command":"update_content","expected_revision":1,"content_updates":[],"properties":{"generation_status":"generated"}}}"#
+        XCTAssertNil(CourseExperienceStore.remoteCourseToolCall(from: missingClosingBrace))
+        XCTAssertTrue(
+            CourseExperienceStore.looksLikeMalformedRemoteCourseToolEnvelope(missingClosingBrace)
         )
         XCTAssertNil(
             CourseExperienceStore.remoteCourseToolCall(
                 from: #"{"tool_call":{"name":"native-editor-fetch","arguments":{}}}"#
             )
         )
+        XCTAssertFalse(
+            CourseExperienceStore.looksLikeMalformedRemoteCourseToolEnvelope(
+                #"{"tool_call":{"name":"native-editor-fetch","arguments":{}}}"#
+            )
+        )
+        XCTAssertFalse(
+            CourseExperienceStore.looksLikeMalformedRemoteCourseToolEnvelope(
+                "Hermes finished the lesson without requesting another tool."
+            )
+        )
+    }
+
+    func testRemoteHermesToolResultCorrelatesLocalResultToWorkspaceAndSourceTurn() throws {
+        let call = RemoteCourseToolCall(
+            name: "native-editor-fetch",
+            argumentsJSON: #"{"workspace_id":"workspace-1","page_id":"page-1"}"#,
+            visibleText: ""
+        )
+        let prompt = try CourseExperienceStore.remoteHermesToolResultPrompt(
+            call: call,
+            result: AppPlatformDynamicToolResult(
+                success: true,
+                output: #"{"object":"page","id":"page-1","revision":7}"#
+            ),
+            workspaceID: "workspace-1",
+            sourceTurnID: "turn-tool-call",
+            callID: "call-native-fetch"
+        )
+        let envelope = try XCTUnwrap(prompt.split(separator: "\n").first)
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(envelope.utf8)) as? [String: Any]
+        )
+        let result = try XCTUnwrap(root["learnfold_tool_result"] as? [String: Any])
+
+        XCTAssertEqual(result["name"] as? String, "native-editor-fetch")
+        XCTAssertEqual(result["workspace_id"] as? String, "workspace-1")
+        XCTAssertEqual(result["source_turn_id"] as? String, "turn-tool-call")
+        XCTAssertEqual(result["call_id"] as? String, "call-native-fetch")
+        XCTAssertEqual(result["executed_on"] as? String, "mobile_device")
+        XCTAssertEqual(result["success"] as? Bool, true)
+        XCTAssertEqual(
+            result["output"] as? String,
+            #"{"object":"page","id":"page-1","revision":7}"#
+        )
+    }
+
+    func testRemoteHermesPresentedPlanResultPausesForLearnerApproval() throws {
+        let prompt = try CourseExperienceStore.remoteHermesToolResultPrompt(
+            call: RemoteCourseToolCall(
+                name: CourseAgentTools.presentPlan,
+                argumentsJSON: #"{"workspace_id":"workspace-1"}"#,
+                visibleText: ""
+            ),
+            result: AppPlatformDynamicToolResult(
+                success: true,
+                output: "Learnfold displayed the plan."
+            ),
+            workspaceID: "workspace-1",
+            sourceTurnID: "turn-plan",
+            callID: "call-present-plan"
+        )
+        let envelope = try XCTUnwrap(prompt.split(separator: "\n").first)
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(envelope.utf8)) as? [String: Any]
+        )
+        let result = try XCTUnwrap(root["learnfold_tool_result"] as? [String: Any])
+
+        XCTAssertEqual(result["approval_status"] as? String, "pending")
+        XCTAssertTrue(prompt.contains("Do not call another course tool"))
+    }
+
+    func testRemoteHermesDeveloperInstructionsFitBridgeLimitAndPersistDeviceBoundary() throws {
+        let instructions = try CourseExperienceStore.remoteHermesDeveloperInstructions(
+            workspaceID: "workspace-contract"
+        )
+
+        XCTAssertLessThanOrEqual(instructions.lengthOfBytes(using: .utf8), 60 * 1024)
+        for required in [
+            "learnfold_tool_call",
+            "executed_on",
+            "mobile_device",
+            "workspace_id",
+            "workspace-contract",
+            "Available Learnfold tools",
+            "untrusted data",
+            "Never use VPS filesystem",
+        ] {
+            XCTAssertTrue(instructions.contains(required), "Missing \(required)")
+        }
+    }
+
+    func testOversizedHermesMutationReceiptNeverReportsCommittedWorkAsFailed() throws {
+        let oversized = String(repeating: "x", count: 61 * 1024)
+        let mutationPrompt = try CourseExperienceStore.remoteHermesToolResultPrompt(
+            call: RemoteCourseToolCall(
+                name: NativeEditorMCPToolCatalog.updatePage,
+                argumentsJSON: #"{"workspace_id":"workspace-1"}"#,
+                visibleText: ""
+            ),
+            result: AppPlatformDynamicToolResult(success: true, output: oversized),
+            workspaceID: "workspace-1",
+            sourceTurnID: "turn-mutation",
+            callID: "call-mutation"
+        )
+        let mutationEnvelope = try XCTUnwrap(mutationPrompt.split(separator: "\n").first)
+        let mutationRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(mutationEnvelope.utf8)) as? [String: Any]
+        )
+        let mutationResult = try XCTUnwrap(
+            mutationRoot["learnfold_tool_result"] as? [String: Any]
+        )
+        XCTAssertEqual(mutationResult["success"] as? Bool, true)
+        XCTAssertTrue((mutationResult["output"] as? String)?.contains("Do not retry") == true)
+
+        let readPrompt = try CourseExperienceStore.remoteHermesToolResultPrompt(
+            call: RemoteCourseToolCall(
+                name: NativeEditorMCPToolCatalog.fetch,
+                argumentsJSON: #"{"workspace_id":"workspace-1"}"#,
+                visibleText: ""
+            ),
+            result: AppPlatformDynamicToolResult(success: true, output: oversized),
+            workspaceID: "workspace-1",
+            sourceTurnID: "turn-read",
+            callID: "call-read"
+        )
+        let readEnvelope = try XCTUnwrap(readPrompt.split(separator: "\n").first)
+        let readRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(readEnvelope.utf8)) as? [String: Any]
+        )
+        let readResult = try XCTUnwrap(readRoot["learnfold_tool_result"] as? [String: Any])
+        XCTAssertEqual(readResult["success"] as? Bool, false)
+        XCTAssertTrue((readResult["output"] as? String)?.contains("narrower read") == true)
+    }
+
+    func testHermesCourseTurnsUseSupportedSandboxAndRejectRichAttachmentsUpFront() {
+        XCTAssertEqual(
+            CourseExperienceStore.courseTurnSandboxPolicy(runtimeID: "hermes"),
+            TurnSandboxPolicy.dangerFullAccess.ffiValue
+        )
+        XCTAssertEqual(
+            CourseExperienceStore.courseTurnSandboxPolicy(runtimeID: "codex"),
+            TurnSandboxPolicy.workspaceWrite.ffiValue
+        )
+        let image = CourseSource(
+            name: "diagram.png",
+            detail: "image",
+            kind: .image,
+            runtimePath: "/tmp/diagram.png",
+            image: nil
+        )
+        XCTAssertNotNil(
+            CourseExperienceStore.unsupportedHermesSourceMessage(
+                runtimeID: "hermes",
+                sources: [image]
+            )
+        )
+        XCTAssertNil(
+            CourseExperienceStore.unsupportedHermesSourceMessage(
+                runtimeID: "codex",
+                sources: [image]
+            )
+        )
+        XCTAssertNil(
+            CourseExperienceStore.unsupportedHermesSourceMessage(
+                runtimeID: "hermes",
+                sources: [
+                    CourseSource(
+                        name: "https://example.com/course",
+                        detail: "link",
+                        kind: .link,
+                        runtimePath: nil,
+                        image: nil
+                    )
+                ]
+            )
+        )
+    }
+
+    func testRemoteHermesToolJournalPersistsExactExecutionAndResultTurnIdentity() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = RemoteHermesToolJournal(
+            fileURL: directory.appendingPathComponent("remote-hermes-tool-journal.json")
+        )
+        var entry = RemoteHermesToolJournalEntry(
+            id: "call-1",
+            workspaceID: "workspace-1",
+            threadID: "thread-1",
+            sourceTurnID: "turn-tool-call",
+            toolName: "native-editor-patch",
+            argumentsJSON: #"{"workspace_id":"workspace-1","page_id":"page-1"}"#,
+            selectionDiscussionID: nil,
+            phase: .executing,
+            success: nil,
+            output: nil,
+            resultTurnID: nil,
+            updatedAt: Date(timeIntervalSince1970: 1)
+        )
+        try journal.save(entry)
+
+        XCTAssertEqual(try journal.pendingEntry(), entry)
+        entry.phase = .executed
+        entry.success = true
+        entry.output = #"{"revision":8}"#
+        entry.updatedAt = Date(timeIntervalSince1970: 2)
+        try journal.save(entry)
+
+        entry.phase = .resultSubmitting
+        entry.updatedAt = Date(timeIntervalSince1970: 3)
+        try journal.save(entry)
+        XCTAssertEqual(try journal.pendingEntry()?.phase, .resultSubmitting)
+
+        entry.phase = .resultSubmitted
+        entry.resultTurnID = "turn-result-accepted"
+        entry.updatedAt = Date(timeIntervalSince1970: 4)
+        try journal.save(entry)
+
+        let reloaded = try XCTUnwrap(
+            RemoteHermesToolJournal(
+                fileURL: directory.appendingPathComponent("remote-hermes-tool-journal.json")
+            ).pendingEntry()
+        )
+        XCTAssertEqual(reloaded.id, "call-1")
+        XCTAssertEqual(reloaded.sourceTurnID, "turn-tool-call")
+        XCTAssertEqual(reloaded.resultTurnID, "turn-result-accepted")
+        XCTAssertEqual(reloaded.success, true)
+        XCTAssertEqual(reloaded.output, #"{"revision":8}"#)
+
+        entry.phase = .completed
+        entry.updatedAt = Date(timeIntervalSince1970: 5)
+        try journal.save(entry)
+        XCTAssertNil(try journal.pendingEntry())
+    }
+
+    func testRemoteHermesToolJournalSelectsOldestPendingEntryPerThread() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = RemoteHermesToolJournal(
+            fileURL: directory.appendingPathComponent("remote-hermes-tool-journal.json")
+        )
+        for (id, threadID, timestamp) in [
+            ("a-first", "thread-a", 1.0),
+            ("b-later", "thread-b", 2.0),
+            ("a-second", "thread-a", 3.0),
+        ] {
+            try journal.save(RemoteHermesToolJournalEntry(
+                id: id,
+                workspaceID: "workspace-1",
+                threadID: threadID,
+                sourceTurnID: "turn-\(id)",
+                toolName: CourseAgentTools.presentPlan,
+                argumentsJSON: #"{"workspace_id":"workspace-1"}"#,
+                selectionDiscussionID: nil,
+                phase: .executing,
+                success: nil,
+                output: nil,
+                resultTurnID: nil,
+                updatedAt: Date(timeIntervalSince1970: timestamp)
+            ))
+        }
+
+        XCTAssertEqual(
+            try journal.pendingEntry(workspaceID: "workspace-1", threadID: "thread-a")?.id,
+            "a-first"
+        )
+        XCTAssertEqual(
+            try journal.pendingEntry(workspaceID: "workspace-1", threadID: "thread-b")?.id,
+            "b-later"
+        )
+    }
+
+    func testHermesAbandonTargetsOnlyTheSelectedWorkspaceThread() {
+        let accepted = [
+            PendingHermesAcceptedTurn(
+                workspaceID: "workspace-1",
+                serverID: "server",
+                threadID: "thread-a",
+                expectedTurnID: "accepted-a",
+                selectionDiscussionID: nil,
+                terminalError: nil
+            ),
+            PendingHermesAcceptedTurn(
+                workspaceID: "workspace-1",
+                serverID: "server",
+                threadID: "thread-b",
+                expectedTurnID: "accepted-b",
+                selectionDiscussionID: UUID(),
+                terminalError: nil
+            ),
+        ]
+        let entries = [
+            RemoteHermesToolJournalEntry(
+                id: "entry-a",
+                workspaceID: "workspace-1",
+                threadID: "thread-a",
+                sourceTurnID: "source-a",
+                toolName: "native-editor-fetch",
+                argumentsJSON: "{}",
+                selectionDiscussionID: nil,
+                phase: .resultSubmitted,
+                success: true,
+                output: "a",
+                resultTurnID: "result-a",
+                updatedAt: Date()
+            ),
+            RemoteHermesToolJournalEntry(
+                id: "entry-b",
+                workspaceID: "workspace-1",
+                threadID: "thread-b",
+                sourceTurnID: "source-b",
+                toolName: "native-editor-fetch",
+                argumentsJSON: "{}",
+                selectionDiscussionID: UUID(),
+                phase: .resultSubmitted,
+                success: true,
+                output: "b",
+                resultTurnID: "result-b",
+                updatedAt: Date()
+            ),
+        ]
+
+        XCTAssertEqual(
+            CourseExperienceStore.hermesTurnIDsForAbandon(
+                acceptedTurns: accepted,
+                journalEntries: entries,
+                workspaceID: "workspace-1",
+                threadID: "thread-b"
+            ),
+            Set(["accepted-b", "result-b"])
+        )
+    }
+
+    func testSavedCourseAndSelectionRecoveryCannotOfferWorkspaceDeletion() throws {
+        let defaults = try makeDefaults()
+        let store = CourseExperienceStore(defaults: defaults)
+        XCTAssertFalse(store.canDeletePendingHermesDraft(selectionDiscussionID: UUID()))
+    }
+
+    @MainActor
+    func testColdStoreRestoresExactHermesWorkspaceAndThreadForEveryPendingJournalPhase() throws {
+        for phase in [
+            RemoteHermesToolJournalEntry.Phase.executing,
+            .executed,
+            .resultSubmitting,
+            .resultSubmitted,
+        ] {
+            let suite = "CourseExperienceStore.pending-hermes.\(phase.rawValue).\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let workspaceID = "pending-\(phase.rawValue)-\(UUID().uuidString.lowercased())"
+            let coursesRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("HermesLegacyMigration-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: coursesRoot) }
+            let threadID = UUID().uuidString.lowercased()
+            var plan = CourseBrief()
+            plan.planID = "pending-plan"
+            plan.revision = 3
+            plan.title = "Pending Hermes course"
+            let identity = PendingHermesCourseIdentity(
+                workspaceID: workspaceID,
+                serverID: "server-hermes",
+                threadID: threadID,
+                runtimeID: "hermes",
+                modelID: "hermes-model",
+                brief: plan,
+                showsBrief: true,
+                expectedTurnID: "turn-accepted-\(phase.rawValue)",
+                terminalError: nil
+            )
+            let submissionJournal = RemoteHermesSubmissionJournal(
+                fileURL: coursesRoot
+                    .appendingPathComponent(workspaceID, isDirectory: true)
+                    .appendingPathComponent(".course/remote-hermes-submissions.json")
+            )
+            let expectedTurnID = phase == .resultSubmitted
+                ? "turn-result-\(phase.rawValue)"
+                : nil
+            try submissionJournal.save(PendingHermesAcceptedTurn(
+                workspaceID: workspaceID,
+                serverID: "server-hermes",
+                threadID: threadID,
+                expectedTurnID: expectedTurnID,
+                selectionDiscussionID: nil,
+                terminalError: nil,
+                courseIdentity: identity,
+                toolLifecycleOwned: true
+            ))
+            let toolJournal = RemoteHermesToolJournal(
+                fileURL: coursesRoot
+                    .appendingPathComponent(workspaceID, isDirectory: true)
+                    .appendingPathComponent(".course/remote-hermes-tool-journal.json")
+            )
+            try toolJournal.save(RemoteHermesToolJournalEntry(
+                id: "call-\(phase.rawValue)",
+                workspaceID: workspaceID,
+                threadID: threadID,
+                sourceTurnID: "turn-tool-\(phase.rawValue)",
+                toolName: CourseAgentTools.presentPlan,
+                argumentsJSON: "{\"workspace_id\":\"\(workspaceID)\"}",
+                selectionDiscussionID: nil,
+                phase: phase,
+                success: phase == .executing ? nil : true,
+                output: phase == .executing ? nil : "durable-result",
+                resultTurnID: expectedTurnID,
+                updatedAt: Date()
+            ))
+
+            XCTAssertNil(defaults.data(forKey: CourseExperienceStore.pendingHermesCourseKey))
+            XCTAssertNil(defaults.data(forKey: CourseExperienceStore.pendingHermesTurnsKey))
+
+            let store = CourseExperienceStore(
+                defaults: defaults,
+                coursesRootURL: coursesRoot
+            )
+            XCTAssertEqual(store.agentThreadKey, ThreadKey(serverId: "server-hermes", threadId: threadID))
+            XCTAssertEqual(store.activeAgentID, "hermes")
+            XCTAssertEqual(store.brief, plan)
+            XCTAssertTrue(store.showsBrief)
+            XCTAssertEqual(store.navigationPath, [.newCourse])
+            XCTAssertTrue(store.hasPendingHermesRecovery())
+            XCTAssertTrue(
+                store.courseDatabaseURL(workspaceID: workspaceID).path.contains(workspaceID)
+            )
+            XCTAssertNil(defaults.data(forKey: CourseExperienceStore.pendingHermesTurnsKey))
+        }
+    }
+
+    @MainActor
+    func testPresentedHermesPlanRefreshesJournalOnlyIdentityAcrossDeliveryPhases() throws {
+        for phase in [
+            RemoteHermesToolJournalEntry.Phase.executed,
+            .resultSubmitting,
+            .resultSubmitted,
+        ] {
+            let suite = "CourseExperienceStore.plan-transition.\(phase.rawValue).\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defaults.removePersistentDomain(forName: suite)
+            let coursesRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("HermesPlanTransition-\(UUID().uuidString)", isDirectory: true)
+            defer {
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: coursesRoot)
+            }
+            let workspaceID = UUID().uuidString.lowercased()
+            let threadID = UUID().uuidString.lowercased()
+            let key = ThreadKey(serverId: "server-hermes", threadId: threadID)
+            let resultTurnID = phase == .resultSubmitted ? "turn-result-plan" : nil
+            let initialIdentity = PendingHermesCourseIdentity(
+                workspaceID: workspaceID,
+                serverID: key.serverId,
+                threadID: key.threadId,
+                runtimeID: "hermes",
+                modelID: "learnfoldflawless",
+                brief: CourseBrief(),
+                showsBrief: false,
+                expectedTurnID: resultTurnID,
+                terminalError: nil
+            )
+            let submissionJournal = RemoteHermesSubmissionJournal(
+                fileURL: coursesRoot
+                    .appendingPathComponent(workspaceID, isDirectory: true)
+                    .appendingPathComponent(".course/remote-hermes-submissions.json")
+            )
+            try submissionJournal.save(PendingHermesAcceptedTurn(
+                workspaceID: workspaceID,
+                serverID: key.serverId,
+                threadID: key.threadId,
+                expectedTurnID: resultTurnID,
+                selectionDiscussionID: nil,
+                terminalError: nil,
+                courseIdentity: initialIdentity,
+                toolLifecycleOwned: true
+            ))
+            var presentedPlan = CourseBrief()
+            presentedPlan.planID = "durable-presented-plan"
+            presentedPlan.revision = 7
+            presentedPlan.title = "Durable Presented Plan"
+            let toolJournal = RemoteHermesToolJournal(
+                fileURL: coursesRoot
+                    .appendingPathComponent(workspaceID, isDirectory: true)
+                    .appendingPathComponent(".course/remote-hermes-tool-journal.json")
+            )
+            try toolJournal.save(RemoteHermesToolJournalEntry(
+                id: "call-plan-\(phase.rawValue)",
+                workspaceID: workspaceID,
+                threadID: threadID,
+                sourceTurnID: "turn-plan-tool",
+                toolName: CourseAgentTools.presentPlan,
+                argumentsJSON: String(decoding: try JSONEncoder().encode(presentedPlan), as: UTF8.self),
+                selectionDiscussionID: nil,
+                phase: phase,
+                success: true,
+                output: "plan displayed",
+                resultTurnID: resultTurnID,
+                updatedAt: Date()
+            ))
+
+            let liveStore = CourseExperienceStore(
+                defaults: defaults,
+                environment: [:],
+                coursesRootURL: coursesRoot
+            )
+            XCTAssertEqual(liveStore.brief, CourseBrief())
+            XCTAssertFalse(liveStore.showsBrief)
+            try liveStore.persistPresentedHermesPlanRecoveryState(
+                presentedPlan,
+                key: key,
+                workspaceID: workspaceID
+            )
+
+            defaults.removeObject(forKey: CourseExperienceStore.pendingHermesCourseKey)
+            defaults.removeObject(forKey: CourseExperienceStore.pendingHermesTurnsKey)
+            let coldStore = CourseExperienceStore(
+                defaults: defaults,
+                environment: [:],
+                coursesRootURL: coursesRoot
+            )
+            XCTAssertEqual(coldStore.agentThreadKey, key)
+            XCTAssertEqual(coldStore.navigationPath, [.newCourse])
+            XCTAssertEqual(coldStore.brief, presentedPlan)
+            XCTAssertTrue(coldStore.showsBrief)
+            XCTAssertTrue(coldStore.hasPendingHermesRecovery())
+            let durableIdentity = try XCTUnwrap(submissionJournal.load().last?.courseIdentity)
+            XCTAssertEqual(durableIdentity.brief, presentedPlan)
+            XCTAssertTrue(durableIdentity.showsBrief)
+        }
+    }
+
+    @MainActor
+    func testColdStoreRestoresPreAcceptHermesSubmissionIntentFromWorkspaceJournal() throws {
+        let suite = "CourseExperienceStore.preaccept-disk.\(UUID().uuidString)"
+        let writerDefaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        writerDefaults.removePersistentDomain(forName: suite)
+        let coursesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HermesPreAccept-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            writerDefaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: coursesRoot)
+        }
+        let workspaceID = UUID().uuidString.lowercased()
+        let threadID = UUID().uuidString.lowercased()
+        let identity = PendingHermesCourseIdentity(
+            workspaceID: workspaceID,
+            serverID: "server-hermes",
+            threadID: threadID,
+            runtimeID: "hermes",
+            modelID: "learnfoldflawless",
+            brief: CourseBrief(),
+            showsBrief: false,
+            expectedTurnID: nil,
+            terminalError: nil
+        )
+        let journal = RemoteHermesSubmissionJournal(
+            fileURL: coursesRoot
+                .appendingPathComponent(workspaceID, isDirectory: true)
+                .appendingPathComponent(".course/remote-hermes-submissions.json")
+        )
+        let intent = PendingHermesAcceptedTurn(
+            workspaceID: workspaceID,
+            serverID: "server-hermes",
+            threadID: threadID,
+            expectedTurnID: nil,
+            selectionDiscussionID: nil,
+            terminalError: nil,
+            submissionIntentID: "intent-durable",
+            previousTurnID: "turn-baseline",
+            submittedText: "internal envelope",
+            learnerText: "Build the lesson",
+            linkedSources: [PendingHermesLinkedSource(name: "Source", detail: "https://example.com")],
+            optimisticMessageID: UUID(),
+            courseIdentity: identity
+        )
+        try journal.save(intent)
+
+        let freshDefaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        XCTAssertNil(freshDefaults.data(forKey: CourseExperienceStore.pendingHermesCourseKey))
+        XCTAssertNil(freshDefaults.data(forKey: CourseExperienceStore.pendingHermesTurnsKey))
+        let store = CourseExperienceStore(
+            defaults: freshDefaults,
+            environment: [:],
+            coursesRootURL: coursesRoot
+        )
+
+        XCTAssertEqual(store.agentThreadKey, ThreadKey(serverId: "server-hermes", threadId: threadID))
+        XCTAssertEqual(store.navigationPath, [.newCourse])
+        XCTAssertEqual(store.activeAgentID, "hermes")
+        XCTAssertEqual(store.brief, identity.brief)
+        XCTAssertEqual(store.showsBrief, identity.showsBrief)
+        XCTAssertTrue(store.hasPendingHermesRecovery())
+        XCTAssertEqual(try journal.load(), [intent])
+    }
+
+    @MainActor
+    func testColdStoreRestoresAcceptedHermesTurnFromWorkspaceJournal() throws {
+        let suite = "CourseExperienceStore.accepted-disk.\(UUID().uuidString)"
+        let writerDefaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        writerDefaults.removePersistentDomain(forName: suite)
+        let coursesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HermesAccepted-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            writerDefaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: coursesRoot)
+        }
+        let workspaceID = UUID().uuidString.lowercased()
+        let threadID = UUID().uuidString.lowercased()
+        let acceptedTurnID = "turn-accepted-on-server"
+        var acceptedBrief = CourseBrief()
+        acceptedBrief.planID = "accepted-durable-plan"
+        acceptedBrief.title = "Accepted durable course"
+        let identity = PendingHermesCourseIdentity(
+            workspaceID: workspaceID,
+            serverID: "server-hermes",
+            threadID: threadID,
+            runtimeID: "hermes",
+            modelID: "learnfoldflawless",
+            brief: acceptedBrief,
+            showsBrief: true,
+            expectedTurnID: acceptedTurnID,
+            terminalError: nil
+        )
+        let journal = RemoteHermesSubmissionJournal(
+            fileURL: coursesRoot
+                .appendingPathComponent(workspaceID, isDirectory: true)
+                .appendingPathComponent(".course/remote-hermes-submissions.json")
+        )
+        let accepted = PendingHermesAcceptedTurn(
+            workspaceID: workspaceID,
+            serverID: "server-hermes",
+            threadID: threadID,
+            expectedTurnID: acceptedTurnID,
+            selectionDiscussionID: nil,
+            terminalError: nil,
+            submissionIntentID: "intent-preserved",
+            previousTurnID: "turn-baseline",
+            submittedText: "internal envelope",
+            learnerText: "Build the lesson",
+            linkedSources: nil,
+            optimisticMessageID: UUID(),
+            courseIdentity: identity
+        )
+        try journal.save(accepted)
+
+        let freshDefaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        XCTAssertNil(freshDefaults.data(forKey: CourseExperienceStore.pendingHermesCourseKey))
+        XCTAssertNil(freshDefaults.data(forKey: CourseExperienceStore.pendingHermesTurnsKey))
+        let store = CourseExperienceStore(
+            defaults: freshDefaults,
+            environment: [:],
+            coursesRootURL: coursesRoot
+        )
+
+        XCTAssertEqual(store.agentThreadKey, ThreadKey(serverId: "server-hermes", threadId: threadID))
+        XCTAssertEqual(store.navigationPath, [.newCourse])
+        XCTAssertEqual(store.activeAgentID, "hermes")
+        XCTAssertEqual(store.brief, acceptedBrief)
+        XCTAssertTrue(store.showsBrief)
+        XCTAssertTrue(store.hasPendingHermesRecovery())
+        XCTAssertEqual(try journal.load().first?.expectedTurnID, acceptedTurnID)
+        XCTAssertEqual(try journal.load().first?.learnerText, "Build the lesson")
+    }
+
+    @MainActor
+    func testCorruptHermesJournalFailsClosedBeforeBeginningAnotherCourse() throws {
+        let defaults = try makeDefaults()
+        let workspaceID = "corrupt-journal-\(UUID().uuidString.lowercased())"
+        let threadID = UUID().uuidString.lowercased()
+        let identity = PendingHermesCourseIdentity(
+            workspaceID: workspaceID,
+            serverID: "server-hermes",
+            threadID: threadID,
+            runtimeID: "hermes",
+            modelID: nil,
+            brief: CourseBrief(),
+            showsBrief: false,
+            expectedTurnID: nil,
+            terminalError: nil
+        )
+        defaults.set(
+            try JSONEncoder().encode(identity),
+            forKey: CourseExperienceStore.pendingHermesCourseKey
+        )
+        let store = CourseExperienceStore(defaults: defaults)
+        let journalURL = store.courseDatabaseURL(workspaceID: workspaceID)
+            .deletingLastPathComponent()
+            .appendingPathComponent("remote-hermes-tool-journal.json")
+        defer {
+            try? FileManager.default.removeItem(
+                at: journalURL.deletingLastPathComponent().deletingLastPathComponent()
+            )
+        }
+        try FileManager.default.createDirectory(
+            at: journalURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("not-json".utf8).write(to: journalURL)
+
+        store.beginNewCourse()
+
+        XCTAssertEqual(store.agentThreadKey?.threadId, threadID)
+        XCTAssertTrue(store.agentError?.contains("recovery data") == true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journalURL.path))
+    }
+
+    @MainActor
+    func testTerminalHermesProtocolErrorBlocksBeginningAnotherCourse() async throws {
+        let defaults = try makeDefaults()
+        let workspaceID = "terminal-hermes-\(UUID().uuidString.lowercased())"
+        let threadID = UUID().uuidString.lowercased()
+        let coursesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: coursesRoot) }
+        let workspaceRoot = coursesRoot.appendingPathComponent(workspaceID, isDirectory: true)
+        let journal = RemoteHermesSubmissionJournal(
+            fileURL: workspaceRoot
+                .appendingPathComponent(".course", isDirectory: true)
+                .appendingPathComponent("remote-hermes-submissions.json")
+        )
+        try journal.save(PendingHermesAcceptedTurn(
+            workspaceID: workspaceID,
+            serverID: "server-hermes",
+            threadID: threadID,
+            expectedTurnID: nil,
+            selectionDiscussionID: nil,
+            terminalError: "Hermes returned malformed native-tool JSON.",
+            courseIdentity: PendingHermesCourseIdentity(
+                workspaceID: workspaceID,
+                serverID: "server-hermes",
+                threadID: threadID,
+                runtimeID: "hermes",
+                modelID: "learnfoldflawless",
+                brief: CourseBrief(),
+                showsBrief: false,
+                expectedTurnID: nil,
+                terminalError: "Hermes returned malformed native-tool JSON."
+            )
+        ))
+        let store = CourseExperienceStore(
+            defaults: defaults,
+            environment: [:],
+            coursesRootURL: coursesRoot
+        )
+
+        store.beginNewCourse()
+
+        XCTAssertEqual(store.agentThreadKey?.threadId, threadID)
+        XCTAssertEqual(store.navigationPath, [.newCourse])
+        XCTAssertTrue(store.agentError?.contains("malformed native-tool JSON") == true)
+        XCTAssertEqual(try journal.load().first?.terminalError, "Hermes returned malformed native-tool JSON.")
+
+        store.agentError = nil
+        await store.retryPendingHermesRecovery(
+            selectionDiscussionID: nil,
+            appModel: AppModel(),
+            appState: AppState()
+        )
+
+        XCTAssertTrue(store.agentError?.contains("malformed native-tool JSON") == true)
+        XCTAssertTrue(store.hasPendingHermesRecovery())
+        XCTAssertEqual(try journal.load().first?.terminalError, "Hermes returned malformed native-tool JSON.")
+    }
+
+    func testRemoteHermesRequiresARealAcceptedServerTurnReceipt() throws {
+        XCTAssertEqual(
+            try CourseExperienceStore.acceptedRemoteHermesTurnID(
+                AppTurnSubmissionReceipt(kind: .started, turnId: "turn-started")
+            ),
+            "turn-started"
+        )
+        XCTAssertEqual(
+            try CourseExperienceStore.acceptedRemoteHermesTurnID(
+                AppTurnSubmissionReceipt(kind: .steered, turnId: "turn-steered")
+            ),
+            "turn-steered"
+        )
+        XCTAssertThrowsError(
+            try CourseExperienceStore.acceptedRemoteHermesTurnID(
+                AppTurnSubmissionReceipt(kind: .queued, turnId: nil)
+            )
+        )
+    }
+
+    func testHermesSubmissionIntentReconcilesExactlyOneTurnAfterAuthoritativeBaseline() throws {
+        XCTAssertEqual(
+            try CourseExperienceStore.acceptedTurnAfterSubmissionBaseline(
+                turnIDsDescending: ["turn-new", "turn-baseline"],
+                previousTurnID: "turn-baseline"
+            ),
+            "turn-new"
+        )
+        XCTAssertNil(
+            try CourseExperienceStore.acceptedTurnAfterSubmissionBaseline(
+                turnIDsDescending: ["turn-baseline"],
+                previousTurnID: "turn-baseline"
+            )
+        )
+        XCTAssertThrowsError(
+            try CourseExperienceStore.acceptedTurnAfterSubmissionBaseline(
+                turnIDsDescending: ["turn-new-2", "turn-new-1", "turn-baseline"],
+                previousTurnID: "turn-baseline"
+            )
+        )
+    }
+
+    func testRemoteHermesUsesAuthoritativeListedTurnWhenLocalSnapshotIsCold() {
+        let listedItems = [
+            HydratedConversationItem(
+                id: "agent-listed",
+                content: .assistant(
+                    HydratedAssistantMessageData(
+                        text: "  authoritative recovered response  ",
+                        agentNickname: nil,
+                        agentRole: nil,
+                        phase: nil
+                    )
+                ),
+                sourceTurnId: "turn-recovered",
+                sourceTurnIndex: 0,
+                timestamp: 1,
+                isFromUserTurnBoundary: false
+            ),
+        ]
+
+        XCTAssertEqual(
+            CourseExperienceStore.remoteHermesAssistantText(
+                in: listedItems,
+                turnID: "turn-recovered"
+            ),
+            "authoritative recovered response"
+        )
+        XCTAssertNil(CourseExperienceStore.remoteHermesAssistantText(
+            in: listedItems,
+            turnID: "turn-other"
+        ))
     }
 
     func testSelectedRemoteCourseServerPersistsAcrossStoreLaunches() throws {
@@ -1737,6 +3178,16 @@ final class CourseExperienceStoreTests: XCTestCase {
 
     private func flattenCourseNodes(_ nodes: [CourseLearningNode]) -> [CourseLearningNode] {
         nodes.flatMap { [$0] + flattenCourseNodes($0.children) }
+    }
+
+    private func messageTexts(in items: [ConversationItem]) -> [String] {
+        items.compactMap { item in
+            switch item.content {
+            case .user(let data): data.text
+            case .assistant(let data): data.text
+            default: nil
+            }
+        }
     }
 
     private func jsonString(_ object: [String: Any]) throws -> String {
@@ -1781,7 +3232,7 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         workspaceID: String,
         prompt: String,
         onPartialResponse: @escaping @MainActor (String) -> Void,
-        onCoursePlan: @escaping @MainActor (CourseBrief) throws -> Void
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
         lastProviderID = providerID
         onPartialResponse("A streamed")

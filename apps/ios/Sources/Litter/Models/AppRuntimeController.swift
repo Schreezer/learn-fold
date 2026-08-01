@@ -154,11 +154,21 @@ final class AppRuntimeController {
     /// This is intentionally separate from snapshot observation because iOS 26
     /// only permits continued-processing requests that directly follow a
     /// person's action.
-    func beginUserInitiatedTurn(key: ThreadKey, appModel: AppModel) -> UUID? {
+    func beginUserInitiatedTurn(
+        key: ThreadKey,
+        appModel: AppModel,
+        agentName: String = "Codex",
+        keepsAliveAcrossTurns: Bool = false
+    ) -> UUID? {
         guard self.appModel === appModel else { return nil }
         guard UIApplication.shared.applicationState == .active else { return nil }
         let title = appModel.threadSnapshot(for: key)?.displayTitle ?? "Codex task"
-        let token = continuedTurnBackground?.beginUserInitiatedTurn(key: key, title: title)
+        let token = continuedTurnBackground?.beginUserInitiatedTurn(
+            key: key,
+            title: title,
+            agentName: agentName,
+            keepsAliveAcrossTurns: keepsAliveAcrossTurns
+        )
         updateLiveActivityOwnership(snapshot: appModel.snapshot)
         return token
     }
@@ -172,6 +182,27 @@ final class AppRuntimeController {
     func markUserInitiatedTurnStartFailed(_ token: UUID?) {
         guard let token else { return }
         continuedTurnBackground?.markTurnStartFailed(token)
+        updateLiveActivityOwnership(snapshot: appModel?.snapshot)
+    }
+
+    /// Automatic continuation turns may share a lease created by the learner's
+    /// initiating action, but must never submit a new continued-processing
+    /// request of their own.
+    func reuseUserInitiatedMultiTurnIfPresent(
+        key: ThreadKey,
+        agentName: String
+    ) -> UUID? {
+        continuedTurnBackground?.reuseMultiTurnSessionIfPresent(
+            key: key,
+            agentName: agentName
+        )
+    }
+
+    func finishUserInitiatedMultiTurn(
+        key: ThreadKey,
+        success: Bool
+    ) {
+        continuedTurnBackground?.finishMultiTurnSession(key: key, success: success)
         updateLiveActivityOwnership(snapshot: appModel?.snapshot)
     }
 

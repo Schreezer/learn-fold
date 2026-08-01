@@ -149,7 +149,7 @@ private struct CourseAgentSetupView: View {
                     }
 
                     VStack(spacing: 12) {
-                        ForEach(store.agentOptions) { choice in
+                        ForEach(store.agentOptions.filter(\.available)) { choice in
                             CourseAgentChoiceRow(
                                 id: choice.id,
                                 title: choice.title,
@@ -400,7 +400,6 @@ private struct CourseHomeView: View {
         .sheet(isPresented: $showsCourseSettings) {
             CourseAgentSettingsView(
                 store: store,
-                onOpenClassicLitter: onOpenClassicLitter,
                 onConnectRemoteAgent: onConnectRemoteAgent
             )
                 .environment(appModel)
@@ -442,7 +441,6 @@ private struct CourseAgentSettingsView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.dismiss) private var dismiss
     @Bindable var store: CourseExperienceStore
-    let onOpenClassicLitter: () -> Void
     let onConnectRemoteAgent: () -> Void
     @State private var selectedAgent: String
     @State private var selectedModel: String
@@ -453,11 +451,9 @@ private struct CourseAgentSettingsView: View {
 
     init(
         store: CourseExperienceStore,
-        onOpenClassicLitter: @escaping () -> Void,
         onConnectRemoteAgent: @escaping () -> Void
     ) {
         self.store = store
-        self.onOpenClassicLitter = onOpenClassicLitter
         self.onConnectRemoteAgent = onConnectRemoteAgent
         _selectedAgent = State(initialValue: store.selectedAgentID ?? "codex")
         _selectedModel = State(initialValue: store.selectedModelID ?? "")
@@ -470,6 +466,21 @@ private struct CourseAgentSettingsView: View {
 
     private var selectedModelInfo: ModelInfo? {
         models.first(where: { $0.id == selectedModel || $0.model == selectedModel })
+    }
+
+    private var connectedHermesServer: AppServerSnapshot? {
+        let connectedServers = appModel.snapshot?.servers.filter { server in
+            !server.isLocal
+                && server.isConnected
+                && server.agentRuntimes.contains {
+                    $0.kind == "hermes" && $0.available
+                }
+        } ?? []
+        if let selectedServerID = store.selectedAgentServerID,
+           let selected = connectedServers.first(where: { $0.serverId == selectedServerID }) {
+            return selected
+        }
+        return connectedServers.first
     }
 
     var body: some View {
@@ -495,9 +506,8 @@ private struct CourseAgentSettingsView: View {
                 }
 
                 Section {
-                    ForEach(store.agentOptions) { option in
+                    ForEach(store.agentOptions.filter(\.available)) { option in
                         Button {
-                            guard option.available else { return }
                             let optionModels = store.models(for: option.id)
                             selectedAgent = option.id
                             let defaultModel = optionModels.first(where: \.isDefault) ?? optionModels.first
@@ -515,17 +525,14 @@ private struct CourseAgentSettingsView: View {
                                 Spacer()
                                 if selectedAgent == option.id {
                                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.blue)
-                                } else if !option.available {
-                                    Image(systemName: "iphone.slash").foregroundStyle(.tertiary)
                                 }
                             }
                         }
-                        .disabled(!option.available)
                     }
                 } header: {
                     Text("Course agent")
                 } footer: {
-                    Text("Learnfold detects these runtimes dynamically. Claude, OpenCode, Pi, Amp, Droid, and future agents become selectable here when their local runtime is available.")
+                    Text("Only agents currently available through this device or the selected server are shown.")
                 }
 
                 if !CourseAgentProvider.isApple(selectedAgent) {
@@ -625,26 +632,35 @@ private struct CourseAgentSettingsView: View {
                 }
 
                 Section {
-                    Button {
-                        dismiss()
-                        Task { @MainActor in
-                            await Task.yield()
-                            onConnectRemoteAgent()
+                    if let connectedHermesServer {
+                        LabeledContent {
+                            Label("Connected", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Hermes")
+                                Text(connectedHermesServer.displayName)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                    } label: {
-                        Label("Connect Hermes or another server", systemImage: "server.rack")
+                    } else {
+                        Button {
+                            dismiss()
+                            Task { @MainActor in
+                                await Task.yield()
+                                onConnectRemoteAgent()
+                            }
+                        } label: {
+                            Label("Connect Hermes", systemImage: "server.rack")
+                        }
+                        .accessibilityIdentifier("course-settings-add-server")
                     }
-                    .accessibilityIdentifier("course-settings-add-server")
                 } header: {
-                    Text("Remote agents")
+                    Text("Remote agent")
                 } footer: {
-                    Text("Pairs through Learnfold Link. Hermes can build and edit native course pages through Learnfold’s approval-gated tool bridge.")
-                }
-
-                Section("Learnfold") {
-                    Button("Open Classic Learnfold", systemImage: "terminal") {
-                        dismiss()
-                        onOpenClassicLitter()
+                    if connectedHermesServer == nil {
+                        Text("Pairs through Learnfold Link. Hermes can build and edit native course pages through Learnfold’s approval-gated tool bridge.")
                     }
                 }
 
@@ -681,6 +697,13 @@ private struct CourseAgentSettingsView: View {
             }
             .task {
                 await store.prepareLocalAgentCatalog(appModel: appModel)
+                let availableOptions = store.agentOptions.filter(\.available)
+                if !availableOptions.contains(where: { $0.id == selectedAgent }),
+                   let fallback = availableOptions.first {
+                    selectedAgent = fallback.id
+                    selectedModel = store.defaultModelID(for: fallback.id) ?? ""
+                    selectedEffort = ""
+                }
                 if selectedModel.isEmpty {
                     selectedModel = store.defaultModelID(for: selectedAgent) ?? ""
                 }
@@ -1189,6 +1212,7 @@ private struct CourseDetailView: View {
                 nodes: learningNodes,
                 expandedNodeIDs: $expandedLearningNodeIDs,
                 generationDisabled: isBackgroundGenerationActive,
+                runtimeID: course.agentRuntimeKind ?? CourseAgentProvider.codex,
                 onOpenMarkdown: { pageID in
                     store.openCoursePage(courseID: course.id, pageID: pageID)
                 },
@@ -1382,6 +1406,7 @@ private struct CourseLearningTreeView: View {
     let nodes: [CourseLearningNode]
     @Binding var expandedNodeIDs: Set<String>
     let generationDisabled: Bool
+    let runtimeID: String
     let onOpenMarkdown: (String) -> Void
     let onGenerate: (CourseLearningNode) -> Void
 
@@ -1393,6 +1418,7 @@ private struct CourseLearningTreeView: View {
                     depth: 0,
                     expandedNodeIDs: $expandedNodeIDs,
                     generationDisabled: generationDisabled,
+                    runtimeID: runtimeID,
                     onOpenMarkdown: onOpenMarkdown,
                     onGenerate: onGenerate
                 )
@@ -1409,6 +1435,7 @@ private struct CourseLearningTreeNodeView: View {
     let depth: Int
     @Binding var expandedNodeIDs: Set<String>
     let generationDisabled: Bool
+    let runtimeID: String
     let onOpenMarkdown: (String) -> Void
     let onGenerate: (CourseLearningNode) -> Void
 
@@ -1476,6 +1503,7 @@ private struct CourseLearningTreeNodeView: View {
                             depth: depth + 1,
                             expandedNodeIDs: $expandedNodeIDs,
                             generationDisabled: generationDisabled,
+                            runtimeID: runtimeID,
                             onOpenMarkdown: onOpenMarkdown,
                             onGenerate: onGenerate
                         )
@@ -1498,16 +1526,22 @@ private struct CourseLearningTreeNodeView: View {
     private var trailingControl: some View {
         switch node.status {
         case .pendingGeneration:
-            Button("Generate") { onGenerate(node) }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 7)
-                .background(.blue, in: Capsule())
-                .buttonStyle(.plain)
-                .accessibilityLabel("Generate \(node.title)")
-                .disabled(generationDisabled)
-                .opacity(generationDisabled ? 0.45 : 1)
+            if CourseExperienceStore.allowsDirectGeneration(of: node, runtimeID: runtimeID) {
+                Button("Generate") { onGenerate(node) }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 7)
+                    .background(.blue, in: Capsule())
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Generate \(node.title)")
+                    .disabled(generationDisabled)
+                    .opacity(generationDisabled ? 0.45 : 1)
+            } else {
+                Text("Pending")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
         case .generating:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)

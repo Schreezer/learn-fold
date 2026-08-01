@@ -483,7 +483,10 @@ struct ContentView: View {
                 }
 
                 #if DEBUG
-                if ConversationDisplayUITestHarnessView.isEnabled {
+                if CourseChatContinuityUITestHarnessView.isEnabled {
+                    CourseChatContinuityUITestHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if ConversationDisplayUITestHarnessView.isEnabled {
                     ConversationDisplayUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if showsClassicLitter {
@@ -506,7 +509,9 @@ struct ContentView: View {
                 #endif
 
                 #if DEBUG
-                if !ConversationDisplayUITestHarnessView.isEnabled, showsClassicLitter {
+                if !CourseChatContinuityUITestHarnessView.isEnabled,
+                   !ConversationDisplayUITestHarnessView.isEnabled,
+                   showsClassicLitter {
                     standardOverlays
                 }
                 #else
@@ -1911,7 +1916,11 @@ private struct HomeNavigationView: View {
             serviceTier: nil
         )
         do {
-            try await appModel.startTurn(key: activeKey, payload: payload)
+            try await appModel.startTurn(
+                key: activeKey,
+                payload: payload,
+                mayCreateBackgroundContinuation: true
+            )
             await appModel.refreshThreadSnapshot(key: activeKey)
         } catch {
             actionErrorMessage = error.localizedDescription

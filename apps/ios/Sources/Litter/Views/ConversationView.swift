@@ -224,7 +224,11 @@ struct ConversationView: View {
                     skillMentions: skillMentions,
                     pluginMentions: pluginMentions
                 )
-                try await appModel.startTurn(key: activeThreadKey, payload: payload)
+                try await appModel.startTurn(
+                    key: activeThreadKey,
+                    payload: payload,
+                    mayCreateBackgroundContinuation: true
+                )
                 NSLog(
                     "[ConversationView] sendMessage turnStart returned server=%@ thread=%@",
                     activeThreadKey.serverId,
@@ -254,7 +258,11 @@ struct ConversationView: View {
                     skillMentions: [],
                     pluginMentions: []
                 )
-                try await appModel.startTurn(key: activeThreadKey, payload: payload)
+                try await appModel.startTurn(
+                    key: activeThreadKey,
+                    payload: payload,
+                    mayCreateBackgroundContinuation: true
+                )
             } catch {
                 messageActionError = error.localizedDescription
             }
@@ -734,6 +742,31 @@ private struct ConversationMessageList: View {
                             ConversationLoadingIndicator(label: "Loading conversation...")
                                 .frame(maxWidth: .infinity)
                                 .padding(.top, 40)
+                        }
+
+                        switch threadStatus {
+                        case .connecting where !isWaitingForData:
+                            ConversationLoadingIndicator(label: "Connecting to conversation...")
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, turns.isEmpty ? 40 : 12)
+                        case .error(let message):
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(LitterTheme.danger)
+                                Text(message)
+                                    .litterFont(.caption)
+                                    .foregroundStyle(LitterTheme.textSecondary)
+                                Spacer()
+                            }
+                            .padding(12)
+                            .background(LitterTheme.danger.opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .padding(.horizontal, 16)
+                            .padding(.top, turns.isEmpty ? 40 : 12)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Conversation error: \(message)")
+                        case .connecting, .ready, .thinking:
+                            EmptyView()
                         }
 
                         Color.clear

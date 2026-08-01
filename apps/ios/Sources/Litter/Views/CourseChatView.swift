@@ -3,13 +3,6 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum CourseChatTimelinePolicy {
-    static func localMessages(
-        _ messages: [CourseChatMessage],
-        hasLiveThread: Bool
-    ) -> [CourseChatMessage] {
-        hasLiveThread ? [] : messages
-    }
-
     static func projectLiveItems(
         _ items: [ConversationItem],
         hidesSelectionEnvelope: Bool = false
@@ -19,8 +12,117 @@ enum CourseChatTimelinePolicy {
         }
     }
 
-    static func isAgentWorking(requestPending: Bool, threadHasActiveTurn: Bool) -> Bool {
-        requestPending || threadHasActiveTurn
+    static func isAgentWorking(
+        requestPending: Bool,
+        threadHasActiveTurn: Bool,
+        usesDurableHermesLifecycle: Bool = false,
+        durableHermesRecoveryPending: Bool = false
+    ) -> Bool {
+        if usesDurableHermesLifecycle {
+            return requestPending || durableHermesRecoveryPending
+        }
+        return requestPending || threadHasActiveTurn
+    }
+
+    static func mergedConversationItems(
+        localMessages: [CourseChatMessage],
+        liveItems: [ConversationItem]
+    ) -> [ConversationItem] {
+        let localItems = localMessages.map(localConversationItem)
+        guard !localItems.isEmpty else { return liveItems }
+        guard !liveItems.isEmpty else { return localItems }
+
+        var matches: [(local: Int, live: Int)] = []
+        var liveCursor = 0
+        for localIndex in localItems.indices {
+            guard let localSignature = messageSignature(for: localItems[localIndex]) else {
+                continue
+            }
+            guard let liveIndex = liveItems.indices.dropFirst(liveCursor).first(where: {
+                guard let liveSignature = messageSignature(for: liveItems[$0]) else {
+                    return false
+                }
+                return localSignature.matches(liveSignature)
+            }) else {
+                continue
+            }
+            matches.append((localIndex, liveIndex))
+            liveCursor = liveIndex + 1
+        }
+
+        var merged: [ConversationItem] = []
+        var localCursor = 0
+        liveCursor = 0
+        for match in matches {
+            merged.append(contentsOf: localItems[localCursor..<match.local])
+            merged.append(contentsOf: liveItems[liveCursor..<match.live])
+            merged.append(liveItems[match.live].replacingID(with: localItems[match.local].id))
+            localCursor = match.local + 1
+            liveCursor = match.live + 1
+        }
+        merged.append(contentsOf: localItems[localCursor...])
+        merged.append(contentsOf: liveItems[liveCursor...])
+        return merged
+    }
+
+    private struct MessageSignature {
+        enum Role {
+            case learner
+            case agent
+        }
+
+        let role: Role
+        let text: String
+
+        func matches(_ other: MessageSignature) -> Bool {
+            guard role == other.role else { return false }
+            if text == other.text { return true }
+            guard role == .agent, !text.isEmpty, !other.text.isEmpty else { return false }
+            return text.hasPrefix(other.text) || other.text.hasPrefix(text)
+        }
+    }
+
+    private static func messageSignature(for item: ConversationItem) -> MessageSignature? {
+        switch item.content {
+        case .user(let data):
+            MessageSignature(role: .learner, text: normalizedMessageText(data.text))
+        case .assistant(let data):
+            MessageSignature(role: .agent, text: normalizedMessageText(data.text))
+        default:
+            nil
+        }
+    }
+
+    private static func normalizedMessageText(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func localConversationItem(_ message: CourseChatMessage) -> ConversationItem {
+        let content: ConversationItemContent
+        switch message.role {
+        case .learner:
+            let images = message.sources.compactMap(\.image)
+                .compactMap(ConversationAttachmentSupport.prepareImage)
+                .map(\.chatImage)
+            content = .user(
+                ConversationUserMessageData(text: message.text, images: images)
+            )
+        case .agent:
+            content = .assistant(
+                ConversationAssistantMessageData(
+                    text: message.text,
+                    agentNickname: nil,
+                    agentRole: nil,
+                    phase: nil
+                )
+            )
+        }
+        return ConversationItem(
+            id: "course-local-\(message.id.uuidString.lowercased())",
+            content: content,
+            timestamp: message.createdAt,
+            isFromUserTurnBoundary: message.role == .learner
+        )
     }
 
     private static func projectLiveItem(
@@ -143,6 +245,19 @@ enum CourseChatTimelinePolicy {
     }
 }
 
+private extension ConversationItem {
+    func replacingID(with id: String) -> ConversationItem {
+        ConversationItem(
+            id: id,
+            content: content,
+            sourceTurnId: sourceTurnId,
+            sourceTurnIndex: sourceTurnIndex,
+            timestamp: timestamp,
+            isFromUserTurnBoundary: isFromUserTurnBoundary
+        )
+    }
+}
+
 enum CourseChatScrollPolicy {
     static let nearBottomDistance: CGFloat = 12
 
@@ -243,9 +358,13 @@ struct CourseChatView: View {
     }
 
     private var localMessages: [CourseChatMessage] {
-        CourseChatTimelinePolicy.localMessages(
-            store.localMessages(for: selectionDiscussionID),
-            hasLiveThread: !liveConversationItems.isEmpty
+        store.localMessages(for: selectionDiscussionID)
+    }
+
+    private var remoteTimelineItems: [ConversationItem] {
+        CourseChatTimelinePolicy.mergedConversationItems(
+            localMessages: localMessages,
+            liveItems: liveConversationItems
         )
     }
 
@@ -267,10 +386,20 @@ struct CourseChatView: View {
     }
 
     private var isAgentWorking: Bool {
-        CourseChatTimelinePolicy.isAgentWorking(
-            requestPending: store.isAgentRequestPending,
-            threadHasActiveTurn: liveThread?.hasActiveTurn == true
+        let usesDurableHermesLifecycle = store.activeAgentID == "hermes"
+        return CourseChatTimelinePolicy.isAgentWorking(
+            requestPending: store.isAgentRequestPending(for: selectionDiscussionID),
+            threadHasActiveTurn: liveThread?.hasActiveTurn == true,
+            usesDurableHermesLifecycle: usesDurableHermesLifecycle,
+            durableHermesRecoveryPending: usesDurableHermesLifecycle
+                && store.hasPendingHermesRecovery(
+                    selectionDiscussionID: selectionDiscussionID
+                )
         )
+    }
+
+    private var isStoppingAgent: Bool {
+        store.agentRunPhase(for: selectionDiscussionID) == .stopping
     }
 
     private var courseServer: AppServerSnapshot? {
@@ -332,20 +461,20 @@ struct CourseChatView: View {
                             .accessibilityLabel("Starting a focused discussion")
                         }
 
-                        ForEach(localMessages) { message in
-                            CourseMessageRow(
-                                message: message,
-                                agentID: store.activeAgentID
-                            )
-                                .id(message.id)
-                        }
-
-                        if let liveThread {
+                        if CourseAgentProvider.isApple(store.activeAgentID) {
+                            ForEach(localMessages) { message in
+                                CourseMessageRow(
+                                    message: message,
+                                    agentID: store.activeAgentID
+                                )
+                                    .id(message.id)
+                            }
+                        } else if !remoteTimelineItems.isEmpty || liveThread != nil {
                             ConversationTurnTimeline(
-                                items: liveConversationItems,
-                                isLive: liveThread.hasActiveTurn,
-                                serverId: liveThread.key.serverId,
-                                originThreadId: liveThread.key.threadId,
+                                items: remoteTimelineItems,
+                                isLive: liveThread?.hasActiveTurn == true,
+                                serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
+                                originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
                                 agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
                                 messageActionsDisabled: true,
                                 onStreamingSnapshotRendered: {
@@ -357,7 +486,7 @@ struct CourseChatView: View {
                                 resolveTargetLabel: { target in
                                     appModel.snapshot?.resolvedAgentTargetLabel(
                                         for: target,
-                                        serverId: liveThread.key.serverId
+                                        serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? ""
                                     )
                                 },
                                 onWidgetPrompt: { prompt in
@@ -374,12 +503,24 @@ struct CourseChatView: View {
                         if isAgentWorking {
                             HStack(alignment: .center, spacing: 8) {
                                 AgentIconView(kind: store.activeAgentID, size: 27)
-                                TypingIndicator()
+                                if isStoppingAgent {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Stopping…")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    TypingIndicator()
+                                }
                                 Spacer()
                             }
                             .id("course-agent-working")
                             .accessibilityElement(children: .combine)
-                            .accessibilityLabel("\(store.activeAgentID.displayLabel) is thinking")
+                            .accessibilityLabel(
+                                isStoppingAgent
+                                    ? "Stopping \(store.activeAgentID.displayLabel)"
+                                    : "\(store.activeAgentID.displayLabel) is thinking"
+                            )
                         }
 
                         if store.showsBrief {
@@ -400,7 +541,39 @@ struct CourseChatView: View {
                                 message: agentError,
                                 needsAuthentication: codexNeedsSignIn,
                                 isConnecting: store.connectionState == .connecting,
+                                showsRecoveryActions: store.hasPendingHermesRecovery(
+                                    selectionDiscussionID: selectionDiscussionID
+                                ),
+                                allowsWorkspaceDeletion: store.canDeletePendingHermesDraft(
+                                    selectionDiscussionID: selectionDiscussionID
+                                ),
                                 onReconnect: reconnectAgent,
+                                onRetryRecovery: {
+                                    Task {
+                                        await store.retryPendingHermesRecovery(
+                                            selectionDiscussionID: selectionDiscussionID,
+                                            appModel: appModel,
+                                            appState: appState
+                                        )
+                                    }
+                                },
+                                onAbandonRecovery: { preserveWorkspace in
+                                    Task {
+                                        do {
+                                            try await store.abandonPendingHermesRecovery(
+                                                selectionDiscussionID: selectionDiscussionID,
+                                                preserveWorkspace: preserveWorkspace,
+                                                appModel: appModel
+                                            )
+                                        } catch {
+                                            if let selectionDiscussionID {
+                                                store.selectionDiscussionErrors[selectionDiscussionID] = error.localizedDescription
+                                            } else {
+                                                store.agentError = error.localizedDescription
+                                            }
+                                        }
+                                    }
+                                },
                                 onDismiss: dismissDisplayedError
                             )
                         }
@@ -436,9 +609,7 @@ struct CourseChatView: View {
                     }
                 }
                 .onChange(of: localMessages.count) { _, _ in
-                    // Once the Rust-backed thread exists, these local messages
-                    // are hidden. Its timeline callbacks own follow scrolling.
-                    guard liveConversationItems.isEmpty else { return }
+                    guard CourseAgentProvider.isApple(store.activeAgentID) else { return }
                     withAnimation(.easeOut(duration: 0.3)) {
                         if store.showsBrief {
                             proxy.scrollTo("course-brief", anchor: .bottom)
@@ -446,6 +617,10 @@ struct CourseChatView: View {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
+                }
+                .onChange(of: remoteTimelineItems.count) { _, _ in
+                    guard !CourseAgentProvider.isApple(store.activeAgentID) else { return }
+                    requestFollowScrollAfterLayout(proxy)
                 }
                 .onChange(of: localStreamingTextLength) { _, _ in
                     guard CourseAgentProvider.isApple(store.activeAgentID),
@@ -478,6 +653,8 @@ struct CourseChatView: View {
                 onSend: sendCurrentMessage,
                 isAgentWorking: isAgentWorking,
                 isPreparing: isPreparingSelectionDiscussion,
+                isAgentReady: isAgentReady,
+                isStopping: isStoppingAgent,
                 onStop: {
                     store.interruptAgent(
                         appModel: appModel,
@@ -655,7 +832,7 @@ struct CourseChatView: View {
     }
 
     private func sendCurrentMessage() {
-        guard !isPreparingSelectionDiscussion else { return }
+        guard !isPreparingSelectionDiscussion, isAgentReady, !isAgentWorking else { return }
         let text = inputText
         inputText = ""
         composerFocused = false
@@ -789,8 +966,13 @@ private struct CourseAgentErrorCard: View {
     let message: String
     let needsAuthentication: Bool
     let isConnecting: Bool
+    let showsRecoveryActions: Bool
+    let allowsWorkspaceDeletion: Bool
     let onReconnect: () -> Void
+    let onRetryRecovery: () -> Void
+    let onAbandonRecovery: (Bool) -> Void
     let onDismiss: () -> Void
+    @State private var showsAbandonConfirmation = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -804,6 +986,14 @@ private struct CourseAgentErrorCard: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 10) {
+                if showsRecoveryActions {
+                    Button("Retry Recovery", action: onRetryRecovery)
+                        .buttonStyle(.borderedProminent)
+                    Button("Abandon…", role: .destructive) {
+                        showsAbandonConfirmation = true
+                    }
+                    .buttonStyle(.bordered)
+                }
                 if needsAuthentication {
                     Button(action: onReconnect) {
                         if isConnecting {
@@ -825,6 +1015,23 @@ private struct CourseAgentErrorCard: View {
         .padding(14)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .accessibilityElement(children: .contain)
+        .confirmationDialog(
+            "Abandon Hermes recovery?",
+            isPresented: $showsAbandonConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Keep Course Workspace") {
+                onAbandonRecovery(true)
+            }
+            if allowsWorkspaceDeletion {
+                Button("Delete Draft Workspace", role: .destructive) {
+                    onAbandonRecovery(false)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Learnfold will stop known Hermes turns, mark the journal abandoned, and retain recovery evidence. Deleting archives that evidence before removing the draft workspace.")
+        }
     }
 }
 
@@ -990,6 +1197,8 @@ private struct CourseChatComposer: View {
     let onSend: () -> Void
     let isAgentWorking: Bool
     let isPreparing: Bool
+    let isAgentReady: Bool
+    let isStopping: Bool
     let onStop: () -> Void
     let supportsBinarySources: Bool
     @Binding var selectedPhoto: PhotosPickerItem?
@@ -1056,7 +1265,7 @@ private struct CourseChatComposer: View {
 
                 Button(action: isAgentWorking ? onStop : onSend) {
                     Group {
-                        if isPreparing {
+                        if isPreparing || isStopping {
                             ProgressView()
                                 .tint(.white)
                         } else {
@@ -1068,11 +1277,18 @@ private struct CourseChatComposer: View {
                     .frame(width: 44, height: 44)
                     .background(sendButtonColor, in: Circle())
                 }
-                .disabled(isPreparing || (!isAgentWorking && !canSend))
+                .disabled(
+                    isPreparing || isStopping ||
+                        (!isAgentWorking && (!isAgentReady || !canSend))
+                )
                 .accessibilityLabel(
                     isPreparing
                         ? "Starting discussion"
-                        : (isAgentWorking ? "Stop agent" : "Send message")
+                        : (isStopping
+                            ? "Stopping agent"
+                            : (isAgentWorking
+                            ? "Stop agent"
+                            : (isAgentReady ? "Send message" : "Agent unavailable")))
                 )
                 .accessibilityIdentifier(isAgentWorking ? "course-chat-stop" : "course-chat-send")
             }
@@ -1090,8 +1306,9 @@ private struct CourseChatComposer: View {
 
     private var sendButtonColor: Color {
         if isPreparing { return .gray.opacity(0.5) }
+        if isStopping { return .gray.opacity(0.5) }
         if isAgentWorking { return .primary }
-        return canSend ? .blue : .gray.opacity(0.35)
+        return isAgentReady && canSend ? .blue : .gray.opacity(0.35)
     }
 }
 
