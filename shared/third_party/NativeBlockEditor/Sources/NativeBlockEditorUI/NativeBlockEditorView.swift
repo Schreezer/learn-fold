@@ -152,6 +152,7 @@ public struct NativeBlockEditorView: View {
     private let onAskAboutSelection: ((NativeBlockEditorSelection) -> Void)?
     private let textAnnotations: [NativeBlockEditorTextAnnotation]
     private let onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)?
+    @Binding private var wrapsCodeLines: Bool
 
     @State private var engine: BlockDocumentEngine
     @State private var revision = 0
@@ -174,7 +175,8 @@ public struct NativeBlockEditorView: View {
         onDocumentChange: ((BlockDocument) -> Void)? = nil,
         onAskAboutSelection: ((NativeBlockEditorSelection) -> Void)? = nil,
         textAnnotations: [NativeBlockEditorTextAnnotation] = [],
-        onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)? = nil
+        onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)? = nil,
+        wrapsCodeLines: Binding<Bool> = .constant(true)
     ) {
         _document = document
         self.configuration = configuration
@@ -188,6 +190,7 @@ public struct NativeBlockEditorView: View {
         self.onAskAboutSelection = onAskAboutSelection
         self.textAnnotations = textAnnotations
         self.onOpenTextAnnotation = onOpenTextAnnotation
+        _wrapsCodeLines = wrapsCodeLines
         _engine = State(initialValue: BlockDocumentEngine(document: Self.anchored(document.wrappedValue)))
     }
 
@@ -261,6 +264,10 @@ public struct NativeBlockEditorView: View {
             .accessibilityLabel("Redo")
 
             Menu {
+                Toggle(isOn: $wrapsCodeLines) {
+                    Label("Wrap code lines", systemImage: "text.word.spacing")
+                }
+                Divider()
                 addBlockButtons
                 Divider()
                 Button("Copy document", systemImage: "doc.on.doc") { copyDocument() }
@@ -557,9 +564,7 @@ public struct NativeBlockEditorView: View {
         case "paragraph", "heading":
             textEditor(block)
         case "code":
-            textEditor(block)
-                .padding(12)
-                .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+            codeEditor(block)
         case "nbe/formula":
             HStack(alignment: .top, spacing: 8) {
                 Text("ƒ").foregroundStyle(configuration.accentColor)
@@ -621,6 +626,33 @@ public struct NativeBlockEditorView: View {
                 .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
             }
         }
+    }
+
+    @ViewBuilder
+    private func codeEditor(_ block: EditorVisibleBlock) -> some View {
+        if wrapsCodeLines {
+            textEditor(block)
+                .padding(12)
+                .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+        } else {
+            ScrollView(.horizontal) {
+                textEditor(block)
+                    .frame(width: unwrappedCodeWidth(for: block), alignment: .leading)
+                    .padding(12)
+            }
+            .scrollIndicators(.visible)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private func unwrappedCodeWidth(for block: EditorVisibleBlock) -> CGFloat {
+        let font = BlockTextStyle.style(for: block.node).font
+        let longestLine = (block.node.delta?.plainText ?? "")
+            .components(separatedBy: .newlines)
+            .max(by: { $0.count < $1.count }) ?? ""
+        let measuredWidth = (longestLine as NSString).size(withAttributes: [.font: font]).width
+        return max(1, ceil(measuredWidth) + 2)
     }
 
     private func textEditor(_ block: EditorVisibleBlock) -> some View {

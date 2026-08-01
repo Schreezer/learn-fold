@@ -127,6 +127,7 @@ struct CoursePageEditorView: View {
 
 private struct CoursePageEditorCanvas: View {
     @Bindable var model: CoursePageEditorModel
+    @AppStorage("coursePage.wrapsCodeLines") private var wrapsCodeLines = true
     let textAnnotations: [NativeBlockEditorTextAnnotation]
     let onAskAboutSelection: (NativeBlockEditorSelection) -> Void
     let onOpenTextAnnotation: (NativeBlockEditorTextAnnotation) -> Void
@@ -177,7 +178,8 @@ private struct CoursePageEditorCanvas: View {
             },
             onAskAboutSelection: onAskAboutSelection,
             textAnnotations: textAnnotations,
-            onOpenTextAnnotation: onOpenTextAnnotation
+            onOpenTextAnnotation: onOpenTextAnnotation,
+            wrapsCodeLines: $wrapsCodeLines
         )
         .overlay(alignment: .top) {
             if let error = model.errorMessage {

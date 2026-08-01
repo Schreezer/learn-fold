@@ -445,17 +445,14 @@ struct RichTextBlockEditor: UIViewRepresentable {
         }
 
         if let focusRequestID,
-           context.coordinator.handledFocusRequestID != focusRequestID {
-            context.coordinator.handledFocusRequestID = focusRequestID
-            DispatchQueue.main.async {
-                guard textView.window != nil else { return }
-                textView.becomeFirstResponder()
-                textView.selectedRange = NSRange(
-                    location: min(focusRequestOffset, textView.attributedText.length),
-                    length: 0
-                )
-                onFocusRequestHandled()
-            }
+           context.coordinator.handledFocusRequestID != focusRequestID,
+           context.coordinator.scheduledFocusRequestID != focusRequestID {
+            context.coordinator.scheduleFocus(
+                id: focusRequestID,
+                textView: textView,
+                offset: focusRequestOffset,
+                onHandled: onFocusRequestHandled
+            )
         }
     }
 
@@ -494,6 +491,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
                 target: coordinator,
                 action: #selector(Coordinator.openAnnotation(_:))
             )
+            recognizer.delegate = coordinator
             recognizer.cancelsTouchesInView = false
             textView.addGestureRecognizer(recognizer)
             textView.annotationTapRecognizer = recognizer
@@ -550,10 +548,49 @@ struct RichTextBlockEditor: UIViewRepresentable {
         var renderedStyleSignature = ""
         var renderedAnnotationSignature = ""
         var handledFocusRequestID: UUID?
+        var scheduledFocusRequestID: UUID?
         var pendingInsertion: (range: NSRange, attributes: [NSAttributedString.Key: Any])?
 
         init(parent: RichTextBlockEditor) {
             self.parent = parent
+        }
+
+        func scheduleFocus(
+            id: UUID,
+            textView: UITextView,
+            offset: Int,
+            onHandled: @escaping () -> Void,
+            remainingAttempts: Int = 5
+        ) {
+            scheduledFocusRequestID = id
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak textView] in
+                guard let self, let textView else { return }
+                guard self.parent.focusRequestID == id else {
+                    self.scheduledFocusRequestID = nil
+                    return
+                }
+                guard textView.window != nil, textView.becomeFirstResponder() else {
+                    if remainingAttempts > 1 {
+                        self.scheduleFocus(
+                            id: id,
+                            textView: textView,
+                            offset: offset,
+                            onHandled: onHandled,
+                            remainingAttempts: remainingAttempts - 1
+                        )
+                    } else {
+                        self.scheduledFocusRequestID = nil
+                    }
+                    return
+                }
+                self.handledFocusRequestID = id
+                self.scheduledFocusRequestID = nil
+                textView.selectedRange = NSRange(
+                    location: min(offset, textView.attributedText.length),
+                    length: 0
+                )
+                onHandled()
+            }
         }
 
         @objc func openLink(_ recognizer: UITapGestureRecognizer) {
@@ -618,17 +655,27 @@ struct RichTextBlockEditor: UIViewRepresentable {
             shouldReceive touch: UITouch
         ) -> Bool {
             guard let textView = gestureRecognizer.view as? DocumentRichTextView,
-                  gestureRecognizer === textView.linkTapRecognizer,
                   let characterIndex = characterIndex(
                     at: touch.location(in: textView),
                     in: textView
                   )
-            else { return true }
-            return textView.textStorage.attribute(
-                .link,
-                at: characterIndex,
-                effectiveRange: nil
-            ) != nil
+            else { return false }
+
+            if gestureRecognizer === textView.linkTapRecognizer {
+                return textView.textStorage.attribute(
+                    .link,
+                    at: characterIndex,
+                    effectiveRange: nil
+                ) != nil
+            }
+            if gestureRecognizer === textView.annotationTapRecognizer {
+                return textView.textStorage.attribute(
+                    RichTextCodec.annotationIDKey,
+                    at: characterIndex,
+                    effectiveRange: nil
+                ) != nil
+            }
+            return true
         }
 
         func gestureRecognizer(
@@ -640,6 +687,8 @@ struct RichTextBlockEditor: UIViewRepresentable {
             }
             return gestureRecognizer === textView.linkTapRecognizer
                 || otherGestureRecognizer === textView.linkTapRecognizer
+                || gestureRecognizer === textView.annotationTapRecognizer
+                || otherGestureRecognizer === textView.annotationTapRecognizer
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
