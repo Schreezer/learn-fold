@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Local gated-agent workflow checkpoints
+.agent-workflow/
+
 # Build system stamps
 .build-stamps/
 
