@@ -94,7 +94,7 @@ public enum NativeEditorMCPToolCatalog {
         ),
         .init(
             name: updatePage,
-            description: "Update page content using Notion-style enhanced Markdown commands: update_content, replace_content, insert_content, replace_content_range, update_properties, or trash. Exact text matches are validated before mutation.",
+            description: "Update page content using Notion-style enhanced Markdown commands: update_content, replace_content, insert_content, replace_content_range, update_properties, or trash. Exact text matches are validated before mutation. Content commands apply any supplied title/course properties in the same revision-checked transaction.",
             inputSchema: objectSchema(
                 properties: [
                     "page_id": stringSchema("Page ID or native-editor page URL."),
