@@ -1,4 +1,9 @@
 use anyhow::{Context, bail};
+#[cfg(unix)]
+use std::ffi::CStr;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use url::Url;
 
@@ -36,7 +41,7 @@ fn run_handoff(args: &[String]) -> anyhow::Result<()> {
     // user-level autostart when possible, starts/upgrades the daemon, and
     // prints a fresh pairing payload. Capture that payload so the model never
     // has to inspect or relay the credential itself.
-    let output = Command::new(executable)
+    let output = managed_service_command(&executable)
         .output()
         .context("set up the local Learnfold Link service")?;
     if !output.status.success() {
@@ -64,6 +69,71 @@ fn run_handoff(args: &[String]) -> anyhow::Result<()> {
 
     println!("Pairing sent securely. Return to Learnfold and approve the connection.");
     Ok(())
+}
+
+fn managed_service_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+
+    // Hermes profiles intentionally give terminal tools an isolated HOME.
+    // launchd/systemd start user services with the OS account's real HOME,
+    // though, so allowing Alleycat's onboarding to inherit the profile HOME
+    // splits the CLI and daemon across different state directories. The CLI
+    // then pairs a fallback daemon whose identity is not the managed service.
+    //
+    // Learnfold Link is an OS-user service, not Hermes profile state. Normalize
+    // only the onboarding child to the account home so install, IPC, identity,
+    // and autostart all resolve to the same persistent location.
+    if let Some(home) = os_account_home() {
+        command.env("HOME", home);
+        #[cfg(target_os = "linux")]
+        {
+            command.env_remove("XDG_CONFIG_HOME");
+            command.env_remove("XDG_STATE_HOME");
+            command.env_remove("XDG_RUNTIME_DIR");
+        }
+    }
+
+    command
+}
+
+#[cfg(unix)]
+fn os_account_home() -> Option<PathBuf> {
+    let uid = unsafe { libc::geteuid() };
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let capacity = if suggested > 0 {
+        suggested as usize
+    } else {
+        16 * 1024
+    };
+    let mut buffer = vec![0_u8; capacity];
+    let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            passwd.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        return None;
+    }
+
+    let passwd = unsafe { passwd.assume_init() };
+    if passwd.pw_dir.is_null() {
+        return None;
+    }
+    let bytes = unsafe { CStr::from_ptr(passwd.pw_dir) }.to_bytes().to_vec();
+    let home = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    (!home.as_os_str().is_empty()).then_some(home)
+}
+
+#[cfg(not(unix))]
+fn os_account_home() -> Option<PathBuf> {
+    None
 }
 
 fn validate_submit_url(raw: &str) -> anyhow::Result<()> {
@@ -127,5 +197,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payload["node_id"], "node");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_service_uses_os_account_home() {
+        let command = managed_service_command(Path::new("/tmp/learnfold-link"));
+        let configured_home = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "HOME").then_some(value))
+            .flatten()
+            .map(PathBuf::from);
+        assert_eq!(configured_home, os_account_home());
     }
 }

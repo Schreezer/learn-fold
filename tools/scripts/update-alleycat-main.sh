@@ -53,12 +53,11 @@ update_shared() {
 }
 
 update_kittylitter() {
-  echo "==> Resolving Learnfold Link Alleycat dep to dnakov/alleycat main ($ALLEYCAT_MAIN_SHA)..."
+  echo "==> Resolving Learnfold Link's pinned public Alleycat dependency..."
   cargo update \
     --quiet \
     --manifest-path "$REPO_DIR/services/kittylitter/Cargo.toml" \
-    -p alleycat \
-    --precise "$ALLEYCAT_MAIN_SHA"
+    -p alleycat
 }
 
 case "$MODE" in
