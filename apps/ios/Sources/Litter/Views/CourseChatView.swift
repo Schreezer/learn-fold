@@ -3,29 +3,19 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum CourseChatTimelinePolicy {
-    private enum Speaker: Hashable {
-        case learner
-        case agent
-    }
-
-    private struct MessageSignature: Hashable {
-        let speaker: Speaker
-        let text: String
-    }
-
     static func localMessages(
         _ messages: [CourseChatMessage],
         representedBy liveItems: [ConversationItem]
     ) -> [CourseChatMessage] {
         var liveCounts = liveItems.reduce(into: [MessageSignature: Int]()) { counts, item in
-            guard let signature = signature(for: item) else { return }
+            guard let signature = messageSignature(for: item) else { return }
             counts[signature, default: 0] += 1
         }
 
         return messages.filter { message in
             let signature = MessageSignature(
-                speaker: message.role == .learner ? .learner : .agent,
-                text: normalized(message.text)
+                role: message.role == .learner ? .learner : .agent,
+                text: normalizedMessageText(message.text)
             )
             guard let count = liveCounts[signature], count > 0 else {
                 return true
@@ -44,23 +34,117 @@ enum CourseChatTimelinePolicy {
         }
     }
 
-    static func isAgentWorking(requestPending: Bool, threadHasActiveTurn: Bool) -> Bool {
-        requestPending || threadHasActiveTurn
+    static func isAgentWorking(
+        requestPending: Bool,
+        threadHasActiveTurn: Bool,
+        usesDurableHermesLifecycle: Bool = false,
+        durableHermesRecoveryPending: Bool = false
+    ) -> Bool {
+        if usesDurableHermesLifecycle {
+            return requestPending || durableHermesRecoveryPending
+        }
+        return requestPending || threadHasActiveTurn
     }
 
-    private static func signature(for item: ConversationItem) -> MessageSignature? {
-        switch item.content {
-        case .user(let data):
-            return MessageSignature(speaker: .learner, text: normalized(data.text))
-        case .assistant(let data):
-            return MessageSignature(speaker: .agent, text: normalized(data.text))
-        default:
-            return nil
+    static func mergedConversationItems(
+        localMessages: [CourseChatMessage],
+        liveItems: [ConversationItem]
+    ) -> [ConversationItem] {
+        let localItems = localMessages.map(localConversationItem)
+        guard !localItems.isEmpty else { return liveItems }
+        guard !liveItems.isEmpty else { return localItems }
+
+        var matches: [(local: Int, live: Int)] = []
+        var liveCursor = 0
+        for localIndex in localItems.indices {
+            guard let localSignature = messageSignature(for: localItems[localIndex]) else {
+                continue
+            }
+            guard let liveIndex = liveItems.indices.dropFirst(liveCursor).first(where: {
+                guard let liveSignature = messageSignature(for: liveItems[$0]) else {
+                    return false
+                }
+                return localSignature.matches(liveSignature)
+            }) else {
+                continue
+            }
+            matches.append((localIndex, liveIndex))
+            liveCursor = liveIndex + 1
+        }
+
+        var merged: [ConversationItem] = []
+        var localCursor = 0
+        liveCursor = 0
+        for match in matches {
+            merged.append(contentsOf: localItems[localCursor..<match.local])
+            merged.append(contentsOf: liveItems[liveCursor..<match.live])
+            merged.append(liveItems[match.live].replacingID(with: localItems[match.local].id))
+            localCursor = match.local + 1
+            liveCursor = match.live + 1
+        }
+        merged.append(contentsOf: localItems[localCursor...])
+        merged.append(contentsOf: liveItems[liveCursor...])
+        return merged
+    }
+
+    private struct MessageSignature: Hashable {
+        enum Role: Hashable {
+            case learner
+            case agent
+        }
+
+        let role: Role
+        let text: String
+
+        func matches(_ other: MessageSignature) -> Bool {
+            guard role == other.role else { return false }
+            if text == other.text { return true }
+            guard role == .agent, !text.isEmpty, !other.text.isEmpty else { return false }
+            return text.hasPrefix(other.text) || other.text.hasPrefix(text)
         }
     }
 
-    private static func normalized(_ text: String) -> String {
+    private static func messageSignature(for item: ConversationItem) -> MessageSignature? {
+        switch item.content {
+        case .user(let data):
+            MessageSignature(role: .learner, text: normalizedMessageText(data.text))
+        case .assistant(let data):
+            MessageSignature(role: .agent, text: normalizedMessageText(data.text))
+        default:
+            nil
+        }
+    }
+
+    private static func normalizedMessageText(_ text: String) -> String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func localConversationItem(_ message: CourseChatMessage) -> ConversationItem {
+        let content: ConversationItemContent
+        switch message.role {
+        case .learner:
+            let images = message.sources.compactMap(\.image)
+                .compactMap(ConversationAttachmentSupport.prepareImage)
+                .map(\.chatImage)
+            content = .user(
+                ConversationUserMessageData(text: message.text, images: images)
+            )
+        case .agent:
+            content = .assistant(
+                ConversationAssistantMessageData(
+                    text: message.text,
+                    agentNickname: nil,
+                    agentRole: nil,
+                    phase: nil
+                )
+            )
+        }
+        return ConversationItem(
+            id: "course-local-\(message.id.uuidString.lowercased())",
+            content: content,
+            timestamp: message.createdAt,
+            isFromUserTurnBoundary: message.role == .learner
+        )
     }
 
     private static func projectLiveItem(
@@ -183,6 +267,19 @@ enum CourseChatTimelinePolicy {
     }
 }
 
+private extension ConversationItem {
+    func replacingID(with id: String) -> ConversationItem {
+        ConversationItem(
+            id: id,
+            content: content,
+            sourceTurnId: sourceTurnId,
+            sourceTurnIndex: sourceTurnIndex,
+            timestamp: timestamp,
+            isFromUserTurnBoundary: isFromUserTurnBoundary
+        )
+    }
+}
+
 enum CourseChatScrollPolicy {
     static let nearBottomDistance: CGFloat = 12
 
@@ -214,19 +311,49 @@ enum CourseChatAuthPolicy {
         isCodex: Bool,
         requiresOpenAIAuth: Bool,
         hasAccount: Bool,
-        explicitlyRequired: Bool
+        explicitlyRequired: Bool,
+        hasOwnedReadinessError: Bool = false
     ) -> Bool {
-        isCodex && (explicitlyRequired || (requiresOpenAIAuth && !hasAccount))
+        guard !hasOwnedReadinessError else { return false }
+        return isCodex && (explicitlyRequired || (requiresOpenAIAuth && !hasAccount))
     }
 
     static func isReady(
         isCodex: Bool,
         transportConnected: Bool,
+        runtimeAvailable: Bool,
         requiresOpenAIAuth: Bool,
         hasAccount: Bool
     ) -> Bool {
-        guard transportConnected else { return false }
+        guard transportConnected, runtimeAvailable else { return false }
         return !isCodex || !requiresOpenAIAuth || hasAccount
+    }
+}
+
+enum CourseAgentErrorActionPolicy {
+    static func showsReconnect(
+        agentID: String,
+        hasOwnedReadinessError: Bool,
+        needsAuthentication: Bool
+    ) -> Bool {
+        hasOwnedReadinessError && !needsAuthentication && !CourseAgentProvider.isApple(agentID)
+    }
+}
+
+enum CourseAgentReconnectPolicy {
+    enum Action: Equatable {
+        case reconnectServer(String)
+        case connectAgent
+    }
+
+    static func action(
+        effectiveTargetServerID: String?,
+        localServerID: String?
+    ) -> Action {
+        if let serverID = effectiveTargetServerID ?? localServerID {
+            return .reconnectServer(serverID)
+        }
+        return .connectAgent
     }
 }
 
@@ -238,6 +365,7 @@ struct CourseChatView: View {
     let selectionContext: CourseTextReference?
     let selectionDiscussionID: UUID?
     let showsDismissButton: Bool
+    let onSelectionDiscussionReplaced: (CourseSelectionDiscussion) -> Void
     @State private var inputText = ""
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var showsFileImporter = false
@@ -249,18 +377,21 @@ struct CourseChatView: View {
     @State private var followScrollScheduled = false
     @State private var isResolvingDiscussion = false
     @State private var resolveError: String?
+    @State private var isReconnectingAgent = false
     @FocusState private var composerFocused: Bool
 
     init(
         store: CourseExperienceStore,
         selectionContext: CourseTextReference? = nil,
         selectionDiscussionID: UUID? = nil,
-        showsDismissButton: Bool = false
+        showsDismissButton: Bool = false,
+        onSelectionDiscussionReplaced: @escaping (CourseSelectionDiscussion) -> Void = { _ in }
     ) {
         self.store = store
         self.selectionContext = selectionContext
         self.selectionDiscussionID = selectionDiscussionID
         self.showsDismissButton = showsDismissButton
+        self.onSelectionDiscussionReplaced = onSelectionDiscussionReplaced
     }
 
     private var activeThreadKey: ThreadKey? {
@@ -289,6 +420,13 @@ struct CourseChatView: View {
         )
     }
 
+    private var remoteTimelineItems: [ConversationItem] {
+        CourseChatTimelinePolicy.mergedConversationItems(
+            localMessages: localMessages,
+            liveItems: liveConversationItems
+        )
+    }
+
     private var localStreamingTextLength: Int {
         localMessages.last(where: { $0.role == .agent })?.text.utf16.count ?? 0
     }
@@ -306,15 +444,49 @@ struct CourseChatView: View {
         return store.agentError
     }
 
+    private var displayedAgentID: String {
+        store.selectionDiscussionAgentID(id: selectionDiscussionID)
+    }
+
+    private var displayedConnectionState: CourseExperienceStore.AgentConnectionState {
+        store.connectionState(for: selectionDiscussionID)
+    }
+
+    private var displayedSources: [CourseSource] {
+        store.sources(for: selectionDiscussionID)
+    }
+
+    private var isPreparingDisplayedSource: Bool {
+        store.isPreparingSource(for: selectionDiscussionID)
+    }
+
     private var isAgentWorking: Bool {
-        CourseChatTimelinePolicy.isAgentWorking(
-            requestPending: store.isAgentRequestPending,
-            threadHasActiveTurn: liveThread?.hasActiveTurn == true
+        let usesDurableHermesLifecycle = displayedAgentID == "hermes"
+        return CourseChatTimelinePolicy.isAgentWorking(
+            requestPending: store.isAgentRequestPending(for: selectionDiscussionID),
+            threadHasActiveTurn: liveThread?.hasActiveTurn == true,
+            usesDurableHermesLifecycle: usesDurableHermesLifecycle,
+            durableHermesRecoveryPending: usesDurableHermesLifecycle
+                && store.hasPendingHermesRecovery(
+                    selectionDiscussionID: selectionDiscussionID
+                )
         )
     }
 
+    private var isStoppingAgent: Bool {
+        store.agentRunPhase(for: selectionDiscussionID) == .stopping
+    }
+
     private var courseServer: AppServerSnapshot? {
-        if let serverID = activeThreadKey?.serverId {
+        if let selectionDiscussionID {
+            if let serverID = activeThreadKey?.serverId
+                ?? store.selectionDiscussion(id: selectionDiscussionID)?.serverID {
+                return appModel.snapshot?.serverSnapshot(for: serverID)
+            }
+        } else if let serverID = store.effectiveMainCourseServerID() {
+            // Returning nil when the configured target is absent is
+            // intentional: a connected local Codex server must not make a
+            // selected remote Hermes course appear ready.
             return appModel.snapshot?.serverSnapshot(for: serverID)
         }
         return appModel.snapshot?.servers.first(where: \.isLocal)
@@ -322,20 +494,26 @@ struct CourseChatView: View {
 
     private var codexNeedsSignIn: Bool {
         CourseChatAuthPolicy.needsSignIn(
-            isCodex: store.activeAgentID == .codex,
+            isCodex: displayedAgentID == .codex,
             requiresOpenAIAuth: courseServer?.requiresOpenaiAuth == true,
             hasAccount: courseServer?.account != nil,
-            explicitlyRequired: store.agentNeedsAuthentication
+            explicitlyRequired: store.agentNeedsAuthentication(for: selectionDiscussionID),
+            hasOwnedReadinessError: store.isDisplayingOwnedReadinessError(
+                for: selectionDiscussionID
+            )
         )
     }
 
     private var isAgentReady: Bool {
-        if CourseAgentProvider.isApple(store.activeAgentID) {
-            return store.connectionState == .connected
+        if CourseAgentProvider.isApple(displayedAgentID) {
+            return displayedConnectionState == .connected
         }
         return CourseChatAuthPolicy.isReady(
-            isCodex: store.activeAgentID == .codex,
+            isCodex: displayedAgentID == .codex,
             transportConnected: courseServer?.isConnected == true,
+            runtimeAvailable: courseServer?.agentRuntimes.contains(where: {
+                $0.kind == displayedAgentID && $0.available
+            }) == true,
             requiresOpenAIAuth: courseServer?.requiresOpenaiAuth == true,
             hasAccount: courseServer?.account != nil
         )
@@ -349,11 +527,14 @@ struct CourseChatView: View {
                 ScrollView {
                     LazyVStack(spacing: 18) {
                         if let selectionContext {
-                            CourseSelectionContextCard(reference: selectionContext)
+                            CourseSelectionContextCard(
+                                reference: selectionContext,
+                                agentName: displayedAgentID.displayLabel
+                            )
                         } else {
                             CourseChatIntro(
                                 supportsBinarySources: !CourseAgentProvider.isApple(
-                                    store.activeAgentID
+                                    displayedAgentID
                                 )
                             )
                         }
@@ -372,20 +553,20 @@ struct CourseChatView: View {
                             .accessibilityLabel("Starting a focused discussion")
                         }
 
-                        ForEach(localMessages) { message in
-                            CourseMessageRow(
-                                message: message,
-                                agentID: store.activeAgentID
-                            )
-                                .id(message.id)
-                        }
-
-                        if let liveThread {
+                        if CourseAgentProvider.isApple(displayedAgentID) {
+                            ForEach(localMessages) { message in
+                                CourseMessageRow(
+                                    message: message,
+                                    agentID: displayedAgentID
+                                )
+                                    .id(message.id)
+                            }
+                        } else if !remoteTimelineItems.isEmpty || liveThread != nil {
                             ConversationTurnTimeline(
-                                items: liveConversationItems,
-                                isLive: liveThread.hasActiveTurn,
-                                serverId: liveThread.key.serverId,
-                                originThreadId: liveThread.key.threadId,
+                                items: remoteTimelineItems,
+                                isLive: liveThread?.hasActiveTurn == true,
+                                serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
+                                originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
                                 agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
                                 messageActionsDisabled: true,
                                 onStreamingSnapshotRendered: {
@@ -397,7 +578,7 @@ struct CourseChatView: View {
                                 resolveTargetLabel: { target in
                                     appModel.snapshot?.resolvedAgentTargetLabel(
                                         for: target,
-                                        serverId: liveThread.key.serverId
+                                        serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? ""
                                     )
                                 },
                                 onWidgetPrompt: { prompt in
@@ -413,19 +594,31 @@ struct CourseChatView: View {
 
                         if isAgentWorking {
                             HStack(alignment: .center, spacing: 8) {
-                                AgentIconView(kind: store.activeAgentID, size: 27)
-                                TypingIndicator()
+                                AgentIconView(kind: displayedAgentID, size: 27)
+                                if isStoppingAgent {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Stopping…")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    TypingIndicator()
+                                }
                                 Spacer()
                             }
                             .id("course-agent-working")
                             .accessibilityElement(children: .combine)
-                            .accessibilityLabel("\(store.activeAgentID.displayLabel) is thinking")
+                            .accessibilityLabel(
+                                isStoppingAgent
+                                    ? "Stopping \(displayedAgentID.displayLabel)"
+                                    : "\(displayedAgentID.displayLabel) is thinking"
+                            )
                         }
 
                         if store.showsBrief {
                             CourseBriefCard(
                                 brief: store.brief,
-                                agentName: store.activeAgentID.displayLabel,
+                                agentName: displayedAgentID.displayLabel,
                                 isAgentWorking: isAgentWorking,
                                 buildAction: {
                                     store.approveCoursePlan(appModel: appModel, appState: appState)
@@ -436,11 +629,69 @@ struct CourseChatView: View {
 
                         if let agentError = displayedAgentError {
                             CourseAgentErrorCard(
-                                agentName: store.activeAgentID.displayLabel,
+                                agentName: displayedAgentID.displayLabel,
                                 message: agentError,
                                 needsAuthentication: codexNeedsSignIn,
-                                isConnecting: store.connectionState == .connecting,
+                                isConnecting: displayedConnectionState == .connecting || isReconnectingAgent,
+                                showsReconnectAction: CourseAgentErrorActionPolicy.showsReconnect(
+                                    agentID: displayedAgentID,
+                                    hasOwnedReadinessError: store.isDisplayingOwnedReadinessError(
+                                        for: selectionDiscussionID
+                                    ),
+                                    needsAuthentication: codexNeedsSignIn
+                                ),
+                                showsRecoveryActions: store.hasPendingHermesRecovery(
+                                    selectionDiscussionID: selectionDiscussionID
+                                ),
+                                showsMissingThreadAction: store.selectionDiscussionHasMissingBoundThread(
+                                    id: selectionDiscussionID
+                                ),
+                                allowsWorkspaceDeletion: store.canDeletePendingHermesDraft(
+                                    selectionDiscussionID: selectionDiscussionID
+                                ),
                                 onReconnect: reconnectAgent,
+                                onRetryRecovery: {
+                                    Task {
+                                        await store.retryPendingHermesRecovery(
+                                            selectionDiscussionID: selectionDiscussionID,
+                                            appModel: appModel,
+                                            appState: appState
+                                        )
+                                    }
+                                },
+                                onAbandonRecovery: { preserveWorkspace in
+                                    Task {
+                                        do {
+                                            try await store.abandonPendingHermesRecovery(
+                                                selectionDiscussionID: selectionDiscussionID,
+                                                preserveWorkspace: preserveWorkspace,
+                                                appModel: appModel
+                                            )
+                                        } catch {
+                                            if let selectionDiscussionID {
+                                                store.selectionDiscussionErrors[selectionDiscussionID] = error.localizedDescription
+                                            } else {
+                                                store.agentError = error.localizedDescription
+                                            }
+                                        }
+                                    }
+                                },
+                                onStartNewDiscussion: {
+                                    guard let selectionDiscussionID else { return }
+                                    store.saveDraft(inputText, for: selectionDiscussionID)
+                                    Task {
+                                        do {
+                                            let replacement = try await store.replaceMissingSelectionDiscussion(
+                                                id: selectionDiscussionID,
+                                                appModel: appModel
+                                            )
+                                            onSelectionDiscussionReplaced(replacement)
+                                        } catch {
+                                            store.selectionDiscussionErrors[selectionDiscussionID] =
+                                                error.localizedDescription
+                                        }
+                                    }
+                                },
                                 onDismiss: dismissDisplayedError
                             )
                         }
@@ -476,9 +727,7 @@ struct CourseChatView: View {
                     }
                 }
                 .onChange(of: localMessages.count) { _, _ in
-                    // Once the Rust-backed thread exists, these local messages
-                    // are hidden. Its timeline callbacks own follow scrolling.
-                    guard liveConversationItems.isEmpty else { return }
+                    guard CourseAgentProvider.isApple(displayedAgentID) else { return }
                     withAnimation(.easeOut(duration: 0.3)) {
                         if store.showsBrief {
                             proxy.scrollTo("course-brief", anchor: .bottom)
@@ -487,8 +736,12 @@ struct CourseChatView: View {
                         }
                     }
                 }
+                .onChange(of: remoteTimelineItems.count) { _, _ in
+                    guard !CourseAgentProvider.isApple(displayedAgentID) else { return }
+                    requestFollowScrollAfterLayout(proxy)
+                }
                 .onChange(of: localStreamingTextLength) { _, _ in
-                    guard CourseAgentProvider.isApple(store.activeAgentID),
+                    guard CourseAgentProvider.isApple(displayedAgentID),
                           isAgentWorking else { return }
                     requestFollowScrollAfterLayout(proxy)
                 }
@@ -512,19 +765,24 @@ struct CourseChatView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             CourseChatComposer(
                 inputText: $inputText,
-                sources: store.sources,
+                prompt: selectionDiscussionID == nil
+                    ? "Message your course agent"
+                    : "Ask a question",
+                sources: displayedSources,
                 isFocused: $composerFocused,
-                onRemoveSource: store.removeSource,
+                onRemoveSource: { store.removeSource($0, for: selectionDiscussionID) },
                 onSend: sendCurrentMessage,
                 isAgentWorking: isAgentWorking,
-                isPreparing: isPreparingSelectionDiscussion,
+                isPreparing: isPreparingSelectionDiscussion || isPreparingDisplayedSource,
+                isAgentReady: isAgentReady,
+                isStopping: isStoppingAgent,
                 onStop: {
                     store.interruptAgent(
                         appModel: appModel,
                         selectionDiscussionID: selectionDiscussionID
                     )
                 },
-                supportsBinarySources: !CourseAgentProvider.isApple(store.activeAgentID),
+                supportsBinarySources: !CourseAgentProvider.isApple(displayedAgentID),
                 selectedPhoto: $selectedPhoto,
                 onChooseFile: { showsFileImporter = true },
                 onPasteLink: pasteLink
@@ -535,7 +793,7 @@ struct CourseChatView: View {
         // zoom is a separate preference and otherwise makes this screen's
         // messages larger than its surrounding controls and guidance.
         .environment(\.textScale, 1.0)
-        .navigationTitle(selectionContext == nil ? (store.generatedCourseID == nil ? "New Course" : "Course Agent") : "Ask Course Agent")
+        .navigationTitle(selectionContext == nil ? (store.generatedCourseID == nil ? "New Course" : "Course Agent") : "Ask about this passage")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             if let draft = store.takeDraft(for: selectionDiscussionID) {
@@ -556,8 +814,11 @@ struct CourseChatView: View {
             }
         }
         .task {
-            await store.refreshAgentReadiness(appModel: appModel)
             if let selectionDiscussionID {
+                await store.refreshSelectionDiscussionReadiness(
+                    id: selectionDiscussionID,
+                    appModel: appModel
+                )
                 await store.prepareSelectionDiscussionThread(
                     id: selectionDiscussionID,
                     appModel: appModel,
@@ -568,6 +829,7 @@ struct CourseChatView: View {
                         id: selectionDiscussionID
                     )
             } else {
+                await store.refreshAgentReadiness(appModel: appModel)
                 await store.hydrateCourseThread(appModel: appModel, appState: appState)
             }
         }
@@ -591,7 +853,8 @@ struct CourseChatView: View {
                         )
                         .accessibilityIdentifier("course-chat-resolve")
                     }
-                    if CourseAgentProvider.isApple(store.activeAgentID) {
+                    if selectionDiscussionID == nil,
+                       CourseAgentProvider.isApple(displayedAgentID) {
                         Menu {
                             Button {
                                 store.switchCurrentAppleProvider(
@@ -600,7 +863,7 @@ struct CourseChatView: View {
                             } label: {
                                 Label(
                                     "Private Cloud Compute",
-                                    systemImage: store.activeAgentID == CourseAgentProvider.applePrivateCloud
+                                    systemImage: displayedAgentID == CourseAgentProvider.applePrivateCloud
                                         ? "checkmark.circle.fill"
                                         : "cloud"
                                 )
@@ -618,7 +881,7 @@ struct CourseChatView: View {
                             } label: {
                                 Label(
                                     "On‑Device",
-                                    systemImage: store.activeAgentID == CourseAgentProvider.appleOnDevice
+                                    systemImage: displayedAgentID == CourseAgentProvider.appleOnDevice
                                         ? "checkmark.circle.fill"
                                         : "iphone"
                                 )
@@ -646,9 +909,14 @@ struct CourseChatView: View {
         ) { result in
             switch result {
             case .success(let urls):
-                for url in urls {
+                Task {
                     do {
-                        store.addSource(try store.copySourceIntoCourse(url: url))
+                        try await store.importDocumentSources(
+                            urls,
+                            selectionDiscussionID: selectionDiscussionID
+                        )
+                    } catch is CancellationError {
+                        return
                     } catch {
                         attachmentError = error.localizedDescription
                     }
@@ -661,19 +929,20 @@ struct CourseChatView: View {
             guard let item else { return }
             Task {
                 defer { selectedPhoto = nil }
-                guard let data = try? await item.loadTransferable(type: Data.self),
-                      let image = UIImage(data: data) else {
+                guard let data = try? await item.loadTransferable(type: Data.self) else {
                     attachmentError = "That image could not be loaded."
                     return
                 }
-                store.addSource(
-                    CourseSource(
-                        name: "Reference image",
-                        detail: "PHOTO",
-                        kind: .image,
-                        image: image
+                do {
+                    try await store.importImageSource(
+                        data: data,
+                        selectionDiscussionID: selectionDiscussionID
                     )
-                )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    attachmentError = error.localizedDescription
+                }
             }
         }
         .alert("Couldn’t Add Source", isPresented: Binding(
@@ -695,20 +964,24 @@ struct CourseChatView: View {
     }
 
     private func sendCurrentMessage() {
-        guard !isPreparingSelectionDiscussion else { return }
+        guard !isPreparingSelectionDiscussion,
+              !isPreparingDisplayedSource,
+              isAgentReady,
+              !isAgentWorking else { return }
         let text = inputText
-        inputText = ""
-        composerFocused = false
-        autoFollowStreaming = true
-        isNearBottom = true
         let reference = hasSentSelectionContext ? nil : selectionContext
-        store.sendMessage(
+        let accepted = store.sendMessage(
             text,
             reference: reference,
             selectionDiscussionID: selectionDiscussionID,
             appModel: appModel,
             appState: appState
         )
+        guard accepted else { return }
+        inputText = ""
+        composerFocused = false
+        autoFollowStreaming = true
+        isNearBottom = true
     }
 
     private func resolveDiscussion() {
@@ -742,13 +1015,13 @@ struct CourseChatView: View {
             Button(action: reconnectAgent) {
                 agentStatusLabel(color: .orange)
             }
-            .accessibilityLabel("Sign in to \(store.activeAgentID.displayLabel)")
+            .accessibilityLabel("Sign in to \(displayedAgentID.displayLabel)")
         } else {
             agentStatusLabel(color: isAgentReady ? .green : .gray)
                 .accessibilityLabel(
                     isAgentReady
-                        ? "\(store.activeAgentID.displayLabel) connected"
-                        : "\(store.activeAgentID.displayLabel) unavailable"
+                        ? "\(displayedAgentID.displayLabel) connected"
+                        : "\(displayedAgentID.displayLabel) unavailable"
                 )
         }
     }
@@ -756,7 +1029,7 @@ struct CourseChatView: View {
     private func agentStatusLabel(color: Color) -> some View {
         HStack(spacing: 7) {
             Circle().fill(color).frame(width: 7, height: 7)
-            AgentIconView(kind: store.activeAgentID, size: 23)
+            AgentIconView(kind: displayedAgentID, size: 23)
         }
         .frame(minWidth: 44, minHeight: 44)
         .padding(.horizontal, 4)
@@ -765,12 +1038,32 @@ struct CourseChatView: View {
 
     private func reconnectAgent() {
         Task {
-            await store.connectLocalAgent(
-                appModel: appModel,
-                agentID: store.activeAgentID,
-                modelID: store.selectedModelID,
-                reasoningEffortID: store.selectedReasoningEffortID
-            )
+            guard !isReconnectingAgent else { return }
+            isReconnectingAgent = true
+            defer { isReconnectingAgent = false }
+            if let selectionDiscussionID {
+                await store.reconnectSelectionDiscussion(
+                    id: selectionDiscussionID,
+                    appModel: appModel
+                )
+            } else {
+                let localServerID = appModel.snapshot?.servers.first(where: \.isLocal)?.serverId
+                switch CourseAgentReconnectPolicy.action(
+                    effectiveTargetServerID: store.effectiveMainCourseServerID(),
+                    localServerID: localServerID
+                ) {
+                case .reconnectServer(let serverID):
+                    await AppRuntimeController.shared.reconnectServer(serverId: serverID)
+                    await store.refreshAgentReadiness(appModel: appModel)
+                case .connectAgent:
+                    await store.connectLocalAgent(
+                        appModel: appModel,
+                        agentID: displayedAgentID,
+                        modelID: store.selectionDiscussionModelID(id: nil),
+                        reasoningEffortID: store.selectedReasoningEffortID
+                    )
+                }
+            }
         }
     }
 
@@ -819,7 +1112,8 @@ struct CourseChatView: View {
                 name: pasted,
                 detail: url.host?.uppercased() ?? "LINK",
                 kind: .link
-            )
+            ),
+            for: selectionDiscussionID
         )
     }
 }
@@ -829,8 +1123,17 @@ private struct CourseAgentErrorCard: View {
     let message: String
     let needsAuthentication: Bool
     let isConnecting: Bool
+    let showsReconnectAction: Bool
+    let showsRecoveryActions: Bool
+    let showsMissingThreadAction: Bool
+    let allowsWorkspaceDeletion: Bool
     let onReconnect: () -> Void
+    let onRetryRecovery: () -> Void
+    let onAbandonRecovery: (Bool) -> Void
+    let onStartNewDiscussion: () -> Void
     let onDismiss: () -> Void
+    @State private var showsAbandonConfirmation = false
+    @State private var showsStartNewConfirmation = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -844,6 +1147,20 @@ private struct CourseAgentErrorCard: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 10) {
+                if showsMissingThreadAction {
+                    Button("Close & Start New", role: .destructive) {
+                        showsStartNewConfirmation = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                if showsRecoveryActions {
+                    Button("Retry Recovery", action: onRetryRecovery)
+                        .buttonStyle(.borderedProminent)
+                    Button("Abandon…", role: .destructive) {
+                        showsAbandonConfirmation = true
+                    }
+                    .buttonStyle(.bordered)
+                }
                 if needsAuthentication {
                     Button(action: onReconnect) {
                         if isConnecting {
@@ -851,6 +1168,17 @@ private struct CourseAgentErrorCard: View {
                                 .controlSize(.small)
                         } else {
                             Label("Sign In", systemImage: "person.crop.circle.badge.checkmark")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isConnecting)
+                } else if showsReconnectAction {
+                    Button(action: onReconnect) {
+                        if isConnecting {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("Reconnect", systemImage: "arrow.clockwise")
                         }
                     }
                     .buttonStyle(.borderedProminent)
@@ -865,23 +1193,78 @@ private struct CourseAgentErrorCard: View {
         .padding(14)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .accessibilityElement(children: .contain)
+        .confirmationDialog(
+            "Abandon Hermes recovery?",
+            isPresented: $showsAbandonConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Keep Course Workspace") {
+                onAbandonRecovery(true)
+            }
+            if allowsWorkspaceDeletion {
+                Button("Delete Draft Workspace", role: .destructive) {
+                    onAbandonRecovery(false)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Learnfold will stop known Hermes turns, mark the journal abandoned, and retain recovery evidence. Deleting archives that evidence before removing the draft workspace.")
+        }
+        .confirmationDialog(
+            "Close this missing discussion and start a new one?",
+            isPresented: $showsStartNewConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Close & Start New", role: .destructive, action: onStartNewDiscussion)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The old annotation and its recovery metadata will be preserved. The new discussion will use your currently selected agent in the same course workspace.")
+        }
     }
 }
 
 private struct CourseSelectionContextCard: View {
     let reference: CourseTextReference
+    let agentName: String
+    @State private var showsFullPassage = false
+    @AccessibilityFocusState private var passageButtonFocused: Bool
+
+    private var preview: String {
+        let limit = 600
+        guard reference.selectedText.count > limit else { return reference.selectedText }
+        return String(reference.selectedText.prefix(limit)) + "…"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("Selected from \(reference.pageTitle)", systemImage: "text.quote")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.blue)
+            HStack(alignment: .firstTextBaseline) {
+                Label("Selected from \(reference.pageTitle)", systemImage: "text.quote")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.blue)
+                Spacer()
+                Text(agentName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.secondary.opacity(0.1), in: Capsule())
+                    .accessibilityLabel("Discussion agent: \(agentName)")
+            }
 
-            Text(reference.selectedText)
+            Text(preview)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .lineLimit(6)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("Passage preview. \(preview)")
+
+            if reference.selectedText.count > 600 {
+                Button("Read full selected passage") {
+                    showsFullPassage = true
+                }
+                .font(.subheadline.weight(.semibold))
+                .accessibilityFocused($passageButtonFocused)
+            }
 
             if reference.wasTruncated {
                 Text("The first \(CourseTextReference.maximumLength.formatted()) characters will be sent as context.")
@@ -895,8 +1278,57 @@ private struct CourseSelectionContextCard: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color.blue.opacity(0.14))
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Selected passage from \(reference.pageTitle). \(reference.selectedText)")
+        .accessibilityElement(children: .contain)
+        .sheet(isPresented: $showsFullPassage, onDismiss: {
+            passageButtonFocused = true
+        }) {
+            CourseSelectedPassageReader(reference: reference)
+        }
+    }
+}
+
+private struct CourseSelectedPassageReader: View {
+    @Environment(\.dismiss) private var dismiss
+    let reference: CourseTextReference
+
+    private var chunks: [String] {
+        reference.selectedText
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .flatMap { paragraph -> [String] in
+                let text = String(paragraph)
+                return stride(from: 0, to: text.count, by: 800).map { offset in
+                    let start = text.index(text.startIndex, offsetBy: offset)
+                    let end = text.index(start, offsetBy: min(800, text.distance(from: start, to: text.endIndex)))
+                    return String(text[start..<end])
+                }
+            }
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    ForEach(Array(chunks.enumerated()), id: \.offset) { _, chunk in
+                        Text(chunk)
+                            .font(.body)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if reference.wasTruncated {
+                        Text("Only the first \(CourseTextReference.maximumLength.formatted()) characters were captured from the original selection.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle("Selected passage")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
 
@@ -1024,12 +1456,15 @@ private struct CourseSourceTile: View {
 
 private struct CourseChatComposer: View {
     @Binding var inputText: String
+    let prompt: String
     let sources: [CourseSource]
     var isFocused: FocusState<Bool>.Binding
     let onRemoveSource: (CourseSource) -> Void
     let onSend: () -> Void
     let isAgentWorking: Bool
     let isPreparing: Bool
+    let isAgentReady: Bool
+    let isStopping: Bool
     let onStop: () -> Void
     let supportsBinarySources: Bool
     @Binding var selectedPhoto: PhotosPickerItem?
@@ -1084,19 +1519,19 @@ private struct CourseChatComposer: View {
                 .accessibilityIdentifier("course-chat-add-source")
                 .disabled(isPreparing)
 
-                TextField("Message your course agent", text: $inputText, axis: .vertical)
+                TextField(prompt, text: $inputText, axis: .vertical)
                     .lineLimit(1...5)
                     .focused(isFocused)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                     .background(.background, in: RoundedRectangle(cornerRadius: 19, style: .continuous))
-                    .accessibilityLabel("Message your course agent")
+                    .accessibilityLabel(prompt)
                     .accessibilityIdentifier("course-chat-composer")
                     .disabled(isPreparing)
 
                 Button(action: isAgentWorking ? onStop : onSend) {
                     Group {
-                        if isPreparing {
+                        if isPreparing || isStopping {
                             ProgressView()
                                 .tint(.white)
                         } else {
@@ -1108,11 +1543,18 @@ private struct CourseChatComposer: View {
                     .frame(width: 44, height: 44)
                     .background(sendButtonColor, in: Circle())
                 }
-                .disabled(isPreparing || (!isAgentWorking && !canSend))
+                .disabled(
+                    isPreparing || isStopping ||
+                        (!isAgentWorking && (!isAgentReady || !canSend))
+                )
                 .accessibilityLabel(
                     isPreparing
                         ? "Starting discussion"
-                        : (isAgentWorking ? "Stop agent" : "Send message")
+                        : (isStopping
+                            ? "Stopping agent"
+                            : (isAgentWorking
+                            ? "Stop agent"
+                            : (isAgentReady ? "Send message" : "Agent unavailable")))
                 )
                 .accessibilityIdentifier(isAgentWorking ? "course-chat-stop" : "course-chat-send")
             }
@@ -1130,8 +1572,9 @@ private struct CourseChatComposer: View {
 
     private var sendButtonColor: Color {
         if isPreparing { return .gray.opacity(0.5) }
+        if isStopping { return .gray.opacity(0.5) }
         if isAgentWorking { return .primary }
-        return canSend ? .blue : .gray.opacity(0.35)
+        return isAgentReady && canSend ? .blue : .gray.opacity(0.35)
     }
 }
 

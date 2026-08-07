@@ -25,7 +25,11 @@ fi
 
 "$WORKSPACE_DIR/../../tools/scripts/update-alleycat-main.sh" --shared
 
-PROFILE="debug"
+# Bindings need a host cdylib only to read UniFFI metadata.  Building that
+# graph with Cargo's default `dev` profile retains full DWARF for every Codex
+# dependency (tens of GiB in this workspace).  The iOS dev profile keeps
+# file/line diagnostics while avoiding that storage cost.
+PROFILE="ios-dev"
 GENERATE_SWIFT=1
 GENERATE_KOTLIN=1
 
@@ -60,7 +64,7 @@ echo "==> Building codex-mobile-client cdylib ($PROFILE)..."
 if [[ "$PROFILE" == "release" ]]; then
     cargo build -p codex-mobile-client --release
 else
-    cargo build -p codex-mobile-client
+    cargo build -p codex-mobile-client --profile "$PROFILE"
 fi
 
 DYLIB_PATH="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}/$PROFILE"

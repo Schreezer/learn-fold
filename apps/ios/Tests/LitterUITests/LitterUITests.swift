@@ -115,10 +115,8 @@ final class LitterUITests: XCTestCase {
             "course-agent-option-codex",
             in: app
         )
-        XCTAssertTrue(privateCloud.exists)
-        XCTAssertFalse(privateCloud.isEnabled)
-        XCTAssertTrue(onDevice.exists)
-        XCTAssertFalse(onDevice.isEnabled)
+        XCTAssertFalse(privateCloud.exists)
+        XCTAssertFalse(onDevice.exists)
         XCTAssertTrue(codex.isEnabled)
         XCTAssertEqual(codex.value as? String, "Selected")
 
@@ -126,6 +124,35 @@ final class LitterUITests: XCTestCase {
         XCTAssertTrue(scrollUntilHittable(connect, in: app))
         XCTAssertEqual(connect.label, "Connect Codex")
         attachScreenshot(named: "Codex-only course setup on unsupported device", app: app)
+    }
+
+    @MainActor
+    func testCourseChatPartialRemoteSnapshotKeepsCompleteLocalTranscript() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchArguments.append("--ui-test-course-chat-continuity")
+        app.launch()
+
+        let harnessTitle = app.staticTexts["courseChatContinuityHarness.title"]
+        XCTAssertTrue(
+            harnessTitle.waitForExistence(timeout: 10),
+            "Course chat continuity harness did not launch"
+        )
+        let splashDismissed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hittable == true"),
+            object: harnessTitle
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [splashDismissed], timeout: 5), .completed)
+        XCTAssertTrue(app.staticTexts["UITEST_COURSE_FIRST_QUESTION"].exists)
+        XCTAssertTrue(app.staticTexts["UITEST_COURSE_FIRST_ANSWER"].exists)
+        XCTAssertTrue(app.staticTexts["UITEST_COURSE_LATEST_QUESTION"].exists)
+        XCTAssertEqual(
+            app.staticTexts.matching(
+                NSPredicate(format: "label == %@", "UITEST_COURSE_LATEST_QUESTION")
+            ).count,
+            1
+        )
+        attachScreenshot(named: "Course chat partial snapshot continuity", app: app)
     }
 
     @MainActor
@@ -138,7 +165,12 @@ final class LitterUITests: XCTestCase {
             "Conversation display harness did not launch"
         )
 
-        app.buttons["conversationDisplayHarness.settingsButton"].tap()
+        let settingsButton = app.buttons["conversationDisplayHarness.settingsButton"]
+        XCTAssertTrue(
+            waitUntilHittable(settingsButton, timeout: 8),
+            "Settings button remained covered or outside the tappable viewport"
+        )
+        settingsButton.tap()
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Conversation"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Internal Thinking"].exists)
@@ -193,6 +225,10 @@ final class LitterUITests: XCTestCase {
 
     @MainActor
     func testCaptureAppStoreScreenshots() throws {
+        try XCTSkipIf(
+            true,
+            "Legacy Classic Learnfold screenshot flow is not part of the Learnfold free-alpha release lane."
+        )
         let app = XCUIApplication()
         setupSnapshot(app)
         app.launch()
@@ -230,6 +266,10 @@ final class LitterUITests: XCTestCase {
 
     @MainActor
     func testCaptureScreenshots() throws {
+        try XCTSkipIf(
+            true,
+            "Legacy Codex/SSH discovery screenshots are intentionally excluded from the Learnfold release lane."
+        )
         let app = XCUIApplication()
         app.launchEnvironment["CODEXIOS_UI_TEST_FORCE_DISCOVERY"] = "1"
         setupSnapshot(app)
@@ -521,6 +561,7 @@ final class LitterUITests: XCTestCase {
         tools: String = "collapsed"
     ) -> XCUIApplication {
         let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
         app.launchArguments.append("--ui-test-conversation-display")
         app.launchEnvironment["CODEXIOS_UI_TEST_REASONING_MODE"] = reasoning
         app.launchEnvironment["CODEXIOS_UI_TEST_COMMAND_MODE"] = commands
@@ -533,6 +574,7 @@ final class LitterUITests: XCTestCase {
         privateCloudAvailable: Bool
     ) -> XCUIApplication {
         let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
         app.launchEnvironment["SNAPPY_RESET_ONBOARDING"] = "1"
         app.launchEnvironment["SNAPPY_APPLE_ON_DEVICE_AVAILABLE"] = onDeviceAvailable ? "1" : "0"
         app.launchEnvironment["SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE"] =

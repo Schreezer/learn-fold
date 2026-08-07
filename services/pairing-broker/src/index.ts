@@ -17,11 +17,6 @@ interface PairingMeta {
   expiresAt: number
 }
 
-interface Env {
-  PAIRING_REQUESTS: DurableObjectNamespace<PairingRequest>
-  PAIRING_RATE_LIMITER: RateLimit
-}
-
 function json(value: unknown, status = 200): Response {
   return Response.json(value, {
     status,
@@ -102,6 +97,14 @@ function parsePairPayload(value: unknown): PairPayload | null {
     ...(candidate.host_name === undefined ? {} : { host_name: candidate.host_name }),
     ...(candidate.relay === undefined ? {} : { relay: candidate.relay }),
   }
+}
+
+function samePairPayload(left: PairPayload, right: PairPayload): boolean {
+  return left.v === right.v
+    && left.node_id === right.node_id
+    && left.token === right.token
+    && left.host_name === right.host_name
+    && left.relay === right.relay
 }
 
 function bearer(request: Request): string | null {
@@ -239,9 +242,14 @@ export class PairingRequest extends DurableObject<Env> {
 
     if (request.method === "POST" && path === "/submit") {
       if (!await this.authorize(request, "submit")) return json({ error: "unauthorized_or_expired" }, 401)
-      if (await this.ctx.storage.get("payload")) return json({ error: "already_submitted" }, 409)
       const payload = await request.json<PairPayload>()
-      await this.ctx.storage.put("payload", payload)
+      const accepted = await this.ctx.storage.transaction(async (transaction) => {
+        const stored = await transaction.get<PairPayload>("payload")
+        if (stored) return samePairPayload(stored, payload)
+        await transaction.put("payload", payload)
+        return true
+      })
+      if (!accepted) return json({ error: "already_submitted" }, 409)
       return json({ ok: true }, 202)
     }
 
@@ -264,7 +272,9 @@ export class PairingRequest extends DurableObject<Env> {
       if (!await this.authorize(request, "claim")) return json({ error: "unauthorized_or_expired" }, 401)
       const payload = await this.ctx.storage.get<PairPayload>("payload")
       if (!payload) return json({ error: "not_ready" }, 409)
-      await this.ctx.storage.deleteAll()
+      // Keep the payload until the existing alarm (or an explicit cancel) clears it.
+      // The client can then retry with the same claim capability if this response is
+      // lost after the broker has handled the request.
       return json({ pairing_payload: payload })
     }
 

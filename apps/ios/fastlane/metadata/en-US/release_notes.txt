@@ -1,1 +1,5 @@
-Bug fixes and improvements.
+Learnfold introduces a native course workspace for turning topics and source material into something you can study and question.
+
+This build adds guided course creation, diagnostics and plan review, progressive lesson generation, course-scoped questions, clearer connected-agent settings, and a choice between wrapped or horizontally scrollable code blocks.
+
+This is an early release. Adaptation, citations, continuation, and sync behavior are still being hardened.

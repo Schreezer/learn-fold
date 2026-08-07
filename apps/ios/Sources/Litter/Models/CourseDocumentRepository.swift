@@ -84,6 +84,7 @@ actor CourseDocumentRepository {
     }
 
     private let service: NativeEditorMCPService
+    private let courseRoot: URL
     private let pendingEditsURL: URL
     private let autosaveDelay: Duration
     private var pendingUserEdits: [String: PendingUserEdit] = [:]
@@ -98,12 +99,14 @@ actor CourseDocumentRepository {
     private init(
         workspaceID: String,
         service: NativeEditorMCPService,
+        courseRoot: URL,
         pendingEditsURL: URL,
         autosaveDelay: Duration,
         recoveredUserEdits: [String: PendingUserEdit]
     ) {
         self.workspaceID = workspaceID
         self.service = service
+        self.courseRoot = courseRoot
         self.pendingEditsURL = pendingEditsURL
         self.autosaveDelay = autosaveDelay
         pendingUserEdits = recoveredUserEdits
@@ -138,6 +141,7 @@ actor CourseDocumentRepository {
         let repository = CourseDocumentRepository(
             workspaceID: workspaceID,
             service: service,
+            courseRoot: courseRoot,
             pendingEditsURL: pendingEditsURL,
             autosaveDelay: autosaveDelay,
             recoveredUserEdits: recoveredUserEdits
@@ -546,15 +550,66 @@ actor CourseDocumentRepository {
     }
 
     func callTool(named name: String, argumentsJSON: String) async -> NativeEditorMCPToolResult {
+        let requiresApprovedPlan = Self.mutatingTools.contains(name)
+        if requiresApprovedPlan {
+            do {
+                return try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(
+                    workspaceID: workspaceID
+                ) {
+                    await callToolWithAuthorizationHeld(
+                        named: name,
+                        argumentsJSON: argumentsJSON,
+                        requiresApprovedPlan: true
+                    )
+                }
+            } catch {
+                return NativeEditorMCPToolResult(
+                    value: .object([
+                        "object": "error",
+                        "code": "repository_error",
+                        "message": .string(error.localizedDescription),
+                    ]),
+                    isError: true
+                )
+            }
+        }
+        return await callToolWithAuthorizationHeld(
+            named: name,
+            argumentsJSON: argumentsJSON,
+            requiresApprovedPlan: false
+        )
+    }
+
+    private func callToolWithAuthorizationHeld(
+        named name: String,
+        argumentsJSON: String,
+        requiresApprovedPlan: Bool
+    ) async -> NativeEditorMCPToolResult {
         do {
             try Task.checkCancellation()
             try await flushPendingUserEdits()
             try Task.checkCancellation()
+            if requiresApprovedPlan,
+               !AppleCourseApprovalPolicy.isLatestPlanApproved(courseDirectory: courseRoot) {
+                return Self.planNotApprovedResult()
+            }
             let data = Data(argumentsJSON.utf8)
             let arguments = try JSONDecoder().decode([String: JSONValue].self, from: data)
             let result = await service.callTool(named: name, arguments: arguments)
             if !result.isError {
                 if let task = Self.asyncTaskDescriptor(result.value) {
+                    if requiresApprovedPlan {
+                        // Native async tasks are in-memory and may commit after
+                        // the initial queued descriptor. Keep the plan lease
+                        // until the device has actually finished the mutation,
+                        // and return that terminal result to Hermes.
+                        let terminal = await awaitAsyncTaskTerminal(id: task.id)
+                        handleAsyncTask(terminal.descriptor)
+                        return NativeEditorMCPToolResult(
+                            value: terminal.value,
+                            isError: terminal.descriptor.status == "failed"
+                        )
+                    }
                     handleAsyncTask(task)
                 } else if Self.mutatingTools.contains(name) {
                     let pageID = arguments["page_id"]?.stringValue
@@ -574,6 +629,128 @@ actor CourseDocumentRepository {
                 isError: true
             )
         }
+    }
+
+    func isLatestPlanApproved() -> Bool {
+        AppleCourseApprovalPolicy.isLatestPlanApproved(courseDirectory: courseRoot)
+    }
+
+    func presentPlan(_ plan: CourseBrief) async throws {
+        try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(
+            workspaceID: workspaceID
+        ) {
+            try writePresentedPlan(plan)
+        }
+    }
+
+    func presentPlanForRecoveryIfUnchanged(_ plan: CourseBrief) async throws {
+        try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(
+            workspaceID: workspaceID
+        ) {
+            let presentedURL = AppleCourseApprovalPolicy.protectedPlanURL(
+                courseDirectory: courseRoot,
+                filename: AppleCourseApprovalPolicy.presentedPlanFilename
+            )
+            if FileManager.default.fileExists(atPath: presentedURL.path) {
+                let current = try JSONDecoder().decode(
+                    CourseBrief.self,
+                    from: Data(contentsOf: presentedURL)
+                )
+                guard current == plan else {
+                    throw AppleCourseAgentError.toolFailed(
+                        "A different course plan is already being reviewed. Learnfold preserved it and did not replay the older Hermes presentation."
+                    )
+                }
+                return
+            }
+            try writePresentedPlan(plan)
+        }
+    }
+
+    private func writePresentedPlan(_ plan: CourseBrief) throws {
+        guard !plan.planID.isEmpty else {
+            throw AppleCourseAgentError.toolFailed(
+                "The generated course plan is missing its plan identifier."
+            )
+        }
+        let metadataDirectory = courseRoot.appendingPathComponent(".course", isDirectory: true)
+        try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
+        let data = try JSONEncoder.courseFileEncoder.encode(plan)
+        let protectedURL = AppleCourseApprovalPolicy.protectedPlanURL(
+            courseDirectory: courseRoot,
+            filename: AppleCourseApprovalPolicy.presentedPlanFilename
+        )
+        try FileManager.default.createDirectory(
+            at: protectedURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: protectedURL, options: .atomic)
+        // Keep a readable workspace mirror for agent context. It is not used
+        // for authorization because course_bash may freely change it.
+        try data.write(
+            to: metadataDirectory.appendingPathComponent(
+                AppleCourseApprovalPolicy.presentedPlanFilename
+            ),
+            options: .atomic
+        )
+    }
+
+    func approvePlan(_ plan: CourseBrief) async throws {
+        try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(
+            workspaceID: workspaceID
+        ) {
+            let protectedPresentedURL = AppleCourseApprovalPolicy.protectedPlanURL(
+                courseDirectory: courseRoot,
+                filename: AppleCourseApprovalPolicy.presentedPlanFilename
+            )
+            // Remote Codex validates and returns dynamic-tool arguments on its
+            // server. If the app was suspended before its completed call could
+            // be mirrored locally, the learner's explicit Approve tap is the
+            // first authoritative phone-side boundary.
+            if !FileManager.default.fileExists(atPath: protectedPresentedURL.path) {
+                try writePresentedPlan(plan)
+            }
+            let presented = try JSONDecoder().decode(
+                CourseBrief.self,
+                from: Data(contentsOf: protectedPresentedURL)
+            )
+            guard presented == plan else {
+                throw AppleCourseAgentError.toolFailed(
+                    "The plan changed before approval was committed. Review the latest revision and approve it explicitly."
+                )
+            }
+            let data = try JSONEncoder.courseFileEncoder.encode(presented)
+            let metadataDirectory = courseRoot.appendingPathComponent(".course", isDirectory: true)
+            try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
+            // Write the learner-visible mirror first. Only the final protected
+            // write commits authorization, so a storage failure cannot grant it.
+            try data.write(
+                to: metadataDirectory.appendingPathComponent(
+                    AppleCourseApprovalPolicy.approvedPlanFilename
+                ),
+                options: .atomic
+            )
+            let protectedApprovedURL = AppleCourseApprovalPolicy.protectedPlanURL(
+                courseDirectory: courseRoot,
+                filename: AppleCourseApprovalPolicy.approvedPlanFilename
+            )
+            try FileManager.default.createDirectory(
+                at: protectedApprovedURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: protectedApprovedURL, options: .atomic)
+        }
+    }
+
+    private static func planNotApprovedResult() -> NativeEditorMCPToolResult {
+        NativeEditorMCPToolResult(
+            value: .object([
+                "object": "error",
+                "code": "course_plan_not_approved",
+                "message": "The latest presented course plan has not been approved. Wait for explicit learner approval before changing native pages.",
+            ]),
+            isError: true
+        )
     }
 
     func changes() -> AsyncStream<CourseDocumentChange> {
@@ -635,6 +812,11 @@ actor CourseDocumentRepository {
         var status: String
     }
 
+    private struct TerminalAsyncTask: Sendable {
+        var descriptor: AsyncTaskDescriptor
+        var value: JSONValue
+    }
+
     private static func asyncTaskDescriptor(_ value: JSONValue) -> AsyncTaskDescriptor? {
         guard let object = value.objectValue,
               object["object"]?.stringValue == "async_task",
@@ -649,11 +831,35 @@ actor CourseDocumentRepository {
             asyncTaskMonitors.removeValue(forKey: task.id)?.cancel()
             latestSnapshots.removeAll()
             publish(pageID: nil, replacesDocument: true)
+            scheduleCloudSync()
         case "failed":
             asyncTaskMonitors.removeValue(forKey: task.id)?.cancel()
         default:
             startAsyncTaskMonitor(id: task.id)
         }
+    }
+
+    private func awaitAsyncTaskTerminal(id: String) async -> TerminalAsyncTask {
+        let service = self.service
+        return await Task.detached {
+            var pollDelay: Duration = .milliseconds(100)
+            while true {
+                do {
+                    let value = try await service.asyncTask(["task_id": .string(id)])
+                    if let descriptor = Self.asyncTaskDescriptor(value),
+                       descriptor.status == "succeeded" || descriptor.status == "failed" {
+                        return TerminalAsyncTask(descriptor: descriptor, value: value)
+                    }
+                    pollDelay = .milliseconds(100)
+                } catch {
+                    pollDelay = .milliseconds(500)
+                }
+                // Detached polling intentionally outlives cancellation of the
+                // Hermes request. Releasing the authorization lease while the
+                // native mutation can still commit would be unsafe.
+                try? await Task.sleep(for: pollDelay)
+            }
+        }.value
     }
 
     private func startAsyncTaskMonitor(id: String) {
@@ -703,7 +909,16 @@ actor CourseDocumentRepository {
             $0.type != "nbe/child_page" && $0.type != "nbe/page_reference"
         }
         let derivedStatus: CourseLearningNode.GenerationStatus
-        if let explicitStatus {
+        if kind == .folder, !children.isEmpty, explicitStatus != .generating {
+            let childStatuses = children.map(\.status)
+            if childStatuses.allSatisfy({ $0 == .generated }) {
+                derivedStatus = .generated
+            } else if childStatuses.allSatisfy({ $0 == .pendingGeneration }) {
+                derivedStatus = .pendingGeneration
+            } else {
+                derivedStatus = .partiallyGenerated
+            }
+        } else if let explicitStatus {
             derivedStatus = explicitStatus
         } else if !contentBlocks.isEmpty || !children.isEmpty {
             derivedStatus = .generated
@@ -1423,6 +1638,94 @@ actor CourseDocumentRegistry {
         guard let repository = repositories[workspaceID] else { return nil }
         return await repository.callTool(named: tool, argumentsJSON: argumentsJSON)
     }
+
+    func executeCourseBash(
+        threadID: String,
+        argumentsJSON: String
+    ) async -> AppPlatformDynamicToolResult? {
+        guard let workspaceID = workspaceByThreadID[threadID],
+              let repository = repositories[workspaceID] else { return nil }
+        return await repository.executeCourseBash(argumentsJSON: argumentsJSON)
+    }
+
+    func presentPlan(
+        threadID: String,
+        argumentsJSON: String
+    ) async -> AppPlatformDynamicToolResult? {
+        guard let workspaceID = workspaceByThreadID[threadID],
+              let repository = repositories[workspaceID],
+              let data = argumentsJSON.data(using: .utf8),
+              let plan = try? JSONDecoder().decode(CourseBrief.self, from: data) else {
+            return AppPlatformDynamicToolResult(
+                success: false,
+                output: "present_course_plan requires a valid complete plan for the registered course thread."
+            )
+        }
+        do {
+            try await repository.presentPlan(plan)
+            return AppPlatformDynamicToolResult(
+                success: true,
+                output: "Course plan revision \(plan.revision) is ready for learner review."
+            )
+        } catch {
+            return AppPlatformDynamicToolResult(
+                success: false,
+                output: error.localizedDescription
+            )
+        }
+    }
+
+    /// Persists the proposal through the same repository actor that owns
+    /// approval authorization. Returning false means this capability is no
+    /// longer connected to a live course repository and must fail closed.
+    func presentPlan(workspaceID: String, plan: CourseBrief) async throws -> Bool {
+        guard let repository = repositories[workspaceID] else { return false }
+        try await repository.presentPlan(plan)
+        return true
+    }
+}
+
+private extension CourseDocumentRepository {
+    func executeCourseBash(argumentsJSON: String) async -> AppPlatformDynamicToolResult {
+        do {
+            guard let data = argumentsJSON.data(using: .utf8),
+                  let arguments = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  arguments[CourseAgentTools.workspaceIDArgument] as? String == workspaceID,
+                  let script = arguments["script"] as? String else {
+                return AppPlatformDynamicToolResult(
+                    success: false,
+                    output: "course_bash requires the registered course's exact workspace_id and a non-empty script."
+                )
+            }
+            let timeout = (arguments["timeout_seconds"] as? NSNumber)?.intValue
+            let execution = try await CourseBashTool.execute(
+                workspaceID: workspaceID,
+                workspaceURL: courseRoot,
+                script: script,
+                timeoutSeconds: timeout
+            )
+            var object = execution.jsonObject
+            if execution.exitCode != 0 {
+                object["warning"] = "The command exited nonzero but may have partially modified the course. Inspect the workspace before retrying."
+            }
+            let output = String(
+                decoding: try JSONSerialization.data(
+                    withJSONObject: object,
+                    options: [.sortedKeys]
+                ),
+                as: UTF8.self
+            )
+            return AppPlatformDynamicToolResult(
+                success: execution.exitCode == 0,
+                output: output
+            )
+        } catch {
+            return AppPlatformDynamicToolResult(
+                success: false,
+                output: error.localizedDescription
+            )
+        }
+    }
 }
 
 private final class CourseToolResultBox: @unchecked Sendable {
@@ -1445,39 +1748,76 @@ private final class CourseToolResultBox: @unchecked Sendable {
 final class CourseDocumentToolRouter: PlatformDynamicToolHandler, @unchecked Sendable {
     static let shared = CourseDocumentToolRouter()
 
+    private let courseBashFlightLock = NSLock()
+    private var courseBashInFlight = false
+
     func handleDynamicTool(
         invocation: AppPlatformDynamicToolInvocation
     ) -> AppPlatformDynamicToolResult? {
-        guard NativeEditorMCPToolCatalog.tools.contains(where: { $0.name == invocation.tool }) else {
+        let isCourseBash = invocation.tool == CourseAgentTools.courseBash
+        let isCoursePlan = invocation.tool == CourseAgentTools.presentPlan
+        guard isCourseBash
+                || isCoursePlan
+                || NativeEditorMCPToolCatalog.tools.contains(where: { $0.name == invocation.tool }) else {
             return nil
+        }
+        if isCourseBash {
+            courseBashFlightLock.lock()
+            guard !courseBashInFlight else {
+                courseBashFlightLock.unlock()
+                return AppPlatformDynamicToolResult(
+                    success: false,
+                    output: "Another phone-side course_bash call is already running. Wait for its result before retrying."
+                )
+            }
+            courseBashInFlight = true
+            courseBashFlightLock.unlock()
+        }
+        defer {
+            if isCourseBash {
+                courseBashFlightLock.lock()
+                courseBashInFlight = false
+                courseBashFlightLock.unlock()
+            }
         }
 
         let semaphore = DispatchSemaphore(value: 0)
         let box = CourseToolResultBox()
-        let routingTask = Task {
+        Task {
             defer { semaphore.signal() }
             guard !Task.isCancelled else { return }
-            let result = await CourseDocumentRegistry.shared.handle(
-                threadID: invocation.threadId,
-                tool: invocation.tool,
-                argumentsJSON: invocation.argumentsJson
-            )
-            guard !Task.isCancelled else { return }
-            let encoded = result.flatMap { result -> AppPlatformDynamicToolResult? in
-                guard let data = try? JSONEncoder().encode(result.value),
-                      let output = String(data: data, encoding: .utf8) else { return nil }
-                return AppPlatformDynamicToolResult(success: !result.isError, output: output)
+            let encoded: AppPlatformDynamicToolResult?
+            if isCourseBash {
+                encoded = await CourseDocumentRegistry.shared.executeCourseBash(
+                    threadID: invocation.threadId,
+                    argumentsJSON: invocation.argumentsJson
+                )
+            } else if isCoursePlan {
+                encoded = await CourseDocumentRegistry.shared.presentPlan(
+                    threadID: invocation.threadId,
+                    argumentsJSON: invocation.argumentsJson
+                )
+            } else {
+                let result = await CourseDocumentRegistry.shared.handle(
+                    threadID: invocation.threadId,
+                    tool: invocation.tool,
+                    argumentsJSON: invocation.argumentsJson
+                )
+                encoded = result.flatMap { result -> AppPlatformDynamicToolResult? in
+                    guard let data = try? JSONEncoder().encode(result.value),
+                          let output = String(data: data, encoding: .utf8) else { return nil }
+                    return AppPlatformDynamicToolResult(success: !result.isError, output: output)
+                }
             }
+            guard !Task.isCancelled else { return }
             box.store(encoded)
         }
 
-        guard semaphore.wait(timeout: .now() + 45) == .success else {
-            routingTask.cancel()
-            return AppPlatformDynamicToolResult(
-                success: false,
-                output: "The course document tool timed out. Its operation may still finish; fetch the current page state before deciding whether to retry."
-            )
-        }
+        // The callback boundary is synchronous, but returning a timeout while
+        // this task can still commit would turn an unknown outcome into a
+        // terminal failure and invite a duplicate retry. Wait for the native
+        // transaction's authoritative result instead.
+        semaphore.wait()
         return box.load()
     }
 }

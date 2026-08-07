@@ -1,19 +1,28 @@
-Summary
+# Learnfold TestFlight — What to Test
 
-- Added a file/dir mount picker for local iPhone runtime mounts: press and hold the server pill to mount.
-- Added Real Time voice API-key fallback when OAuth realtime auth is unavailable.
-- Fixed active-turn composer text entry so Send is available while a turn is running.
-- Fixed a CarPlay voice crash when reopening or resuming an active voice session.
-- Improved Real Time voice error reporting for unexpected session closes.
-- Fixed OpenCode/Pi model catalog loading through Alleycat.
-- Fixed Pi/alleycat remote project browsing when directory-picker commands were rejected.
+## Summary
 
-What to test
+- Introduced the Learnfold course library and guided new-course flow.
+- Added topic, link, file, and photo source intake.
+- Added a short diagnostic, course-plan review, and progressive lesson generation.
+- Added course-scoped questions and course workspace reading.
+- Simplified Course Settings to show only currently supported learning agents.
+- Show connected Hermes details instead of a redundant connection prompt.
+- Added a persistent code-block preference: wrap long lines or scroll horizontally.
 
-- Local iPhone mounts: connect to the local iPhone runtime, press and hold the server pill, pick a file or directory, and confirm it mounts.
-- Real Time auth fallback: configure OAuth and an API key, start voice, and confirm fallback auth can connect.
-- Active-turn composer: type while a turn is running, confirm Send appears, then clear text and confirm Cancel returns.
-- CarPlay voice: start or resume CarPlay voice and confirm Now Playing opens without crashing.
-- Real Time errors: confirm an unexpected session close shows a specific error.
-- OpenCode/Pi models: connect to an Alleycat host, open the model picker, and confirm models load.
-- Remote project picker: connect to a Pi/alleycat host, open the new-project directory picker, and confirm folders load.
+Learnfold is an early external beta. Visible adaptation, reassessment, citations, continuation, and sync behavior are active development areas rather than finished claims.
+
+## What to test
+
+1. Create a course from a topic and complete the diagnostic.
+2. Review the proposed course plan before approving it.
+3. Generate the first lesson, open it, then return to the course library and resume.
+4. Add a link, file, or photo source and confirm the source remains attached to the course.
+5. Ask a question from inside a course and confirm the response remains scoped to that course.
+6. In Course Settings, confirm an already connected Hermes server is shown as connected and unavailable agents are hidden.
+7. In a lesson with a long code line, turn wrapping off and confirm the code block scrolls horizontally without wrapping.
+8. Relaunch during and after course generation and report any lost progress, duplicate content, or misleading readiness state.
+
+## Feedback
+
+Please include the course title, selected learning agent, the last visible step, and a screenshot when reporting a problem.

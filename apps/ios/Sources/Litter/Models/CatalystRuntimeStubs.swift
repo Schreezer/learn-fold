@@ -47,8 +47,6 @@ final class AppRuntimeController {
         await appModel.client.shutdownAlleycatEndpoint()
     }
 
-    func setDevicePushToken(_ token: Data) {}
-
     func reconnectSavedServers() async {
         guard let appModel else { return }
         let servers = SavedServerStore.reconnectRecords(
@@ -100,9 +98,19 @@ final class AppRuntimeController {
     }
 
     func handleSnapshot(_ snapshot: AppSnapshotRecord?) {}
-    func beginUserInitiatedTurn(key: ThreadKey, appModel: AppModel) -> UUID? { nil }
+    func beginUserInitiatedTurn(
+        key: ThreadKey,
+        appModel: AppModel,
+        agentName: String = "Codex",
+        keepsAliveAcrossTurns: Bool = false
+    ) -> UUID? { nil }
     func markUserInitiatedTurnAccepted(_ token: UUID?) {}
     func markUserInitiatedTurnStartFailed(_ token: UUID?) {}
+    func reuseUserInitiatedMultiTurnIfPresent(
+        key: ThreadKey,
+        agentName: String
+    ) -> UUID? { nil }
+    func finishUserInitiatedMultiTurn(key: ThreadKey, success: Bool) {}
     func appDidEnterBackground() {
         lastBackgroundedAt = Date()
     }

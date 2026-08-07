@@ -88,11 +88,15 @@ final class CourseCloudSyncStateStoreTests: XCTestCase {
         )
 
         let isSealed = try await store.isAccountSealed("old-account")
-        let oldOutbox = try await store.pendingOutbox(accountID: "old-account")
+        let sealedOutbox = try await store.pendingOutbox(accountID: "old-account")
         let newOutbox = try await store.pendingOutbox(accountID: "new-account")
         XCTAssertTrue(isSealed)
-        XCTAssertEqual(oldOutbox, [outbox])
+        XCTAssertEqual(sealedOutbox, [])
         XCTAssertEqual(newOutbox, [])
+
+        try await store.activateAccount("old-account")
+        let reactivatedOutbox = try await store.pendingOutbox(accountID: "old-account")
+        XCTAssertEqual(reactivatedOutbox, [outbox])
     }
 
     func testMigrationReceiptsAreAccountAndChecksumScoped() async throws {
@@ -149,6 +153,44 @@ final class CourseCloudSyncStateStoreTests: XCTestCase {
         XCTAssertNil(otherAccount)
     }
 
+    func testCourseProvenanceRetainsOwningCloudAccount() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try await store.setCourseProvenance(
+            workspaceID: "workspace",
+            provenance: .cloudAccount,
+            accountID: "account-a"
+        )
+
+        let provenance = try await store.courseProvenance(workspaceID: "workspace")
+        XCTAssertEqual(
+            provenance,
+            CourseCloudCourseProvenanceRecord(
+                provenance: .cloudAccount,
+                accountID: "account-a",
+                copiedFromAccountID: nil
+            )
+        )
+    }
+
+    func testCourseProvenanceCanRecordExplicitCrossAccountCopy() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try await store.setCourseProvenance(
+            workspaceID: "workspace",
+            provenance: .copiedFromAccount,
+            accountID: "account-b",
+            copiedFromAccountID: "account-a"
+        )
+
+        let provenance = try await store.courseProvenance(workspaceID: "workspace")
+        XCTAssertEqual(provenance?.provenance, .copiedFromAccount)
+        XCTAssertEqual(provenance?.accountID, "account-b")
+        XCTAssertEqual(provenance?.copiedFromAccountID, "account-a")
+    }
+
     func testMutationVectorsAdvancePerAccountWorkspace() async throws {
         let (store, directory) = try makeStore()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -177,6 +219,176 @@ final class CourseCloudSyncStateStoreTests: XCTestCase {
         XCTAssertEqual(otherAccount.dot.counter, 1)
     }
 
+    func testAcceptedCloudHeadSeedsNextMutationCausality() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let remoteVector = CourseSyncVersionVector(counters: ["remote": 4])
+        let head = CourseCloudHead(
+            workspaceID: "workspace",
+            generationID: "generation-1",
+            generationRecordName: "generation-record",
+            commitRecordName: "commit-record",
+            checksum: "checksum",
+            title: "Course",
+            previousGenerationID: nil,
+            version: remoteVector
+        )
+
+        try await store.setCloudHead(
+            accountID: "account-a",
+            head: head,
+            systemFields: Data("system-fields".utf8)
+        )
+        try await store.observeWorkspaceVector(
+            accountID: "account-a",
+            workspaceID: "workspace",
+            vector: remoteVector
+        )
+        let next = try await store.nextMutationVersion(
+            accountID: "account-a",
+            workspaceID: "workspace",
+            ancestorChecksum: "checksum"
+        )
+        let storedHead = try await store.cloudHead(
+            accountID: "account-a",
+            workspaceID: "workspace"
+        )
+
+        XCTAssertEqual(
+            storedHead,
+            CourseCloudStoredHead(head: head, systemFields: Data("system-fields".utf8))
+        )
+        XCTAssertTrue(next.observed.observes(.init(replicaID: "remote", counter: 4)))
+    }
+
+    func testNewStableHeadSupersedesOlderPendingCandidate() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stableRecordName = CourseSyncRecordName.course(workspaceID: "workspace")
+        let first = outboxEntry(
+            id: "head-generation-1",
+            recordName: stableRecordName,
+            createdAt: Date(timeIntervalSince1970: 1)
+        )
+        let second = outboxEntry(
+            id: "head-generation-2",
+            recordName: stableRecordName,
+            createdAt: Date(timeIntervalSince1970: 2)
+        )
+
+        try await store.enqueue(first)
+        try await store.supersedePendingHead(
+            accountID: "account-a",
+            workspaceID: "workspace",
+            recordName: stableRecordName
+        )
+        try await store.enqueue(second)
+
+        let pending = try await store.pendingOutbox(accountID: "account-a")
+        XCTAssertEqual(pending, [second])
+    }
+
+    func testAcceptSavedHeadCommitsCandidateHeadBaseAndVectorTogether() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recordName = CourseSyncRecordName.course(workspaceID: "workspace")
+        let outbox = outboxEntry(
+            id: "head-generation-1",
+            recordName: recordName,
+            createdAt: Date(timeIntervalSince1970: 1)
+        )
+        let vector = CourseSyncVersionVector(counters: ["remote": 2])
+        let head = CourseCloudHead(
+            workspaceID: "workspace",
+            generationID: "generation-1",
+            generationRecordName: "generation-record",
+            commitRecordName: "commit-record",
+            checksum: "checksum",
+            title: "Course",
+            previousGenerationID: nil,
+            version: vector
+        )
+        let snapshot = Data("snapshot".utf8)
+        try await store.enqueue(outbox)
+
+        try await store.acceptSavedHead(
+            accountID: "account-a",
+            entryID: outbox.id,
+            head: head,
+            systemFields: Data("system-fields".utf8),
+            snapshot: snapshot
+        )
+        let pending = try await store.pendingOutbox(accountID: "account-a")
+        let storedHead = try await store.cloudHead(
+            accountID: "account-a",
+            workspaceID: "workspace"
+        )
+        let storedBase = try await store.cloudBase(
+            accountID: "account-a",
+            workspaceID: "workspace"
+        )
+
+        XCTAssertEqual(pending, [])
+        XCTAssertEqual(
+            storedHead,
+            CourseCloudStoredHead(head: head, systemFields: Data("system-fields".utf8))
+        )
+        XCTAssertEqual(storedBase, snapshot)
+        let next = try await store.nextMutationVersion(
+            accountID: "account-a",
+            workspaceID: "workspace",
+            ancestorChecksum: "checksum"
+        )
+        XCTAssertTrue(next.observed.observes(.init(replicaID: "remote", counter: 2)))
+    }
+
+    func testAcceptSavedHeadRollsBackWhenCandidateIsStale() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outbox = outboxEntry(
+            id: "new-head",
+            recordName: CourseSyncRecordName.course(workspaceID: "workspace"),
+            createdAt: Date(timeIntervalSince1970: 2)
+        )
+        let head = CourseCloudHead(
+            workspaceID: "workspace",
+            generationID: "old-generation",
+            generationRecordName: "generation-record",
+            commitRecordName: "commit-record",
+            checksum: "checksum",
+            title: "Course",
+            previousGenerationID: nil,
+            version: .init(counters: ["replica": 1])
+        )
+        try await store.enqueue(outbox)
+
+        do {
+            try await store.acceptSavedHead(
+                accountID: "account-a",
+                entryID: "old-head",
+                head: head,
+                systemFields: Data("system-fields".utf8),
+                snapshot: Data("snapshot".utf8)
+            )
+            XCTFail("Expected stale candidate rejection")
+        } catch {
+            XCTAssertEqual(error as? CourseCloudSyncStateError, .accountScopeMismatch)
+        }
+        let pending = try await store.pendingOutbox(accountID: "account-a")
+        let storedHead = try await store.cloudHead(
+            accountID: "account-a",
+            workspaceID: "workspace"
+        )
+        let storedBase = try await store.cloudBase(
+            accountID: "account-a",
+            workspaceID: "workspace"
+        )
+
+        XCTAssertEqual(pending, [outbox])
+        XCTAssertNil(storedHead)
+        XCTAssertNil(storedBase)
+    }
+
     private func makeStore() throws -> (CourseCloudSyncStateStore, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CourseCloudSyncStateStoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -197,6 +409,24 @@ final class CourseCloudSyncStateStoreTests: XCTestCase {
             durableAssetPath: nil,
             checksum: "checksum",
             receivedAt: Date(timeIntervalSince1970: 1)
+        )
+    }
+
+    private func outboxEntry(
+        id: String,
+        recordName: String,
+        createdAt: Date
+    ) -> CourseCloudOutboxEntry {
+        CourseCloudOutboxEntry(
+            id: id,
+            accountID: "account-a",
+            workspaceID: "workspace",
+            zoneName: CourseCloudSyncSchema.catalogZoneName,
+            recordName: recordName,
+            changeKind: .save,
+            payload: Data(id.utf8),
+            mutationVersion: nil,
+            createdAt: createdAt
         )
     }
 }

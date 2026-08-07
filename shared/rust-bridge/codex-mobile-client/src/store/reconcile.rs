@@ -1012,6 +1012,7 @@ mod tests {
     fn merge_paged_turns_empty_store_first_desc_page() {
         let mut thread = test_thread_snapshot();
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             // Desc page: turn-3 newest, then turn-2, then turn-1.
             turns: vec![
                 item_with_turn("turn-3", "i3"),
@@ -1047,6 +1048,7 @@ mod tests {
         thread.initial_turns_loaded = true;
         thread.older_turns_cursor = Some("cursor-first".to_string());
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             turns: vec![
                 item_with_turn("turn-2", "i2"),
                 item_with_turn("turn-1", "i1"),
@@ -1078,6 +1080,7 @@ mod tests {
         thread.items = vec![item_with_turn("turn-3", "i3")];
         thread.initial_turns_loaded = true;
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             turns: vec![
                 item_with_turn("turn-3", "i3-dup"),
                 item_with_turn("turn-2", "i2"),
@@ -1105,6 +1108,7 @@ mod tests {
         live_item.source_turn_id = None;
         thread.items = vec![live_item];
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             turns: vec![item_with_turn("turn-1", "stable-user-id")],
             next_cursor: None,
             backwards_cursor: None,
@@ -1123,6 +1127,7 @@ mod tests {
         let replay_item = item_with_turn("turn-1", "persisted-user-id");
         thread.items = vec![live_item];
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             turns: vec![replay_item],
             next_cursor: None,
             backwards_cursor: None,
@@ -1143,6 +1148,7 @@ mod tests {
             assistant_item(None, "live-assistant-id", "partial"),
         ];
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             turns: vec![
                 item_with_turn("turn-1", "persisted-user-id"),
                 assistant_item(Some("turn-1"), "persisted-assistant-id", "final"),
@@ -1167,6 +1173,7 @@ mod tests {
             assistant_item(None, "live-assistant-id", "partial"),
         ];
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             turns: vec![
                 item_with_turn("turn-1", "persisted-user-id"),
                 assistant_item(Some("turn-1"), "persisted-assistant-id", "final"),
@@ -1197,6 +1204,7 @@ mod tests {
             assistant_item(Some("active-turn"), "active-assistant-id", "partial"),
         ];
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             turns: vec![
                 item_with_turn("turn-1", "persisted-user-id"),
                 assistant_item(Some("turn-1"), "persisted-assistant-id", "final"),
@@ -1222,6 +1230,7 @@ mod tests {
             assistant_item(Some("turn-1"), "late-stream-assistant-id", "late duplicate"),
         ];
         let page = AppListThreadTurnsResponse {
+            turn_states: vec![],
             turns: vec![
                 item_with_turn("turn-1", "persisted-user-id"),
                 assistant_item(Some("turn-1"), "persisted-assistant-id", "final"),

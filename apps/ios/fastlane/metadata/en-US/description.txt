@@ -1,12 +1,16 @@
-Litter is a native mobile client for Codex.
+Learnfold is a native iOS learning workspace that turns a topic, link, document, or photo into a personal course you can explore, question, and build on.
 
-Connect to local or remote Codex servers, manage coding sessions from anywhere, and keep conversations moving without opening your laptop.
+Start from what caught your attention. Learnfold helps establish your learning goal and starting point, creates a concise course plan for your review, and generates lessons progressively instead of producing an entire synthetic textbook at once.
 
-Features:
-- Discover Codex servers on your local network automatically
-- Connect to remote machines over SSH and start Codex remotely
-- Talk to Codex with voice input for fast, hands-free prompts
-- Review conversation history, reasoning, code blocks, and images in a mobile-native UI
-- Stay connected to the servers you control instead of sending your work through a hosted relay
+With Learnfold you can:
+- Begin with a topic, webpage, document, or photo
+- Answer a short diagnostic and review the proposed course plan
+- Read and organize course material in a native workspace
+- Generate the next lesson with a connected Hermes learning agent or an available Apple on-device model
+- Ask questions in the context of the current course
+- Choose whether long code lines wrap or scroll horizontally
+- Keep working from the course library and return to material you already generated
 
-Litter is open source and built for people who want their coding agent with them wherever they are.
+Learnfold is being developed around a simple principle: learning matters more than content generation. The long-term goal is a course that responds to evidence, explains meaningful changes, and keeps the learner in control.
+
+AI-generated material can be incomplete or incorrect. Review important claims and source material, especially for high-stakes subjects.

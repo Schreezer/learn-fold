@@ -29,9 +29,9 @@ use crate::store::{
 use crate::transport::{RpcError, TransportError};
 use crate::types::{
     AgentRuntimeInfo, AgentRuntimeKind, AppCollaborationModePreset, AppModeKind,
-    ApprovalDecisionValue, PendingApproval, PendingApprovalSeed, PendingUserInputAnswer,
-    PendingUserInputRequest, PendingUserInputResponseKind, PendingUserInputSeed, ThreadInfo,
-    ThreadKey, ThreadSummaryStatus,
+    AppTurnSubmissionKind, AppTurnSubmissionReceipt, ApprovalDecisionValue, PendingApproval,
+    PendingApprovalSeed, PendingUserInputAnswer, PendingUserInputRequest,
+    PendingUserInputResponseKind, PendingUserInputSeed, ThreadInfo, ThreadKey, ThreadSummaryStatus,
 };
 use codex_app_server_protocol as upstream;
 
@@ -3133,7 +3133,7 @@ impl MobileClient {
         &self,
         server_id: &str,
         params: upstream::TurnStartParams,
-    ) -> Result<(), RpcError> {
+    ) -> Result<AppTurnSubmissionReceipt, RpcError> {
         self.get_session(server_id)?;
         let mut params = params;
         let thread_key = ThreadKey {
@@ -3195,7 +3195,10 @@ impl MobileClient {
         // When a draft was queued, the user can Steer it or it will auto-send
         // when the turn finishes.  Don't also auto-steer here.
         if queued_draft.is_some() {
-            return Ok(());
+            return Ok(AppTurnSubmissionReceipt {
+                kind: AppTurnSubmissionKind::Queued,
+                turn_id: None,
+            });
         }
 
         // If there's an active turn, try turn/steer first (injects input
@@ -3222,10 +3225,13 @@ impl MobileClient {
                 )
                 .await;
             match steer_result {
-                Ok(_) => {
+                Ok(response) => {
                     // Draft cleanup happens via TurnStarted / item upsert;
                     // don't remove here so the user sees the queued preview.
-                    return Ok(());
+                    return Ok(AppTurnSubmissionReceipt {
+                        kind: AppTurnSubmissionKind::Steered,
+                        turn_id: Some(response.turn_id),
+                    });
                 }
                 Err(_) => {
                     // Turn not steerable or gone — fall through to turn/start.
@@ -3276,7 +3282,10 @@ impl MobileClient {
                 &response.turn.id,
             );
         }
-        Ok(())
+        Ok(AppTurnSubmissionReceipt {
+            kind: AppTurnSubmissionKind::Started,
+            turn_id: Some(response.turn.id),
+        })
     }
 
     pub async fn steer_queued_follow_up(
@@ -3871,6 +3880,7 @@ impl MobileClient {
             },
         )
         .await
+        .map(|_| ())
     }
 
     pub fn set_voice_handoff_thread(&self, key: Option<ThreadKey>) {

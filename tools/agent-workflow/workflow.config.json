@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "maxRoundsPerLoop": 5,
+  "turnTimeoutMs": 600000,
+  "requireCleanWorktreeForEngineer": true,
+  "models": {
+    "lead": { "candidates": ["gpt-5.6-sol", "gpt-5.6-terra"], "reasoningEffort": "high" },
+    "productStrategist": { "candidates": ["gpt-5.6-sol", "gpt-5.6-terra"], "reasoningEffort": "high" },
+    "engineer": { "candidates": ["gpt-5.6-terra", "gpt-5.6-sol"], "reasoningEffort": "high" },
+    "testDesigner": { "candidates": ["gpt-5.6-terra", "gpt-5.6-sol"], "reasoningEffort": "medium" },
+    "testExecutor": { "candidates": ["gpt-5.6-luna", "gpt-5.6-terra"], "reasoningEffort": "medium" },
+    "uxAcceptance": { "candidates": ["gpt-5.6-terra", "gpt-5.6-sol"], "reasoningEffort": "high" },
+    "reviewer": { "candidates": ["gpt-5.6-sol", "gpt-5.6-terra"], "reasoningEffort": "high" },
+    "finalRegression": { "candidates": ["gpt-5.6-luna", "gpt-5.6-terra"], "reasoningEffort": "medium" }
+  }
+}

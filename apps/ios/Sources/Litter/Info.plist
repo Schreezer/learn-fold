@@ -34,7 +34,7 @@
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>LearnfoldCourseCloudSyncEnabled</key>
-	<false/>
+	<true/>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>tailscale</string>
@@ -58,12 +58,10 @@
 	</dict>
 	<key>NSBonjourServices</key>
 	<array>
-		<string>_codex._tcp</string>
-		<string>_ssh._tcp</string>
 		<string>_litter-pair._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Codex discovers coding agents and SSH servers on your local network.</string>
+	<string>Learnfold uses your local network to find and pair with your Hermes server.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Learnfold uses the camera to capture photos for conversations.</string>
 	<key>NSMicrophoneUsageDescription</key>
@@ -111,7 +109,6 @@
 	<array>
 		<string>audio</string>
 		<string>fetch</string>
-		<string>remote-notification</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

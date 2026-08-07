@@ -12,6 +12,19 @@ struct CourseCloudRecordEnvelope: Codable, Equatable, Sendable {
     let recordType: String
     let fields: [String: String]
     let assetPayload: Data?
+    let systemFields: Data?
+
+    init(
+        recordType: String,
+        fields: [String: String],
+        assetPayload: Data?,
+        systemFields: Data? = nil
+    ) {
+        self.recordType = recordType
+        self.fields = fields
+        self.assetPayload = assetPayload
+        self.systemFields = systemFields
+    }
 }
 
 enum CourseCloudSyncAvailability: Equatable, Sendable {
@@ -23,15 +36,20 @@ enum CourseCloudSyncAvailability: Equatable, Sendable {
 
 enum CourseCloudSyncEngineError: LocalizedError {
     case notStarted
+    case staleEngine
     case invalidEnvelope(String)
     case missingAsset(String)
     case checksumMismatch(String)
     case missingMergeBase(String)
+    case accountQuarantined(String)
+    case waitingForHeadContent(String)
 
     var errorDescription: String? {
         switch self {
         case .notStarted:
             "Course iCloud sync has not started."
+        case .staleEngine:
+            "The iCloud account changed while the course was being queued."
         case .invalidEnvelope(let recordName):
             "The queued CloudKit record \(recordName) is invalid."
         case .missingAsset(let recordName):
@@ -40,6 +58,10 @@ enum CourseCloudSyncEngineError: LocalizedError {
             "The CloudKit payload checksum did not match for \(recordName)."
         case .missingMergeBase(let workspaceID):
             "Course \(workspaceID) exists locally but has no trusted cloud merge base."
+        case .accountQuarantined(let workspaceID):
+            "Course \(workspaceID) belongs to a different iCloud account and remains local-only until it is explicitly copied."
+        case .waitingForHeadContent(let workspaceID):
+            "Course \(workspaceID) is waiting for its accepted iCloud generation to arrive."
         }
     }
 }
@@ -60,13 +82,29 @@ enum CourseCloudEntitlement {
 actor CourseCloudSyncEngine: CKSyncEngineDelegate {
     static let shared = CourseCloudSyncEngine()
 
+    private struct DeferredEngineContext: Equatable {
+        let epoch: UInt64
+        let accountID: String
+    }
+
     private var container: CKContainer?
     private let stateStore: CourseCloudSyncStateStore?
     private let stagingDirectory: URL?
     private var engine: CKSyncEngine?
     private var accountID: String?
     private var bufferedFetchedEntries: [CourseCloudInboxEntry] = []
+    private var bufferedCreatedAssetPaths: [String] = []
+    private var fetchedBatchFailed = false
     private var workspacesBeingQueued: Set<String> = []
+    private var delegateEventDepth = 0
+    private var engineEpoch: UInt64 = 0
+    private var lifecycleGeneration: UInt64 = 0
+    private var deferredRestart = false
+    private var deferredFetchAfterRestart = false
+    private var deferredFetch: DeferredEngineContext?
+    private var deferredDrain: DeferredEngineContext?
+    private var deferredSend: DeferredEngineContext?
+    private var deferredEngineWorkerScheduled = false
     private(set) var availability: CourseCloudSyncAvailability = .missingEntitlement
 
     init(
@@ -101,6 +139,12 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             availability = .failed("Could not open the course sync state database.")
             return
         }
+        if engine != nil, accountID != nil, availability == .available {
+            return
+        }
+
+        lifecycleGeneration &+= 1
+        let startupGeneration = lifecycleGeneration
 
         do {
             try FileManager.default.createDirectory(
@@ -112,8 +156,12 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
                 ?? CKContainer(identifier: CourseCloudEntitlement.containerIdentifier)
             container = resolvedContainer
             let userRecordID = try await resolvedContainer.userRecordID()
+            guard startupGeneration == lifecycleGeneration else { return }
             let resolvedAccountID = userRecordID.recordName
+            try await stateStore.activateAccount(resolvedAccountID)
+            guard startupGeneration == lifecycleGeneration else { return }
             let serializedData = try await stateStore.engineState(accountID: resolvedAccountID)
+            guard startupGeneration == lifecycleGeneration else { return }
             let serializedState = try serializedData.map {
                 try JSONDecoder().decode(CKSyncEngine.State.Serialization.self, from: $0)
             }
@@ -127,6 +175,8 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             configuration.subscriptionID = "learnfold-course-sync-v1"
 
             let syncEngine = CKSyncEngine(configuration)
+            guard startupGeneration == lifecycleGeneration else { return }
+            engineEpoch &+= 1
             accountID = resolvedAccountID
             engine = syncEngine
             availability = .available
@@ -139,35 +189,59 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
                 )
             }
             try await restorePendingOutbox(into: syncEngine, accountID: resolvedAccountID)
+            guard startupGeneration == lifecycleGeneration,
+                  syncEngine === engine else { return }
             let repositories = await CourseDocumentRegistry.shared.openRepositories()
+            guard startupGeneration == lifecycleGeneration,
+                  syncEngine === engine else { return }
             for repository in repositories {
                 await queueRepositoryChangesIfNeeded(repository: repository)
+                guard startupGeneration == lifecycleGeneration,
+                      syncEngine === engine else { return }
             }
         } catch let error as CKError where error.code == .notAuthenticated {
-            availability = .noAccount
+            if startupGeneration == lifecycleGeneration {
+                availability = .noAccount
+            }
         } catch {
-            availability = .failed(error.localizedDescription)
+            if startupGeneration == lifecycleGeneration {
+                availability = .failed(error.localizedDescription)
+            }
         }
     }
 
     func fetchChanges() async -> Bool {
         guard let engine else { return false }
+        if delegateEventDepth > 0 {
+            enqueueDeferredFetch()
+            return true
+        }
+        let capturedEpoch = engineEpoch
         do {
             try await engine.fetchChanges()
+            guard capturedEpoch == engineEpoch, engine === self.engine else { return false }
             return true
         } catch {
-            availability = .failed(error.localizedDescription)
+            if capturedEpoch == engineEpoch, engine === self.engine {
+                availability = .failed(error.localizedDescription)
+            }
             return false
         }
     }
 
     func applyPendingFetchedChanges() async {
-        guard let accountID else { return }
+        guard let context = currentDeferredContext() else { return }
         do {
-            try await drainInbox(accountID: accountID)
-            availability = .available
+            try await drainInbox(context: context)
+            if isCurrent(context) {
+                availability = .available
+            }
+        } catch CourseCloudSyncEngineError.staleEngine {
+            return
         } catch {
-            availability = .failed(error.localizedDescription)
+            if isCurrent(context) {
+                availability = .failed(error.localizedDescription)
+            }
         }
     }
 
@@ -178,17 +252,39 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         guard let engine, let accountID, let stateStore else {
             throw CourseCloudSyncEngineError.notStarted
         }
+        let capturedEpoch = engineEpoch
+        let capturedAccountID = accountID
 
         let mutationReceipts = try await repository.pendingSyncMutationReceipts(limit: 10_000)
         let draft = try await repository.exportSyncSnapshot(generationID: "checksum-probe")
         let workspaceID = draft.manifest.workspaceID
+        if let provenance = try await stateStore.courseProvenance(workspaceID: workspaceID),
+           let ownerAccountID = provenance.accountID,
+           ownerAccountID != accountID {
+            throw CourseCloudSyncEngineError.accountQuarantined(workspaceID)
+        }
         let baseData = try await stateStore.cloudBase(
             accountID: accountID,
             workspaceID: workspaceID
         )
-        let ancestorChecksum = try baseData.map {
-            try Self.decoder.decode(CourseSyncWorkspaceSnapshot.self, from: $0).checksum
+        let acceptedHead = try await stateStore.cloudHead(
+            accountID: accountID,
+            workspaceID: workspaceID
+        )
+        let decodedBase = try baseData.map {
+            try Self.decoder.decode(CourseSyncWorkspaceSnapshot.self, from: $0)
         }
+        if let acceptedHead, decodedBase?.checksum != acceptedHead.head.checksum {
+            throw CourseCloudSyncEngineError.waitingForHeadContent(workspaceID)
+        }
+        if let acceptedHead {
+            try await stateStore.observeWorkspaceVector(
+                accountID: accountID,
+                workspaceID: workspaceID,
+                vector: acceptedHead.head.version
+            )
+        }
+        let ancestorChecksum = decodedBase?.checksum
         let mutationVersion = try await stateStore.nextMutationVersion(
             accountID: accountID,
             workspaceID: workspaceID,
@@ -204,6 +300,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         )
         let snapshot = try await repository.exportSyncSnapshot(
             generationID: generationID,
+            previousGenerationID: acceptedHead?.head.generationID,
             version: mutationVersion.resultingVector
         )
         let resolvedTitle = title
@@ -216,7 +313,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         )
         let generationRecordName = "\(generationBaseName).workspace.\(snapshot.checksum)"
         let commitRecordName = "\(generationBaseName).commit"
-        let catalogRecordName = "\(generationBaseName).catalog"
+        let catalogRecordName = CourseSyncRecordName.course(workspaceID: workspaceID)
         let commit = try CourseSyncGenerationCommit(
             workspaceID: workspaceID,
             generationID: generationID,
@@ -235,6 +332,16 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
 
         let contentZone = CourseCloudSyncSchema.contentZoneName
         let catalogZone = CourseCloudSyncSchema.catalogZoneName
+        let head = CourseCloudHead(
+            workspaceID: workspaceID,
+            generationID: generationID,
+            generationRecordName: generationRecordName,
+            commitRecordName: commitRecordName,
+            checksum: snapshot.checksum,
+            title: resolvedTitle,
+            previousGenerationID: snapshot.manifest.previousGenerationID,
+            version: snapshot.manifest.version
+        )
         let entries = [
             try Self.outboxEntry(
                 accountID: accountID,
@@ -282,23 +389,37 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
                         "commitRecordName": commitRecordName,
                         "checksum": snapshot.checksum,
                         "title": resolvedTitle,
+                        "previousGenerationID": snapshot.manifest.previousGenerationID ?? "",
+                        "versionJSON": Self.encoder.encode(snapshot.manifest.version).base64EncodedString(),
                     ],
-                    assetPayload: nil
+                    assetPayload: nil,
+                    systemFields: acceptedHead?.systemFields
                 ),
-                mutationVersion: mutationVersion
+                mutationVersion: mutationVersion,
+                candidateID: head.generationID
             ),
         ]
 
+        try await stateStore.supersedePendingHead(
+            accountID: accountID,
+            workspaceID: workspaceID,
+            recordName: catalogRecordName
+        )
         for entry in entries {
             try await stateStore.enqueue(entry)
         }
         try await repository.acknowledgeSyncMutationReceipts(ids: mutationReceipts.map(\.id))
+        guard capturedEpoch == engineEpoch,
+              capturedAccountID == self.accountID,
+              engine === self.engine else {
+            throw CourseCloudSyncEngineError.staleEngine
+        }
         engine.state.add(
             pendingRecordZoneChanges: entries.map {
                 .saveRecord(Self.recordID(zoneName: $0.zoneName, recordName: $0.recordName))
             }
         )
-        try await engine.sendChanges()
+        enqueueDeferredSend()
         try await stateStore.recordMigrationReceipt(
             accountID: accountID,
             workspaceID: workspaceID,
@@ -322,6 +443,11 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         do {
             guard !(try await repository.pendingSyncMutationReceipts()).isEmpty else { return }
             try await queueWorkspaceGeneration(repository: repository)
+        } catch CourseCloudSyncEngineError.staleEngine,
+                CourseCloudSyncEngineError.accountQuarantined,
+                CourseCloudSyncEngineError.waitingForHeadContent {
+            // A workspace owned by another iCloud account remains local and
+            // must not disable sync for unrelated courses.
         } catch {
             availability = .failed(error.localizedDescription)
         }
@@ -329,50 +455,91 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
 
     func handleEvent(_ event: CKSyncEngine.Event, syncEngine: CKSyncEngine) async {
         guard let stateStore else { return }
+        guard syncEngine === engine else { return }
+        guard let callbackContext = currentDeferredContext() else { return }
+        delegateEventDepth += 1
+        defer {
+            delegateEventDepth -= 1
+            scheduleDeferredEngineWorkerIfNeeded()
+        }
         do {
             switch event {
             case .stateUpdate(let update):
                 guard let accountID else { return }
+                if fetchedBatchFailed {
+                    fetchedBatchFailed = false
+                    bufferedFetchedEntries.removeAll(keepingCapacity: true)
+                    for path in bufferedCreatedAssetPaths {
+                        try? FileManager.default.removeItem(atPath: path)
+                    }
+                    bufferedCreatedAssetPaths.removeAll(keepingCapacity: true)
+                    invalidateEngine()
+                    enqueueDeferredRestart(fetchAfterStart: true)
+                    return
+                }
                 let stateData = try Self.encoder.encode(update.stateSerialization)
                 try await stateStore.commitFetchedBatch(
                     accountID: accountID,
                     stateSerialization: stateData,
                     entries: bufferedFetchedEntries
                 )
+                try ensureCurrent(callbackContext, engine: syncEngine)
                 bufferedFetchedEntries.removeAll(keepingCapacity: true)
-                try await drainInbox(accountID: accountID)
+                bufferedCreatedAssetPaths.removeAll(keepingCapacity: true)
+                enqueueDeferredDrain()
 
             case .accountChange(let change):
                 try await handleAccountChange(change, syncEngine: syncEngine)
 
             case .fetchedRecordZoneChanges(let changes):
                 guard let accountID else { return }
-                for modification in changes.modifications {
-                    bufferedFetchedEntries.append(
-                        try stageFetchedRecord(modification.record, accountID: accountID)
-                    )
-                }
-                for deletion in changes.deletions {
-                    bufferedFetchedEntries.append(
-                        CourseCloudInboxEntry(
-                            id: Self.changeID(
-                                recordID: deletion.recordID,
-                                version: "delete-\(deletion.recordType)"
-                            ),
-                            accountID: accountID,
-                            zoneName: deletion.recordID.zoneID.zoneName,
-                            recordName: deletion.recordID.recordName,
-                            changeKind: .delete,
-                            payload: nil,
-                            durableAssetPath: nil,
-                            checksum: nil,
-                            receivedAt: .now
+                guard !fetchedBatchFailed else { return }
+                var eventEntries: [CourseCloudInboxEntry] = []
+                var eventCreatedAssetPaths: [String] = []
+                do {
+                    for modification in changes.modifications {
+                        let staged = try stageFetchedRecord(
+                            modification.record,
+                            accountID: accountID
                         )
-                    )
+                        eventEntries.append(staged.entry)
+                        if let path = staged.createdAssetPath {
+                            eventCreatedAssetPaths.append(path)
+                        }
+                    }
+                    for deletion in changes.deletions {
+                        eventEntries.append(
+                            CourseCloudInboxEntry(
+                                id: Self.changeID(
+                                    recordID: deletion.recordID,
+                                    version: "delete-\(deletion.recordType)"
+                                ),
+                                accountID: accountID,
+                                zoneName: deletion.recordID.zoneID.zoneName,
+                                recordName: deletion.recordID.recordName,
+                                changeKind: .delete,
+                                payload: nil,
+                                durableAssetPath: nil,
+                                checksum: nil,
+                                receivedAt: .now
+                            )
+                        )
+                    }
+                    bufferedFetchedEntries.append(contentsOf: eventEntries)
+                    bufferedCreatedAssetPaths.append(contentsOf: eventCreatedAssetPaths)
+                } catch {
+                    for path in bufferedCreatedAssetPaths + eventCreatedAssetPaths {
+                        try? FileManager.default.removeItem(atPath: path)
+                    }
+                    bufferedFetchedEntries.removeAll(keepingCapacity: true)
+                    bufferedCreatedAssetPaths.removeAll(keepingCapacity: true)
+                    fetchedBatchFailed = true
+                    throw error
                 }
 
             case .fetchedDatabaseChanges(let changes):
                 guard let accountID else { return }
+                guard !fetchedBatchFailed else { return }
                 for deletion in changes.deletions where Self.zoneIDs.contains(deletion.zoneID) {
                     let kind: CourseCloudChangeKind
                     switch deletion.reason {
@@ -402,15 +569,14 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
 
             case .sentRecordZoneChanges(let changes):
                 guard let accountID else { return }
-                try await stateStore.markOutboxSent(
-                    accountID: accountID,
-                    recordIDs: changes.savedRecords.map(\.recordID.recordName)
-                )
-                try await acceptIdempotentServerRecords(
+                try await acceptSavedRecords(changes.savedRecords, accountID: accountID)
+                try ensureCurrent(callbackContext, engine: syncEngine)
+                try await resolveFailedRecordSaves(
                     changes.failedRecordSaves,
                     accountID: accountID,
                     syncEngine: syncEngine
                 )
+                try ensureCurrent(callbackContext, engine: syncEngine)
                 syncEngine.state.remove(
                     pendingRecordZoneChanges: changes.deletedRecordIDs.map {
                         .deleteRecord($0)
@@ -420,8 +586,12 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             default:
                 break
             }
+        } catch CourseCloudSyncEngineError.staleEngine {
+            return
         } catch {
-            availability = .failed(error.localizedDescription)
+            if isCurrent(callbackContext, engine: syncEngine) {
+                availability = .failed(error.localizedDescription)
+            }
         }
     }
 
@@ -429,6 +599,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         _ context: CKSyncEngine.SendChangesContext,
         syncEngine: CKSyncEngine
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
+        guard syncEngine === engine else { return nil }
         guard let accountID, let stateStore else { return nil }
         do {
             let outbox = try await stateStore.pendingOutbox(accountID: accountID, limit: 500)
@@ -474,7 +645,21 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         guard entry.changeKind == .save, let payload = entry.payload else { return nil }
         let envelope = try Self.decoder.decode(CourseCloudRecordEnvelope.self, from: payload)
         let recordID = Self.recordID(zoneName: entry.zoneName, recordName: entry.recordName)
-        let record = CKRecord(recordType: envelope.recordType, recordID: recordID)
+        let record: CKRecord
+        if let systemFields = envelope.systemFields {
+            let unarchiver = try NSKeyedUnarchiver(forReadingFrom: systemFields)
+            unarchiver.requiresSecureCoding = true
+            guard let restored = CKRecord(coder: unarchiver) else {
+                throw CourseCloudSyncEngineError.invalidEnvelope(entry.recordName)
+            }
+            unarchiver.finishDecoding()
+            guard restored.recordID == recordID, restored.recordType == envelope.recordType else {
+                throw CourseCloudSyncEngineError.invalidEnvelope(entry.recordName)
+            }
+            record = restored
+        } else {
+            record = CKRecord(recordType: envelope.recordType, recordID: recordID)
+        }
         for (key, value) in envelope.fields {
             record[key] = value as CKRecordValue
         }
@@ -502,9 +687,10 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
     private func stageFetchedRecord(
         _ record: CKRecord,
         accountID: String
-    ) throws -> CourseCloudInboxEntry {
+    ) throws -> (entry: CourseCloudInboxEntry, createdAssetPath: String?) {
         let checksum = record["payloadChecksum"] as? String
         var durableAssetPath: String?
+        var createdAssetPath: String?
         if let asset = record["payload"] as? CKAsset {
             guard let sourceURL = asset.fileURL, let stagingDirectory else {
                 throw CourseCloudSyncEngineError.missingAsset(record.recordID.recordName)
@@ -522,6 +708,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             )
             if !FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.copyItem(at: sourceURL, to: destination)
+                createdAssetPath = destination.path
                 try FileManager.default.setAttributes(
                     [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
                     ofItemAtPath: destination.path
@@ -541,27 +728,31 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             recordType: record.recordType,
             fields: record.allKeys().reduce(into: [:]) { result, key in
                 if let string = record[key] as? String { result[key] = string }
-            }
+            },
+            systemFields: try Self.archivedSystemFields(for: record)
         )
-        return CourseCloudInboxEntry(
-            id: Self.changeID(
-                recordID: record.recordID,
-                version: record.recordChangeTag ?? checksum ?? "new"
+        return (
+            CourseCloudInboxEntry(
+                id: Self.changeID(
+                    recordID: record.recordID,
+                    version: record.recordChangeTag ?? checksum ?? "new"
+                ),
+                accountID: accountID,
+                zoneName: record.recordID.zoneID.zoneName,
+                recordName: record.recordID.recordName,
+                changeKind: .save,
+                payload: try Self.encoder.encode(metadata),
+                durableAssetPath: durableAssetPath,
+                checksum: checksum,
+                receivedAt: .now
             ),
-            accountID: accountID,
-            zoneName: record.recordID.zoneID.zoneName,
-            recordName: record.recordID.recordName,
-            changeKind: .save,
-            payload: try Self.encoder.encode(metadata),
-            durableAssetPath: durableAssetPath,
-            checksum: checksum,
-            receivedAt: .now
+            createdAssetPath
         )
     }
 
     private func handleAccountChange(
         _ event: CKSyncEngine.Event.AccountChange,
-        syncEngine: CKSyncEngine
+        syncEngine _: CKSyncEngine
     ) async throws {
         guard let stateStore else { return }
         let previous = accountID
@@ -576,6 +767,10 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         @unknown default:
             current = nil
         }
+        if previous == current {
+            availability = current == nil ? .noAccount : .available
+            return
+        }
         if let previous, previous != current {
             try await stateStore.sealAccount(
                 previous,
@@ -587,16 +782,21 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             )
         }
         bufferedFetchedEntries.removeAll()
-        accountID = current
-        if let current {
-            try await restorePendingOutbox(into: syncEngine, accountID: current)
-            availability = .available
+        for path in bufferedCreatedAssetPaths {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+        bufferedCreatedAssetPaths.removeAll()
+        fetchedBatchFailed = false
+        if current != nil {
+            invalidateEngine()
+            enqueueDeferredRestart(fetchAfterStart: false)
         } else {
+            invalidateEngine()
             availability = .noAccount
         }
     }
 
-    private func acceptIdempotentServerRecords(
+    private func resolveFailedRecordSaves(
         _ failures: [CKSyncEngine.Event.SentRecordZoneChanges.FailedRecordSave],
         accountID: String,
         syncEngine: CKSyncEngine
@@ -605,11 +805,20 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         for failure in failures {
             guard failure.error.code == .serverRecordChanged,
                   let server = failure.error.serverRecord,
-                  let localChecksum = failure.record["checksum"] as? String,
-                  server["checksum"] as? String == localChecksum else {
+                  let localChecksum = failure.record["checksum"] as? String else {
                 continue
             }
             let recordID = failure.record.recordID
+            if failure.record.recordType == CourseCloudRecordType.catalogEntry {
+                try await resolveHeadConflict(
+                    local: failure.record,
+                    server: server,
+                    accountID: accountID,
+                    syncEngine: syncEngine
+                )
+                continue
+            }
+            guard server["checksum"] as? String == localChecksum else { continue }
             try await stateStore.markOutboxSent(
                 accountID: accountID,
                 recordIDs: [recordID.recordName]
@@ -618,9 +827,271 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         }
     }
 
-    private func drainInbox(accountID: String) async throws {
+    private func acceptSavedRecords(
+        _ records: [CKRecord],
+        accountID: String
+    ) async throws {
         guard let stateStore else { return }
-        let pending = try await stateStore.pendingInbox(accountID: accountID, limit: 500)
+        for record in records.sorted(by: {
+            ($0.recordType == CourseCloudRecordType.catalogEntry ? 1 : 0)
+                < ($1.recordType == CourseCloudRecordType.catalogEntry ? 1 : 0)
+        }) {
+            guard record.recordType == CourseCloudRecordType.catalogEntry else {
+                if let entry = try await stateStore.pendingOutbox(
+                    accountID: accountID,
+                    recordName: record.recordID.recordName
+                ) {
+                    try await stateStore.markOutboxSent(accountID: accountID, entryIDs: [entry.id])
+                }
+                continue
+            }
+            let head = try Self.decodeHead(record)
+            guard let pending = try await pendingHeadEntry(
+                matching: head,
+                accountID: accountID
+            ) else {
+                // A success callback for a superseded head must never
+                // acknowledge the newer candidate sharing this record ID.
+                continue
+            }
+            let snapshotData = try await localSnapshotData(
+                for: head,
+                accountID: accountID
+            )
+            try await stateStore.acceptSavedHead(
+                accountID: accountID,
+                entryID: pending.id,
+                head: head,
+                systemFields: Self.archivedSystemFields(for: record),
+                snapshot: snapshotData
+            )
+        }
+    }
+
+    private func resolveHeadConflict(
+        local: CKRecord,
+        server: CKRecord,
+        accountID: String,
+        syncEngine: CKSyncEngine
+    ) async throws {
+        guard let stateStore else { return }
+        let localHead = try Self.decodeHead(local)
+        let serverHead = try Self.decodeHead(server)
+        guard localHead.workspaceID == serverHead.workspaceID,
+              local.recordID == server.recordID else {
+            throw CourseCloudSyncEngineError.invalidEnvelope(local.recordID.recordName)
+        }
+        let pending = try await stateStore.pendingOutbox(
+            accountID: accountID,
+            recordName: local.recordID.recordName
+        )
+
+        if localHead.generationID == serverHead.generationID,
+           localHead.checksum == serverHead.checksum {
+            guard let pending = try await pendingHeadEntry(
+                matching: localHead,
+                accountID: accountID
+            ) else { return }
+            try await stateStore.acceptSavedHead(
+                accountID: accountID,
+                entryID: pending.id,
+                head: serverHead,
+                systemFields: Self.archivedSystemFields(for: server),
+                snapshot: try await localSnapshotData(for: localHead, accountID: accountID)
+            )
+            syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(local.recordID)])
+            return
+        }
+
+        switch localHead.version.relation(to: serverHead.version) {
+        case .after:
+            guard let pending, let payload = pending.payload else { return }
+            var envelope = try Self.decoder.decode(CourseCloudRecordEnvelope.self, from: payload)
+            envelope = CourseCloudRecordEnvelope(
+                recordType: envelope.recordType,
+                fields: envelope.fields,
+                assetPayload: envelope.assetPayload,
+                systemFields: try Self.archivedSystemFields(for: server)
+            )
+            try await stateStore.replaceOutboxPayload(
+                entryID: pending.id,
+                payload: Self.encoder.encode(envelope)
+            )
+            syncEngine.state.add(pendingRecordZoneChanges: [.saveRecord(local.recordID)])
+
+        case .before, .concurrent:
+            if let pending {
+                try await stateStore.markOutboxSent(accountID: accountID, entryIDs: [pending.id])
+            }
+            try await stateStore.setCloudHead(
+                accountID: accountID,
+                head: serverHead,
+                systemFields: Self.archivedSystemFields(for: server)
+            )
+            try await stateStore.observeWorkspaceVector(
+                accountID: accountID,
+                workspaceID: serverHead.workspaceID,
+                vector: serverHead.version
+            )
+            syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(local.recordID)])
+            enqueueDeferredFetch()
+
+        case .equal:
+            throw CourseCloudSyncEngineError.invalidEnvelope(local.recordID.recordName)
+        }
+    }
+
+    private func invalidateEngine() {
+        lifecycleGeneration &+= 1
+        engineEpoch &+= 1
+        engine = nil
+        accountID = nil
+        deferredFetch = nil
+        deferredDrain = nil
+        deferredSend = nil
+    }
+
+    private func currentDeferredContext() -> DeferredEngineContext? {
+        guard engine != nil, let accountID else { return nil }
+        return DeferredEngineContext(epoch: engineEpoch, accountID: accountID)
+    }
+
+    private func isCurrent(_ context: DeferredEngineContext, engine: CKSyncEngine) -> Bool {
+        context.epoch == engineEpoch
+            && context.accountID == accountID
+            && engine === self.engine
+    }
+
+    private func isCurrent(_ context: DeferredEngineContext) -> Bool {
+        context.epoch == engineEpoch && context.accountID == accountID
+    }
+
+    private func ensureCurrent(
+        _ context: DeferredEngineContext,
+        engine: CKSyncEngine? = nil
+    ) throws {
+        let valid = if let engine {
+            isCurrent(context, engine: engine)
+        } else {
+            isCurrent(context)
+        }
+        guard valid else { throw CourseCloudSyncEngineError.staleEngine }
+    }
+
+    private func enqueueDeferredRestart(fetchAfterStart: Bool) {
+        deferredRestart = true
+        deferredFetchAfterRestart = deferredFetchAfterRestart || fetchAfterStart
+        scheduleDeferredEngineWorkerIfNeeded()
+    }
+
+    private func enqueueDeferredFetch() {
+        guard let context = currentDeferredContext() else { return }
+        deferredFetch = context
+        scheduleDeferredEngineWorkerIfNeeded()
+    }
+
+    private func enqueueDeferredDrain() {
+        guard let context = currentDeferredContext() else { return }
+        deferredDrain = context
+        scheduleDeferredEngineWorkerIfNeeded()
+    }
+
+    private func enqueueDeferredSend() {
+        guard let context = currentDeferredContext() else { return }
+        deferredSend = context
+        scheduleDeferredEngineWorkerIfNeeded()
+    }
+
+    private var hasDeferredEngineWork: Bool {
+        deferredRestart || deferredFetch != nil || deferredDrain != nil || deferredSend != nil
+    }
+
+    private func scheduleDeferredEngineWorkerIfNeeded() {
+        guard delegateEventDepth == 0,
+              hasDeferredEngineWork,
+              !deferredEngineWorkerScheduled else {
+            return
+        }
+        deferredEngineWorkerScheduled = true
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.runDeferredEngineOperations()
+        }
+    }
+
+    private func runDeferredEngineOperations() async {
+        while true {
+            guard delegateEventDepth == 0 else { break }
+            if deferredRestart {
+                let fetchAfterStart = deferredFetchAfterRestart
+                deferredRestart = false
+                deferredFetchAfterRestart = false
+                await startIfAvailable()
+                if fetchAfterStart {
+                    enqueueDeferredFetch()
+                }
+                continue
+            }
+
+            guard delegateEventDepth == 0 else { break }
+            if let context = deferredFetch {
+                deferredFetch = nil
+                if let engine, isCurrent(context, engine: engine) {
+                    do {
+                        try await engine.fetchChanges()
+                    } catch {
+                        if isCurrent(context, engine: engine) {
+                            availability = .failed(error.localizedDescription)
+                        }
+                    }
+                }
+                continue
+            }
+
+            guard delegateEventDepth == 0 else { break }
+            if let context = deferredDrain {
+                deferredDrain = nil
+                if isCurrent(context) {
+                    do {
+                        try await drainInbox(context: context)
+                    } catch CourseCloudSyncEngineError.staleEngine {
+                        // The replacement engine/account owns any later drain.
+                    } catch {
+                        if isCurrent(context) {
+                            availability = .failed(error.localizedDescription)
+                        }
+                    }
+                }
+                continue
+            }
+
+            guard delegateEventDepth == 0 else { break }
+            if let context = deferredSend {
+                deferredSend = nil
+                if let engine, isCurrent(context, engine: engine) {
+                    do {
+                        try await engine.sendChanges()
+                    } catch {
+                        if isCurrent(context, engine: engine) {
+                            availability = .failed(error.localizedDescription)
+                        }
+                    }
+                }
+                continue
+            }
+
+            break
+        }
+
+        deferredEngineWorkerScheduled = false
+        scheduleDeferredEngineWorkerIfNeeded()
+    }
+
+    private func drainInbox(context: DeferredEngineContext) async throws {
+        guard let stateStore else { return }
+        try ensureCurrent(context)
+        let accountID = context.accountID
+        let pending = try await stateStore.pendingInbox(accountID: accountID, limit: 10_000)
+        try ensureCurrent(context)
         guard !pending.isEmpty else { return }
 
         let zoneEvents = pending.filter {
@@ -629,6 +1100,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
                 || $0.changeKind == .encryptedDataReset
         }
         if !zoneEvents.isEmpty, let engine {
+            try ensureCurrent(context, engine: engine)
             let zones = Set(zoneEvents.map(\.zoneName))
             engine.state.add(
                 pendingDatabaseChanges: Self.zoneIDs
@@ -639,8 +1111,11 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
                 accountID: accountID,
                 entryIDs: zoneEvents.map(\.id)
             )
+            try ensureCurrent(context, engine: engine)
             for repository in await CourseDocumentRegistry.shared.openRepositories() {
+                try ensureCurrent(context, engine: engine)
                 try await queueWorkspaceGeneration(repository: repository)
+                try ensureCurrent(context, engine: engine)
             }
         }
         let recordDeletionIDs = pending
@@ -654,6 +1129,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
                 accountID: accountID,
                 entryIDs: recordDeletionIDs
             )
+            try ensureCurrent(context)
         }
 
         struct DecodedEntry {
@@ -681,13 +1157,84 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             $0.metadata.recordType == CourseCloudRecordType.catalogEntry
         }
 
-        for generation in generations {
-            guard let workspaceID = generation.metadata.fields["workspaceID"],
-                  let generationID = generation.metadata.fields["generationID"],
+        let stableCatalogs = catalogs.filter {
+            guard let workspaceID = $0.metadata.fields["workspaceID"] else { return false }
+            return $0.entry.recordName == CourseSyncRecordName.course(workspaceID: workspaceID)
+        }
+        let legacyCatalogIDs = catalogs
+            .filter { catalog in !stableCatalogs.contains(where: { $0.entry.id == catalog.entry.id }) }
+            .map(\.entry.id)
+        try await stateStore.markInboxApplied(accountID: accountID, entryIDs: legacyCatalogIDs)
+        try ensureCurrent(context)
+
+        var workspaceIDs = Set(generations.compactMap { $0.metadata.fields["workspaceID"] })
+        workspaceIDs.formUnion(stableCatalogs.compactMap { $0.metadata.fields["workspaceID"] })
+
+        for workspaceID in workspaceIDs.sorted() {
+            let workspaceCatalogs = stableCatalogs
+                .filter { $0.metadata.fields["workspaceID"] == workspaceID }
+                .sorted { $0.entry.receivedAt < $1.entry.receivedAt }
+            var ignoredCatalogIDs: [String] = []
+            for catalog in workspaceCatalogs {
+                guard let fetchedHead = try? Self.decodeHead(
+                    metadata: catalog.metadata,
+                    recordName: catalog.entry.recordName
+                ),
+                      let systemFields = catalog.metadata.systemFields else {
+                    ignoredCatalogIDs.append(catalog.entry.id)
+                    continue
+                }
+                if let accepted = try await stateStore.cloudHead(
+                    accountID: accountID,
+                    workspaceID: workspaceID
+                ) {
+                    try ensureCurrent(context)
+                    switch CourseCloudHeadResolver.resolve(
+                        accepted: accepted.head,
+                        incoming: fetchedHead
+                    ) {
+                    case .ignoreHistorical:
+                        ignoredCatalogIDs.append(catalog.entry.id)
+                        continue
+                    case .invalidEqualVersion:
+                        throw CourseCloudSyncEngineError.invalidEnvelope(catalog.entry.recordName)
+                    case .accept, .mergeConcurrent:
+                        break
+                    }
+                }
+                try await stateStore.setCloudHead(
+                    accountID: accountID,
+                    head: fetchedHead,
+                    systemFields: systemFields
+                )
+                try ensureCurrent(context)
+                try await stateStore.observeWorkspaceVector(
+                    accountID: accountID,
+                    workspaceID: workspaceID,
+                    vector: fetchedHead.version
+                )
+                try ensureCurrent(context)
+            }
+            try await stateStore.markInboxApplied(
+                accountID: accountID,
+                entryIDs: ignoredCatalogIDs
+            )
+            try ensureCurrent(context)
+
+            guard let storedHead = try await stateStore.cloudHead(
+                accountID: accountID,
+                workspaceID: workspaceID
+            ) else {
+                continue
+            }
+            try ensureCurrent(context)
+            let head = storedHead.head
+            guard let generation = generations.first(where: {
+                      $0.entry.recordName == head.generationRecordName
+                  }),
                   let assetPath = generation.entry.durableAssetPath,
                   let commitEntry = commits.first(where: {
-                      $0.metadata.fields["workspaceID"] == workspaceID
-                          && $0.metadata.fields["generationID"] == generationID
+                      $0.entry.recordName == head.commitRecordName
                   }),
                   let commitPath = commitEntry.entry.durableAssetPath else {
                 continue
@@ -701,9 +1248,12 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             let commit = try Self.decoder.decode(CourseSyncGenerationCommit.self, from: commitData)
             _ = try snapshot.validatedWorkspace()
             guard snapshot.manifest.workspaceID == workspaceID,
-                  snapshot.manifest.generationID == generationID,
+                  snapshot.manifest.generationID == head.generationID,
+                  snapshot.manifest.version == head.version,
+                  snapshot.checksum == head.checksum,
                   commit.workspaceID == workspaceID,
-                  commit.generationID == generationID,
+                  commit.generationID == head.generationID,
+                  commit.version == head.version,
                   commit.records.contains(where: {
                       $0.recordName == generation.entry.recordName
                           && $0.checksum == snapshot.checksum
@@ -717,37 +1267,52 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             ).map {
                 try Self.decoder.decode(CourseSyncWorkspaceSnapshot.self, from: $0)
             }
-            let title = catalogs.first(where: {
-                $0.metadata.fields["workspaceID"] == workspaceID
-                    && $0.metadata.fields["generationID"] == generationID
-            })?.metadata.fields["title"] ?? "Synced Course"
-
-            try await CourseCloudSyncApplyBridge.shared.apply(
-                snapshot: snapshot,
-                base: base,
-                title: title
-            )
+            try ensureCurrent(context)
+            if let provenance = try await stateStore.courseProvenance(workspaceID: workspaceID),
+               let ownerAccountID = provenance.accountID,
+               ownerAccountID != accountID {
+                continue
+            }
+            try ensureCurrent(context)
+            let repository: CourseDocumentRepository?
+            if base?.checksum == snapshot.checksum {
+                repository = nil
+            } else {
+                repository = try await CourseCloudSyncApplyBridge.shared.apply(
+                    snapshot: snapshot,
+                    base: base,
+                    title: head.title
+                )
+                try ensureCurrent(context)
+            }
+            try ensureCurrent(context)
             try await stateStore.setCloudBase(
                 accountID: accountID,
                 workspaceID: workspaceID,
                 checksum: snapshot.checksum,
                 snapshot: snapshotData
             )
+            try ensureCurrent(context)
             try await stateStore.setCourseProvenance(
                 workspaceID: workspaceID,
                 provenance: .cloudAccount,
                 accountID: accountID
             )
+            try ensureCurrent(context)
             var appliedIDs = [generation.entry.id, commitEntry.entry.id]
-            if let catalog = catalogs.first(where: {
-                $0.metadata.fields["workspaceID"] == workspaceID
-                    && $0.metadata.fields["generationID"] == generationID
-            }) {
-                appliedIDs.append(catalog.entry.id)
-            }
+            appliedIDs.append(
+                contentsOf: workspaceCatalogs
+                    .filter { $0.metadata.fields["generationID"] == head.generationID }
+                    .map(\.entry.id)
+            )
             try await stateStore.markInboxApplied(accountID: accountID, entryIDs: appliedIDs)
+            try ensureCurrent(context)
             for path in [assetPath, commitPath] {
                 try? FileManager.default.removeItem(atPath: path)
+            }
+            if let repository {
+                await queueRepositoryChangesIfNeeded(repository: repository)
+                try ensureCurrent(context)
             }
         }
     }
@@ -756,6 +1321,48 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         CKRecordZone.ID(zoneName: CourseCloudSyncSchema.catalogZoneName, ownerName: CKCurrentUserDefaultName),
         CKRecordZone.ID(zoneName: CourseCloudSyncSchema.contentZoneName, ownerName: CKCurrentUserDefaultName),
     ]
+
+    private func pendingHeadEntry(
+        matching head: CourseCloudHead,
+        accountID: String
+    ) async throws -> CourseCloudOutboxEntry? {
+        guard let stateStore,
+              let entry = try await stateStore.pendingOutbox(
+                  accountID: accountID,
+                  recordName: CourseSyncRecordName.course(workspaceID: head.workspaceID)
+              ),
+              let payload = entry.payload else {
+            return nil
+        }
+        let envelope = try Self.decoder.decode(CourseCloudRecordEnvelope.self, from: payload)
+        return envelope.fields["generationID"] == head.generationID ? entry : nil
+    }
+
+    private func localSnapshotData(
+        for head: CourseCloudHead,
+        accountID: String
+    ) async throws -> Data {
+        guard let stateStore,
+              let generationEntry = try await stateStore.outboxEntry(
+                  accountID: accountID,
+                  recordName: head.generationRecordName
+              ),
+              let payload = generationEntry.payload else {
+            throw CourseCloudSyncEngineError.missingAsset(head.generationRecordName)
+        }
+        let envelope = try Self.decoder.decode(CourseCloudRecordEnvelope.self, from: payload)
+        guard let snapshotData = envelope.assetPayload else {
+            throw CourseCloudSyncEngineError.missingAsset(head.generationRecordName)
+        }
+        let snapshot = try Self.decoder.decode(CourseSyncWorkspaceSnapshot.self, from: snapshotData)
+        guard snapshot.manifest.workspaceID == head.workspaceID,
+              snapshot.manifest.generationID == head.generationID,
+              snapshot.checksum == head.checksum,
+              snapshot.manifest.version == head.version else {
+            throw CourseCloudSyncEngineError.invalidEnvelope(head.generationRecordName)
+        }
+        return snapshotData
+    }
 
     private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
@@ -776,10 +1383,15 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         zoneName: String,
         recordName: String,
         envelope: CourseCloudRecordEnvelope,
-        mutationVersion: CourseSyncMutationVersion?
+        mutationVersion: CourseSyncMutationVersion?,
+        candidateID: String? = nil
     ) throws -> CourseCloudOutboxEntry {
         CourseCloudOutboxEntry(
-            id: sha256(Data("\(accountID)\u{0}\(zoneName)\u{0}\(recordName)".utf8)),
+            id: sha256(
+                Data(
+                    "\(accountID)\u{0}\(zoneName)\u{0}\(recordName)\u{0}\(candidateID ?? "")".utf8
+                )
+            ),
             accountID: accountID,
             workspaceID: workspaceID,
             zoneName: zoneName,
@@ -809,11 +1421,83 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
     private static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
+
+    private static func archivedSystemFields(for record: CKRecord) throws -> Data {
+        let archiver = NSKeyedArchiver(requiringSecureCoding: true)
+        record.encodeSystemFields(with: archiver)
+        archiver.finishEncoding()
+        return archiver.encodedData
+    }
+
+    private static func decodeHead(_ record: CKRecord) throws -> CourseCloudHead {
+        guard record.recordType == CourseCloudRecordType.catalogEntry,
+              let workspaceID = record["workspaceID"] as? String,
+              record.recordID.recordName == CourseSyncRecordName.course(workspaceID: workspaceID),
+              let generationID = record["generationID"] as? String,
+              let generationRecordName = record["generationRecordName"] as? String,
+              let commitRecordName = record["commitRecordName"] as? String,
+              let checksum = record["checksum"] as? String,
+              let title = record["title"] as? String,
+              let encodedVersion = record["versionJSON"] as? String,
+              let versionData = Data(base64Encoded: encodedVersion) else {
+            throw CourseCloudSyncEngineError.invalidEnvelope(record.recordID.recordName)
+        }
+        return CourseCloudHead(
+            workspaceID: workspaceID,
+            generationID: generationID,
+            generationRecordName: generationRecordName,
+            commitRecordName: commitRecordName,
+            checksum: checksum,
+            title: title,
+            previousGenerationID: (record["previousGenerationID"] as? String).flatMap {
+                $0.isEmpty ? nil : $0
+            },
+            version: try decoder.decode(CourseSyncVersionVector.self, from: versionData)
+        )
+    }
+
+    private static func decodeHead(
+        metadata: CourseCloudFetchedRecordMetadata,
+        recordName: String
+    ) throws -> CourseCloudHead {
+        let fields = metadata.fields
+        guard metadata.recordType == CourseCloudRecordType.catalogEntry,
+              let workspaceID = fields["workspaceID"],
+              recordName == CourseSyncRecordName.course(workspaceID: workspaceID),
+              let generationID = fields["generationID"],
+              let generationRecordName = fields["generationRecordName"],
+              let commitRecordName = fields["commitRecordName"],
+              let checksum = fields["checksum"],
+              let title = fields["title"],
+              let encodedVersion = fields["versionJSON"],
+              let versionData = Data(base64Encoded: encodedVersion) else {
+            throw CourseCloudSyncEngineError.invalidEnvelope(recordName)
+        }
+        return CourseCloudHead(
+            workspaceID: workspaceID,
+            generationID: generationID,
+            generationRecordName: generationRecordName,
+            commitRecordName: commitRecordName,
+            checksum: checksum,
+            title: title,
+            previousGenerationID: fields["previousGenerationID"].flatMap {
+                $0.isEmpty ? nil : $0
+            },
+            version: try decoder.decode(CourseSyncVersionVector.self, from: versionData)
+        )
+    }
 }
 
 struct CourseCloudFetchedRecordMetadata: Codable, Equatable, Sendable {
     let recordType: String
     let fields: [String: String]
+    let systemFields: Data?
+
+    init(recordType: String, fields: [String: String], systemFields: Data? = nil) {
+        self.recordType = recordType
+        self.fields = fields
+        self.systemFields = systemFields
+    }
 }
 
 @MainActor
@@ -833,7 +1517,7 @@ final class CourseCloudSyncApplyBridge {
         snapshot: CourseSyncWorkspaceSnapshot,
         base: CourseSyncWorkspaceSnapshot?,
         title: String
-    ) async throws {
+    ) async throws -> CourseDocumentRepository {
         guard let store else { throw CourseCloudSyncEngineError.notStarted }
         let workspaceID = snapshot.manifest.workspaceID
         let databaseURL = store.courseDatabaseURL(workspaceID: workspaceID)
@@ -860,5 +1544,6 @@ final class CourseCloudSyncApplyBridge {
             }
         }
         await store.recoverReadyCourses()
+        return repository
     }
 }

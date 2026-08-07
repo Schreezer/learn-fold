@@ -5,7 +5,10 @@ use crate::conversation_uniffi::{HydratedConversationItem, HydratedConversationI
 use crate::ffi::ClientError;
 use crate::ffi::shared::{blocking_async, shared_mobile_client, shared_runtime};
 use crate::store::{AppSnapshotRecord, AppStoreUpdateRecord, AppThreadSnapshot};
-use crate::types::{AppForkThreadFromMessageRequest, AppModeKind, AppStartTurnRequest, ThreadKey};
+use crate::types::{
+    AppForkThreadFromMessageRequest, AppModeKind, AppStartTurnRequest, AppTurnSubmissionReceipt,
+    ThreadKey,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -381,7 +384,7 @@ impl AppStore {
         &self,
         key: ThreadKey,
         params: AppStartTurnRequest,
-    ) -> Result<(), ClientError> {
+    ) -> Result<AppTurnSubmissionReceipt, ClientError> {
         blocking_async!(self.rt, self.inner, |c| {
             let params = params.try_into().map_err(|error: crate::RpcClientError| {
                 ClientError::Serialization(error.to_string())

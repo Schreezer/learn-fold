@@ -34,7 +34,6 @@ struct SettingsView: View {
             ZStack {
                 LitterTheme.backgroundGradient.ignoresSafeArea()
                 Form {
-                    supportSection
                     appearanceSection
                     fontSection
                     conversationSection
@@ -290,29 +289,6 @@ struct SettingsView: View {
             .listRowBackground(LitterTheme.surface.opacity(0.6))
         } header: {
             Text("Experimental")
-                .foregroundColor(LitterTheme.textSecondary)
-        }
-    }
-
-    // MARK: - Support Section
-
-    private var supportSection: some View {
-        Section {
-            NavigationLink {
-                TipJarView()
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: "pawprint.fill")
-                        .foregroundColor(LitterTheme.accent)
-                        .frame(width: 20)
-                    Text("Support Learnfold")
-                        .litterFont(.subheadline)
-                        .foregroundColor(LitterTheme.textPrimary)
-                }
-            }
-            .listRowBackground(LitterTheme.surface.opacity(0.6))
-        } header: {
-            Text("Support")
                 .foregroundColor(LitterTheme.textSecondary)
         }
     }

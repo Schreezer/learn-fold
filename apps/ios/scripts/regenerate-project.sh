@@ -52,15 +52,3 @@ if [[ -d "$NESTED_PROJECT" ]]; then
   echo "error: nested project still exists at $NESTED_PROJECT" >&2
   exit 1
 fi
-
-# Fix StoreKit Configuration in scheme — xcodegen doesn't generate a valid reference.
-SCHEME_FILE="$PROJECT_FILE/xcshareddata/xcschemes/Litter.xcscheme"
-if [[ -f "$SCHEME_FILE" ]]; then
-  # Remove broken xcodegen-generated StoreKitConfigurationFileReference if present
-  sed -i '' '/<StoreKitConfigurationFileReference/,/<\/StoreKitConfigurationFileReference>/d' "$SCHEME_FILE"
-  # Insert correct one before </LaunchAction>
-  sed -i '' 's|</LaunchAction>|      <StoreKitConfigurationFileReference\
-         identifier = "../../Sources/Litter/Resources/TipJarProducts.storekit">\
-      </StoreKitConfigurationFileReference>\
-   </LaunchAction>|' "$SCHEME_FILE"
-fi

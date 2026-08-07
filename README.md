@@ -30,6 +30,12 @@ foundation for Learnfold. Learnfold is not an official Litter release, and
 Learnfold-specific issues and contributions should be filed in this
 repository.
 
+<p align="center">
+  <a href="https://learnfold.pages.dev/"><img src="docs/badges/website.svg" alt="Learnfold website" /></a>
+  &nbsp;
+  <a href="https://apps.apple.com/app/id6759521788"><img src="docs/badges/app-store.svg" alt="App Store" /></a>
+</p>
+
 ## Screenshots (iOS)
 
 <p align="center">

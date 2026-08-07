@@ -431,6 +431,13 @@ public actor NativeEditorMCPService {
                 workspace: workspace,
                 previousDocument: page.document
             )
+            preserveCourseMetadata(from: page.document, in: &updatedDocument)
+            if let properties = arguments["properties"]?.objectValue {
+                if let title = titleValue(properties["title"]) {
+                    try workspace.renamePage(pageID, to: title)
+                }
+                applyCourseMetadata(properties, to: &updatedDocument)
+            }
             reconcileStableIDs(from: page.document.root.children, into: &updatedDocument.root.children)
             updatedDocument.ensureStableBlockIDs()
             if arguments["allow_deleting_content"]?.boolValue != true {
@@ -863,6 +870,20 @@ public actor NativeEditorMCPService {
             changed = true
         }
         return changed
+    }
+
+    private func preserveCourseMetadata(
+        from previousDocument: BlockDocument,
+        in updatedDocument: inout BlockDocument
+    ) {
+        for key in [
+            "course_node_id",
+            "course_role",
+            "course_generation_status",
+            "course_bootstrap_status",
+        ] where updatedDocument.root.data[key] == nil {
+            updatedDocument.root.data[key] = previousDocument.root.data[key]
+        }
     }
 
     private func courseMetadataValue(_ document: BlockDocument) -> JSONValue {

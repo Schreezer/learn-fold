@@ -550,8 +550,37 @@ impl TryFrom<AppListThreadTurnsRequest> for upstream::ThreadTurnsListParams {
 #[derive(uniffi::Record)]
 pub struct AppListThreadTurnsResponse {
     pub turns: Vec<crate::conversation_uniffi::HydratedConversationItem>,
+    pub turn_states: Vec<AppTurnState>,
     pub next_cursor: Option<String>,
     pub backwards_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "camelCase")]
+pub enum AppTurnStatus {
+    Completed,
+    Interrupted,
+    Failed,
+    InProgress,
+}
+
+impl From<upstream::TurnStatus> for AppTurnStatus {
+    fn from(value: upstream::TurnStatus) -> Self {
+        match value {
+            upstream::TurnStatus::Completed => Self::Completed,
+            upstream::TurnStatus::Interrupted => Self::Interrupted,
+            upstream::TurnStatus::Failed => Self::Failed,
+            upstream::TurnStatus::InProgress => Self::InProgress,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, uniffi::Record)]
+#[serde(rename_all = "camelCase")]
+pub struct AppTurnState {
+    pub turn_id: String,
+    pub status: AppTurnStatus,
+    pub error_message: Option<String>,
 }
 
 /// Outcome of a `load_thread_turns_page` store action.
@@ -572,8 +601,18 @@ impl From<upstream::ThreadTurnsListResponse> for AppListThreadTurnsResponse {
             &value.data,
             &crate::conversation::HydrationOptions::default(),
         );
+        let turn_states = value
+            .data
+            .iter()
+            .map(|turn| AppTurnState {
+                turn_id: turn.id.clone(),
+                status: turn.status.clone().into(),
+                error_message: turn.error.as_ref().map(|error| error.message.clone()),
+            })
+            .collect();
         Self {
             turns,
+            turn_states,
             next_cursor: value.next_cursor,
             backwards_cursor: value.backwards_cursor,
         }
@@ -826,6 +865,27 @@ pub struct AppStartTurnRequest {
     #[serde(default)]
     #[uniffi(default = None)]
     pub output_schema: Option<String>,
+}
+
+/// Describes how a submitted composer payload entered the server lifecycle.
+///
+/// Callers that require exact response correlation should only accept
+/// `Started`/`Steered` receipts with a matching `turn_id`. `Queued` means the
+/// payload remains local and has not yet been accepted as a server turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "camelCase")]
+pub enum AppTurnSubmissionKind {
+    Started,
+    Steered,
+    Queued,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[derive(uniffi::Record)]
+pub struct AppTurnSubmissionReceipt {
+    pub kind: AppTurnSubmissionKind,
+    pub turn_id: Option<String>,
 }
 
 impl TryFrom<AppStartTurnRequest> for upstream::TurnStartParams {
@@ -1254,6 +1314,76 @@ impl TryFrom<AppWriteConfigValueRequest> for upstream::ConfigValueWriteParams {
 mod tests {
     use super::*;
     use crate::types::enums::ApprovalKind;
+
+    #[test]
+    fn turn_submission_receipt_preserves_server_turn_identity() {
+        let receipt = AppTurnSubmissionReceipt {
+            kind: AppTurnSubmissionKind::Started,
+            turn_id: Some("turn-accepted".to_string()),
+        };
+        let json = serde_json::to_string(&receipt).unwrap();
+        let round_trip: AppTurnSubmissionReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, receipt);
+
+        let queued = AppTurnSubmissionReceipt {
+            kind: AppTurnSubmissionKind::Queued,
+            turn_id: None,
+        };
+        assert_eq!(queued.turn_id, None);
+    }
+
+    #[test]
+    fn thread_turns_response_preserves_terminal_status_and_error() {
+        let upstream: upstream::ThreadTurnsListResponse =
+            serde_json::from_value(serde_json::json!({
+                "data": [
+                    {
+                        "id": "turn-completed",
+                        "items": [],
+                        "itemsView": "full",
+                        "status": "completed",
+                        "error": null,
+                        "startedAt": 1,
+                        "completedAt": 2,
+                        "durationMs": 1000
+                    },
+                    {
+                        "id": "turn-failed",
+                        "items": [],
+                        "itemsView": "full",
+                        "status": "failed",
+                        "error": {
+                            "message": "provider stopped",
+                            "codexErrorInfo": null,
+                            "additionalDetails": null
+                        },
+                        "startedAt": 3,
+                        "completedAt": 4,
+                        "durationMs": 1000
+                    }
+                ],
+                "nextCursor": null,
+                "backwardsCursor": "latest"
+            }))
+            .unwrap();
+
+        let response = AppListThreadTurnsResponse::from(upstream);
+        assert_eq!(
+            response.turn_states,
+            vec![
+                AppTurnState {
+                    turn_id: "turn-completed".to_string(),
+                    status: AppTurnStatus::Completed,
+                    error_message: None,
+                },
+                AppTurnState {
+                    turn_id: "turn-failed".to_string(),
+                    status: AppTurnStatus::Failed,
+                    error_message: Some("provider stopped".to_string()),
+                },
+            ]
+        );
+    }
 
     #[test]
     fn pending_approval_roundtrip() {

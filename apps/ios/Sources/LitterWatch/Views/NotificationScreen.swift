@@ -29,13 +29,13 @@ struct NotificationScreen: View {
                         .font(WatchTheme.mono(10, weight: .bold))
                         .foregroundStyle(theme.textOnAccent)
                 }
-                Text("litter")
+                Text("learnfold")
                     .font(WatchTheme.mono(10))
                     .foregroundStyle(theme.textSecondary)
                 Spacer(minLength: 0)
             }
 
-            Text(content?.title ?? "codex update")
+            Text(content?.title ?? "Learnfold update")
                 .font(WatchTheme.mono(14, weight: .bold))
                 .foregroundStyle(theme.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
