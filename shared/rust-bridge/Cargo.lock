@@ -313,7 +313,7 @@ dependencies = [
 [[package]]
 name = "alleycat-bridge-core"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#3f0f84422e977f32cbc98de7a1d6c4e26fb240d1"
 dependencies = [
  "alleycat-codex-proto",
  "anyhow",
@@ -332,7 +332,7 @@ dependencies = [
 [[package]]
 name = "alleycat-claude-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#3f0f84422e977f32cbc98de7a1d6c4e26fb240d1"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",
@@ -356,7 +356,7 @@ dependencies = [
 [[package]]
 name = "alleycat-codex-proto"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#3f0f84422e977f32cbc98de7a1d6c4e26fb240d1"
 dependencies = [
  "chrono",
  "serde",
@@ -367,7 +367,7 @@ dependencies = [
 [[package]]
 name = "alleycat-opencode-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#3f0f84422e977f32cbc98de7a1d6c4e26fb240d1"
 dependencies = [
  "alleycat-bridge-core",
  "anyhow",
@@ -391,7 +391,7 @@ dependencies = [
 [[package]]
 name = "alleycat-pi-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#3c6dfe2c6b060864d8cb0fcae58f73a6ed1ea10f"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#3f0f84422e977f32cbc98de7a1d6c4e26fb240d1"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",
@@ -8330,7 +8330,6 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 [[package]]
 name = "ish-embed-host"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/litter-ish.git?branch=main#4f783cd957b83de3019d6a843408d5bb3ff902c7"
 dependencies = [
  "async-trait",
  "bindgen 0.70.1",
@@ -8349,7 +8348,6 @@ dependencies = [
 [[package]]
 name = "ish-embed-protocol"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/litter-ish.git?branch=main#4f783cd957b83de3019d6a843408d5bb3ff902c7"
 dependencies = [
  "postcard",
  "serde",

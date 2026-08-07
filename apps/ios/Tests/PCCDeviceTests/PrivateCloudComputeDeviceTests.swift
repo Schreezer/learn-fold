@@ -124,6 +124,7 @@ final class PrivateCloudComputeDeviceTests: XCTestCase {
                 Make exactly two beginner chapters about Swift actors. Present the course plan now. \
                 Do not write or edit course pages.
                 """,
+                onAccepted: {},
                 onPartialResponse: { latestResponse = $0 },
                 onCoursePlan: { plan = $0 }
             )

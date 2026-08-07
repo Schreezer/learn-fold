@@ -25,6 +25,12 @@ struct CourseMCPHTTPResponse: Sendable {
     let body: Data?
 }
 
+enum CourseMCPHTTPRequestTestResult: Equatable {
+    case incomplete
+    case malformed
+    case complete
+}
+
 private final class CourseMCPStartupResult: @unchecked Sendable {
     private let lock = NSLock()
     private var result: Result<UInt16, Error>?
@@ -55,15 +61,23 @@ final class CourseMCPServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.chirag.learnfold.course-mcp", qos: .userInitiated)
     private let startLock = NSLock()
     private var listener: NWListener?
+    private var listenerPort: UInt16?
+    private var capabilityPathByWorkspace: [String: String] = [:]
+    private var workspaceByCapabilityPath: [String: String] = [:]
     private(set) var endpointURL: URL?
 
     private init() {}
 
     @discardableResult
-    func start() throws -> URL {
+    func start(workspaceID: String) throws -> URL {
+        guard CourseBashTool.isValidWorkspaceID(workspaceID) else {
+            throw CourseMCPServerError.unavailable
+        }
         startLock.lock()
         defer { startLock.unlock() }
-        if let endpointURL { return endpointURL }
+        if listener != nil {
+            return try endpoint(for: workspaceID)
+        }
 
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(
@@ -112,14 +126,40 @@ final class CourseMCPServer: @unchecked Sendable {
             throw CourseMCPServerError.startupFailed(error.localizedDescription)
         }
 
-        guard let endpoint = URL(string: "http://127.0.0.1:\(port)/mcp") else {
-            listener.cancel()
+        self.listener = listener
+        listenerPort = port
+        let endpoint = try endpoint(for: workspaceID)
+        endpointURL = endpoint
+        LLog.info(
+            "course-mcp",
+            "local course MCP server ready",
+            fields: ["port": port, "workspaceId": workspaceID]
+        )
+        return endpoint
+    }
+
+    private func endpoint(for workspaceID: String) throws -> URL {
+        guard let listenerPort else { throw CourseMCPServerError.unavailable }
+        let path: String
+        if let existing = capabilityPathByWorkspace[workspaceID] {
+            path = existing
+        } else {
+            let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            path = "/mcp/\(token)"
+            capabilityPathByWorkspace[workspaceID] = path
+            workspaceByCapabilityPath[path] = workspaceID
+        }
+        guard let endpoint = URL(string: "http://127.0.0.1:\(listenerPort)\(path)") else {
             throw CourseMCPServerError.unavailable
         }
-        self.listener = listener
-        endpointURL = endpoint
-        LLog.info("course-mcp", "local course MCP server ready", fields: ["url": endpoint.absoluteString])
         return endpoint
+    }
+
+    private func authorizedWorkspaceID(for path: String) -> String? {
+        startLock.lock()
+        defer { startLock.unlock() }
+        return workspaceByCapabilityPath[path]
     }
 
     private func accept(_ connection: NWConnection) {
@@ -147,12 +187,18 @@ final class CourseMCPServer: @unchecked Sendable {
                 send(CourseMCPHTTPResponse(statusCode: 413, body: nil), over: connection)
                 return
             }
-            if let request = parseHTTPRequest(accumulated) {
+            switch parseHTTPRequest(accumulated) {
+            case .complete(let request):
                 Task {
                     let response: CourseMCPHTTPResponse
-                    if request.method == "POST", request.path == "/mcp" {
-                        response = await CourseMCPProtocol.handleJSONRPC(body: request.body)
-                    } else if request.method == "GET", request.path == "/mcp" {
+                    if request.method == "POST",
+                       let workspaceID = self.authorizedWorkspaceID(for: request.path) {
+                        response = await CourseMCPProtocol.handleJSONRPC(
+                            body: request.body,
+                            authorizedWorkspaceID: workspaceID
+                        )
+                    } else if request.method == "GET",
+                              self.authorizedWorkspaceID(for: request.path) != nil {
                         // Stateless JSON responses are used; SSE GET is not.
                         response = CourseMCPHTTPResponse(statusCode: 405, body: nil)
                     } else {
@@ -161,36 +207,87 @@ final class CourseMCPServer: @unchecked Sendable {
                     self.send(response, over: connection)
                 }
                 return
-            }
-            if error != nil || isComplete {
+            case .malformed:
                 send(CourseMCPHTTPResponse(statusCode: 400, body: nil), over: connection)
                 return
+            case .incomplete:
+                if error != nil || isComplete {
+                    send(CourseMCPHTTPResponse(statusCode: 400, body: nil), over: connection)
+                    return
+                }
             }
             receiveRequest(connection, accumulated: accumulated)
         }
     }
 
-    private func parseHTTPRequest(_ data: Data) -> (method: String, path: String, body: Data)? {
-        let separator = Data("\r\n\r\n".utf8)
-        guard let headerRange = data.range(of: separator) else { return nil }
-        let headerData = data[..<headerRange.lowerBound]
-        guard let header = String(data: headerData, encoding: .utf8) else { return nil }
-        let lines = header.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return nil }
-        let requestParts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
-        guard requestParts.count >= 2 else { return nil }
+    private struct ParsedHTTPRequest {
+        let method: String
+        let path: String
+        let body: Data
+    }
 
-        let contentLength = lines.dropFirst().compactMap { line -> Int? in
+    private enum HTTPRequestParseResult {
+        case incomplete
+        case malformed
+        case complete(ParsedHTTPRequest)
+    }
+
+    private func parseHTTPRequest(_ data: Data) -> HTTPRequestParseResult {
+        let separator = Data("\r\n\r\n".utf8)
+        guard let headerRange = data.range(of: separator) else { return .incomplete }
+        let headerData = data[..<headerRange.lowerBound]
+        guard let header = String(data: headerData, encoding: .utf8) else { return .malformed }
+        let lines = header.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else { return .malformed }
+        let requestParts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
+        guard requestParts.count == 3,
+              requestParts[2] == "HTTP/1.1" || requestParts[2] == "HTTP/1.0" else {
+            return .malformed
+        }
+
+        var contentLengthValues: [String] = []
+        var hasTransferEncoding = false
+        for line in lines.dropFirst() {
             let parts = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-            guard parts.count == 2,
-                  parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
-                    .caseInsensitiveCompare("Content-Length") == .orderedSame else { return nil }
-            return Int(parts[1].trimmingCharacters(in: .whitespacesAndNewlines))
-        }.first ?? 0
+            guard parts.count == 2 else { return .malformed }
+            let name = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { return .malformed }
+            if name.caseInsensitiveCompare("Content-Length") == .orderedSame {
+                contentLengthValues.append(value)
+            } else if name.caseInsensitiveCompare("Transfer-Encoding") == .orderedSame {
+                hasTransferEncoding = true
+            }
+        }
+        guard !hasTransferEncoding, contentLengthValues.count <= 1 else { return .malformed }
+        let contentLength: Int
+        if let value = contentLengthValues.first {
+            guard !value.isEmpty,
+                  value.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+                  let parsed = Int(value),
+                  parsed <= Self.maximumRequestBytes else { return .malformed }
+            contentLength = parsed
+        } else {
+            contentLength = 0
+        }
         let bodyStart = headerRange.upperBound
-        guard data.count >= bodyStart + contentLength else { return nil }
-        let body = data.subdata(in: bodyStart..<(bodyStart + contentLength))
-        return (String(requestParts[0]), String(requestParts[1]), body)
+        let (bodyEnd, overflow) = bodyStart.addingReportingOverflow(contentLength)
+        guard !overflow, bodyEnd <= Self.maximumRequestBytes else { return .malformed }
+        guard data.count >= bodyEnd else { return .incomplete }
+        let body = data.subdata(in: bodyStart..<bodyEnd)
+        return .complete(ParsedHTTPRequest(
+            method: String(requestParts[0]),
+            path: String(requestParts[1]),
+            body: body
+        ))
+    }
+
+    static func parseHTTPRequestForTesting(_ data: Data) -> CourseMCPHTTPRequestTestResult {
+        switch shared.parseHTTPRequest(data) {
+        case .incomplete: .incomplete
+        case .malformed: .malformed
+        case .complete: .complete
+        }
     }
 
     private func send(_ response: CourseMCPHTTPResponse, over connection: NWConnection) {
@@ -220,7 +317,10 @@ final class CourseMCPServer: @unchecked Sendable {
 }
 
 enum CourseMCPProtocol {
-    static func handleJSONRPC(body: Data) async -> CourseMCPHTTPResponse {
+    static func handleJSONRPC(
+        body: Data,
+        authorizedWorkspaceID: String
+    ) async -> CourseMCPHTTPResponse {
         do {
             let request = try JSONDecoder().decode(JSONValue.self, from: body)
             guard case .object(let object) = request,
@@ -259,7 +359,11 @@ enum CourseMCPProtocol {
                 let tools = try JSONDecoder().decode(JSONValue.self, from: toolsData)
                 return resultResponse(id: id ?? .null, result: ["tools": tools])
             case "tools/call":
-                return await callTool(id: id ?? .null, params: object["params"])
+                return await callTool(
+                    id: id ?? .null,
+                    params: object["params"],
+                    authorizedWorkspaceID: authorizedWorkspaceID
+                )
             default:
                 return errorResponse(id: id ?? .null, code: -32601, message: "Method not found")
             }
@@ -268,20 +372,26 @@ enum CourseMCPProtocol {
         }
     }
 
-    private static func callTool(id: JSONValue, params: JSONValue?) async -> CourseMCPHTTPResponse {
+    private static func callTool(
+        id: JSONValue,
+        params: JSONValue?,
+        authorizedWorkspaceID: String
+    ) async -> CourseMCPHTTPResponse {
         guard let params = params?.objectValue,
               let name = params["name"]?.stringValue,
               var arguments = params["arguments"]?.objectValue,
-              let workspaceID = arguments.removeValue(
+              let requestedWorkspaceID = arguments.removeValue(
                   forKey: CourseAgentTools.workspaceIDArgument
               )?.stringValue,
-              let workspaceURL = workspaceURL(for: workspaceID) else {
+              requestedWorkspaceID == authorizedWorkspaceID,
+              let workspaceURL = workspaceURL(for: authorizedWorkspaceID) else {
             return toolResult(
                 id: id,
-                value: ["error": "A valid workspace_id is required."],
+                value: ["error": "The workspace_id does not match this course-tool capability."],
                 isError: true
             )
         }
+        let workspaceID = authorizedWorkspaceID
 
         guard FileManager.default.fileExists(atPath: workspaceURL.path) else {
             return toolResult(
@@ -298,11 +408,66 @@ enum CourseMCPProtocol {
                 if let problem = coursePlanSemanticProblem(for: plan) {
                     return invalidCoursePlanResult(id: id, problem: problem)
                 }
+                guard try await CourseDocumentRegistry.shared.presentPlan(
+                    workspaceID: workspaceID,
+                    plan: plan
+                ) else {
+                    return toolResult(
+                        id: id,
+                        value: [
+                            "error": "The course editor is not connected to this workspace. The plan was not presented."
+                        ],
+                        isError: true
+                    )
+                }
                 return toolResult(id: id, value: .object(arguments), isError: false)
             } catch {
                 return invalidCoursePlanResult(
                     id: id,
                     problem: coursePlanValidationProblem(for: error)
+                )
+            }
+        }
+
+        if name == CourseAgentTools.courseBash {
+            guard let script = arguments["script"]?.stringValue else {
+                return toolResult(
+                    id: id,
+                    value: ["error": "course_bash requires a non-empty script."],
+                    isError: true
+                )
+            }
+            do {
+                let execution = try await CourseBashTool.execute(
+                    workspaceID: workspaceID,
+                    workspaceURL: workspaceURL,
+                    script: script,
+                    timeoutSeconds: arguments["timeout_seconds"]?.intValue
+                )
+                var value: [String: JSONValue] = [
+                    "exit_code": .integer(Int(execution.exitCode)),
+                    "output": .string(execution.output),
+                    "output_truncated": .bool(execution.outputWasTruncated),
+                    "changed_paths": .array(execution.changedPaths.map(JSONValue.string)),
+                    "changed_paths_truncated": .bool(execution.changedPathsWereTruncated),
+                    "workspace_root": "/workspace",
+                    "workspace_access": .string(
+                        execution.workspaceWasReadOnly ? "read_only" : "read_write"
+                    ),
+                ]
+                if execution.exitCode != 0 {
+                    value["warning"] = "The command exited nonzero but may have partially modified the course. Inspect the workspace before retrying."
+                }
+                return toolResult(
+                    id: id,
+                    value: .object(value),
+                    isError: execution.exitCode != 0
+                )
+            } catch {
+                return toolResult(
+                    id: id,
+                    value: ["error": .string(error.localizedDescription)],
+                    isError: true
                 )
             }
         }
@@ -316,10 +481,9 @@ enum CourseMCPProtocol {
         }
 
         if CourseAgentTools.isMutatingEditorTool(name) {
-            let approvedPlan = workspaceURL
-                .appendingPathComponent(".course", isDirectory: true)
-                .appendingPathComponent("approved-plan.json")
-            guard FileManager.default.fileExists(atPath: approvedPlan.path) else {
+            guard AppleCourseApprovalPolicy.isLatestPlanApproved(
+                courseDirectory: workspaceURL
+            ) else {
                 return toolResult(
                     id: id,
                     value: [
@@ -459,11 +623,7 @@ enum CourseMCPProtocol {
     }
 
     private static func workspaceURL(for workspaceID: String) -> URL? {
-        guard !workspaceID.isEmpty,
-              workspaceID.count <= 128,
-              workspaceID.unicodeScalars.allSatisfy({
-                  CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_"
-              }) else { return nil }
+        guard CourseBashTool.isValidWorkspaceID(workspaceID) else { return nil }
         return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Apps", isDirectory: true)
             .appendingPathComponent("Courses", isDirectory: true)

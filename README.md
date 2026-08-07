@@ -9,11 +9,9 @@
 </p>
 
 <p align="center">
-  <a href="https://kittylitter.app"><img src="docs/badges/website.svg" alt="kittylitter.app" /></a>
+  <a href="https://learnfold.pages.dev/"><img src="docs/badges/website.svg" alt="Learnfold website" /></a>
   &nbsp;
-  <a href="https://apps.apple.com/us/app/kittylitter/id6759521788"><img src="docs/badges/app-store.svg" alt="App Store" /></a>
-  &nbsp;
-  <a href="https://kittylitter.app/android-beta"><img src="docs/badges/android-beta.svg" alt="Android Beta" /></a>
+  <a href="https://apps.apple.com/app/id6759521788"><img src="docs/badges/app-store.svg" alt="App Store" /></a>
 </p>
 
 ## Screenshots (iOS)
@@ -70,11 +68,11 @@ Both platforms share a single Rust core (`codex-mobile-client`) via UniFFI-gener
 
 ## Contributing
 
-Litter is under active development and a lot of features are in flight. PRs are welcome but will likely only be merged if they're small and target a specific problem — sweeping refactors and new features tend to collide with work already underway. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening one.
+Learnfold is under active development and a lot of features are in flight. PRs are welcome but will likely only be merged if they're small and target a specific problem — sweeping refactors and new features tend to collide with work already underway. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening one.
 
 ## License
 
-Litter is licensed under the GNU General Public License version 3 with an additional permission under GPLv3 section 7 for Apple App Store and Google Play distribution. See [LICENSE](LICENSE).
+Learnfold is licensed under the GNU General Public License version 3 with the additional distribution permission described in [LICENSE](LICENSE).
 
 ## Make Targets
 

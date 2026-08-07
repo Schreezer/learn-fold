@@ -114,6 +114,31 @@ pub fn ish_run(cmd: String, cwd: String) -> IshRunResult {
     }
 }
 
+/// Timeout-capable variant used by phone-executed course tools. A timeout is
+/// enforced by the embedded kernel runner rather than by a child `timeout`
+/// process, so a stuck command cannot monopolize the serialized iSH runtime.
+#[uniffi::export]
+pub fn ish_run_with_timeout(cmd: String, cwd: String, timeout_ms: u64) -> IshRunResult {
+    #[cfg(all(target_os = "ios", not(target_abi = "macabi")))]
+    {
+        let cwd_opt = if cwd.is_empty() {
+            None
+        } else {
+            Some(cwd.as_str())
+        };
+        let (exit_code, output) = ish_runtime::run(&cmd, cwd_opt, Some(timeout_ms));
+        return IshRunResult { exit_code, output };
+    }
+    #[cfg(not(all(target_os = "ios", not(target_abi = "macabi"))))]
+    {
+        let _ = (cmd, cwd, timeout_ms);
+        IshRunResult {
+            exit_code: -1,
+            output: b"unsupported on this platform\n".to_vec(),
+        }
+    }
+}
+
 #[cfg(any(all(target_os = "ios", not(target_abi = "macabi")), test))]
 mod mobile_exec_command;
 mod shell_quoting;

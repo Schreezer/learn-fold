@@ -52,14 +52,12 @@
 	</dict>
 	<key>NSBonjourServices</key>
 	<array>
-		<string>_codex._tcp</string>
-		<string>_ssh._tcp</string>
 		<string>_litter-pair._tcp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Learnfold can import image files for conversations.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Codex discovers coding agents and SSH servers on your local network.</string>
+	<string>Learnfold uses your local network to find and pair with your Hermes server.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Learnfold uses the microphone for voice-to-text input.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>

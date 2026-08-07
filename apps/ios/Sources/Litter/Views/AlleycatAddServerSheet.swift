@@ -61,149 +61,13 @@ enum AgentAssistedPairing {
     }
 }
 
-struct HermesPairingRequest: Decodable, Equatable {
-    let requestId: String
-    let submitURL: URL
-    let claimToken: String
-    let expiresAt: Date
-
-    enum CodingKeys: String, CodingKey {
-        case requestId = "request_id"
-        case submitURL = "submit_url"
-        case claimToken = "claim_token"
-        case expiresAt = "expires_at"
-    }
-}
-
-struct HermesPairingStatus: Decodable, Equatable {
-    struct Host: Decodable, Equatable {
-        let name: String?
-        let nodeId: String
-
-        enum CodingKeys: String, CodingKey {
-            case name
-            case nodeId = "node_id"
-        }
-    }
-
-    let state: String
-    let expiresAt: Date
-    let host: Host?
-
-    enum CodingKeys: String, CodingKey {
-        case state
-        case expiresAt = "expires_at"
-        case host
-    }
-}
-
-enum HermesPairingBrokerError: LocalizedError {
-    case invalidResponse
-    case requestFailed(Int)
-    case expired
-
-    var errorDescription: String? {
-        switch self {
-        case .invalidResponse:
-            return "The secure pairing service returned an invalid response."
-        case let .requestFailed(status):
-            return "The secure pairing service could not complete this request (HTTP \(status))."
-        case .expired:
-            return "This pairing request expired. Copy a new setup prompt and try again."
-        }
-    }
-}
-
-actor HermesPairingBrokerClient {
-    static let shared = HermesPairingBrokerClient(
-        baseURL: URL(string: "https://litter-pairing-broker.chiragmgg.workers.dev")!
-    )
-
-    private let baseURL: URL
-    private let session: URLSession
-    private let decoder: JSONDecoder
-
-    init(baseURL: URL, session: URLSession? = nil) {
-        self.baseURL = baseURL
-        if let session {
-            self.session = session
-        } else {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-            configuration.timeoutIntervalForRequest = 20
-            self.session = URLSession(configuration: configuration)
-        }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        self.decoder = decoder
-    }
-
-    func createRequest(installationId: String) async throws -> HermesPairingRequest {
-        var request = URLRequest(url: baseURL.appending(path: "v1/pairing-requests"))
-        request.httpMethod = "POST"
-        request.setValue(installationId, forHTTPHeaderField: "X-Learnfold-Installation")
-        let data = try await perform(request, expectedStatus: 201)
-        return try decoder.decode(HermesPairingRequest.self, from: data)
-    }
-
-    func status(for pairing: HermesPairingRequest) async throws -> HermesPairingStatus {
-        var request = URLRequest(
-            url: baseURL.appending(path: "v1/pairing-requests/\(pairing.requestId)/status")
-        )
-        request.setValue("Bearer \(pairing.claimToken)", forHTTPHeaderField: "Authorization")
-        let data = try await perform(request)
-        return try decoder.decode(HermesPairingStatus.self, from: data)
-    }
-
-    func claim(_ pairing: HermesPairingRequest) async throws -> String {
-        var request = URLRequest(
-            url: baseURL.appending(path: "v1/pairing-requests/\(pairing.requestId)/claim")
-        )
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(pairing.claimToken)", forHTTPHeaderField: "Authorization")
-        let data = try await perform(request)
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let payload = object["pairing_payload"],
-              JSONSerialization.isValidJSONObject(payload)
-        else {
-            throw HermesPairingBrokerError.invalidResponse
-        }
-        let payloadData = try JSONSerialization.data(withJSONObject: payload)
-        guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
-            throw HermesPairingBrokerError.invalidResponse
-        }
-        return payloadJSON
-    }
-
-    func cancel(_ pairing: HermesPairingRequest) async {
-        var request = URLRequest(
-            url: baseURL.appending(path: "v1/pairing-requests/\(pairing.requestId)/cancel")
-        )
-        request.httpMethod = "DELETE"
-        request.setValue("Bearer \(pairing.claimToken)", forHTTPHeaderField: "Authorization")
-        _ = try? await perform(request)
-    }
-
-    private func perform(_ request: URLRequest, expectedStatus: Int = 200) async throws -> Data {
-        let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse else {
-            throw HermesPairingBrokerError.invalidResponse
-        }
-        guard response.statusCode == expectedStatus else {
-            if response.statusCode == 401 || response.statusCode == 410 {
-                throw HermesPairingBrokerError.expired
-            }
-            throw HermesPairingBrokerError.requestFailed(response.statusCode)
-        }
-        return data
-    }
-}
-
 struct AlleycatAddServerSheet: View {
     let appModel: AppModel
     let onConnected: (AlleycatConnectedTarget) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var hermesPairing = HermesPairingLifecycleCoordinator()
     @State private var displayName: String = ""
     @State private var parsedParams: AppAlleycatPairPayload?
     @State private var agents: [AppAlleycatAgentInfo] = []
@@ -220,16 +84,11 @@ struct AlleycatAddServerSheet: View {
     @State private var pasteJSON: String = ""
     @State private var showPaste: Bool = false
     @State private var copiedAgentPrompt = false
-    @State private var isPreparingAgentPrompt = false
-    @State private var hermesPairingRequest: HermesPairingRequest?
-    @State private var hermesPairingStatus = "Create a secure request, then paste the prompt into Hermes."
-    @State private var hermesReadyHost: HermesPairingStatus.Host?
     @State private var showHermesConfirmation = false
-    @State private var hermesPollingTask: Task<Void, Never>?
     @State private var connectAfterAgentLoad = false
+    @State private var pairingRequestIDForParsedParams: String?
 
     private let alleycat = RustAlleycatBridge.shared
-    private let pairingBroker = HermesPairingBrokerClient.shared
 
     init(
         appModel: AppModel,
@@ -275,7 +134,22 @@ struct AlleycatAddServerSheet: View {
             }
         }
         .onDisappear {
-            cancelHermesPairing()
+            hermesPairing.pause()
+        }
+        .task {
+            hermesPairing.restoreAndResume()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                hermesPairing.resume()
+            } else {
+                hermesPairing.pause()
+            }
+        }
+        .onChange(of: hermesPairing.readyHost) { _, host in
+            if host != nil {
+                showHermesConfirmation = true
+            }
         }
         // QR scanner cover + camera-denied alert are applied
         // unconditionally; on Mac builds (Catalyst + iOS-on-Mac) the
@@ -312,7 +186,7 @@ struct AlleycatAddServerSheet: View {
             isPresented: $showHermesConfirmation,
             actions: {
                 Button("Connect") { claimHermesPairingAndConnect() }
-                Button("Not now", role: .cancel) { cancelHermesPairing() }
+                Button("Not now", role: .cancel) {}
             },
             message: {
                 Text(hermesConfirmationMessage)
@@ -355,7 +229,7 @@ struct AlleycatAddServerSheet: View {
                 copyAgentSetupPrompt()
             } label: {
                 HStack {
-                    if isPreparingAgentPrompt {
+                    if hermesPairing.isCreating {
                         ProgressView().tint(.black)
                     }
                     Label(
@@ -368,26 +242,43 @@ struct AlleycatAddServerSheet: View {
             .buttonStyle(.borderedProminent)
             .tint(LitterTheme.accent)
             .foregroundColor(.black)
-            .disabled(isPreparingAgentPrompt)
+            .disabled(hermesPairing.isCreating)
             .accessibilityIdentifier("alleycat.copyAgentSetupPrompt")
 
-            if hermesPairingRequest != nil {
+            if hermesPairing.request != nil {
                 HStack(spacing: 8) {
-                    ProgressView().tint(LitterTheme.accent)
-                    Text(hermesPairingStatus)
+                    if hermesPairing.phase == .polling || hermesPairing.phase == .claiming {
+                        ProgressView().tint(LitterTheme.accent)
+                    }
+                    Text(hermesPairing.statusMessage)
                         .litterFont(.caption)
                         .foregroundColor(LitterTheme.textSecondary)
                     Spacer()
-                    Button("Cancel") {
-                        cancelHermesPairing()
+                    if hermesPairing.canReviewReadyPairing && !isConnecting && !isLoadingAgents {
+                        Button("Review") {
+                            showHermesConfirmation = true
+                        }
+                        .litterFont(.caption)
+                        .foregroundColor(LitterTheme.accent)
+                    } else {
+                        Button("Cancel") {
+                            cancelHermesPairing()
+                        }
+                        .litterFont(.caption)
+                        .foregroundColor(LitterTheme.warning)
                     }
-                    .litterFont(.caption)
-                    .foregroundColor(LitterTheme.warning)
                 }
             } else {
-                Text(hermesPairingStatus)
+                Text(hermesPairing.statusMessage)
                     .litterFont(.caption)
                     .foregroundColor(LitterTheme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let error = hermesPairing.errorMessage {
+                Text(error)
+                    .litterFont(.caption2)
+                    .foregroundColor(LitterTheme.warning)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -586,7 +477,7 @@ struct AlleycatAddServerSheet: View {
     private var connectSection: some View {
         Section {
             Button {
-                connect()
+                connect(pairingRequestID: pairingRequestIDForParsedParams)
             } label: {
                 HStack {
                     if isConnecting {
@@ -631,12 +522,17 @@ struct AlleycatAddServerSheet: View {
         }
     }
 
-    private func handleScannedPayload(_ raw: String, connectAfterLoading: Bool = false) {
+    private func handleScannedPayload(
+        _ raw: String,
+        connectAfterLoading: Bool = false,
+        pairingRequestID: String? = nil
+    ) {
         let trimmed = AgentAssistedPairing.pairingPayloadCandidate(from: raw)
         guard !trimmed.isEmpty else { return }
         do {
             let params = try alleycat.parsePairPayload(json: trimmed)
             connectAfterAgentLoad = connectAfterLoading
+            pairingRequestIDForParsedParams = pairingRequestID
             parsedParams = params
             displayName = suggestedDisplayName(for: params)
             parseError = nil
@@ -644,9 +540,10 @@ struct AlleycatAddServerSheet: View {
             agentError = nil
             agents = []
             selectedAgentNames = []
-            loadAgents(params: params)
+            loadAgents(params: params, pairingRequestID: pairingRequestID)
         } catch {
             connectAfterAgentLoad = false
+            pairingRequestIDForParsedParams = nil
             parsedParams = nil
             agents = []
             selectedAgentNames = []
@@ -655,38 +552,29 @@ struct AlleycatAddServerSheet: View {
     }
 
     private func copyAgentSetupPrompt() {
-        cancelHermesPairing()
-        isPreparingAgentPrompt = true
         parseError = nil
+        copiedAgentPrompt = false
 
         Task {
             do {
-                let pairing = try await pairingBroker.createRequest(
+                let pairing = try await hermesPairing.createRequest(
                     installationId: pairingInstallationId
                 )
-                await MainActor.run {
-                    hermesPairingRequest = pairing
-                    hermesPairingStatus = "Waiting for Hermes…"
-                    let prompt = AgentAssistedPairing.prompt(
-                        submitURL: pairing.submitURL
-                    )
-                    UIPasteboard.general.setItems(
-                        [[UTType.plainText.identifier: prompt]],
-                        options: [.expirationDate: pairing.expiresAt]
-                    )
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        copiedAgentPrompt = true
-                    }
-                    isPreparingAgentPrompt = false
-                    startPollingHermesPairing(pairing)
+                guard hermesPairing.request?.requestId == pairing.requestId else { return }
+                let prompt = AgentAssistedPairing.prompt(
+                    submitURL: pairing.submitURL
+                )
+                UIPasteboard.general.setItems(
+                    [[UTType.plainText.identifier: prompt]],
+                    options: [.expirationDate: pairing.expiresAt]
+                )
+                withAnimation(.easeOut(duration: 0.15)) {
+                    copiedAgentPrompt = true
                 }
+            } catch is CancellationError {
+                return
             } catch {
-                await MainActor.run {
-                    isPreparingAgentPrompt = false
-                    copiedAgentPrompt = false
-                    hermesPairingStatus = "Create a secure request, then paste the prompt into Hermes."
-                    parseError = error.localizedDescription
-                }
+                copiedAgentPrompt = false
             }
         }
     }
@@ -702,101 +590,45 @@ struct AlleycatAddServerSheet: View {
     }
 
     private var hermesConfirmationMessage: String {
-        guard let host = hermesReadyHost else {
+        guard let host = hermesPairing.readyHost else {
             return "Hermes submitted a pairing request. Connect to this computer?"
         }
         let name = host.name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let display = name?.isEmpty == false ? name! : shortNodeId(host.nodeId)
+        if hermesPairing.phase == .claimed {
+            return "Retry the connection to \(display) using the same secure pairing request?"
+        }
         return "\(display) is ready to connect. The one-time credential will only be claimed after you tap Connect."
     }
 
-    private func startPollingHermesPairing(_ pairing: HermesPairingRequest) {
-        hermesPollingTask?.cancel()
-        hermesPollingTask = Task {
-            while !Task.isCancelled {
-                if Date() >= pairing.expiresAt {
-                    await MainActor.run {
-                        clearHermesPairingState(
-                            status: "The request expired. Copy a new setup prompt to try again."
-                        )
-                    }
-                    return
-                }
-                do {
-                    let status = try await pairingBroker.status(for: pairing)
-                    if status.state == "ready", let host = status.host {
-                        await MainActor.run {
-                            hermesPairingStatus = "Hermes sent the pairing securely."
-                            hermesReadyHost = host
-                            showHermesConfirmation = true
-                        }
-                        return
-                    }
-                } catch {
-                    await MainActor.run {
-                        parseError = error.localizedDescription
-                        clearHermesPairingState(
-                            status: "Could not continue this request. Copy a new prompt to retry."
-                        )
-                    }
-                    return
-                }
-                try? await Task.sleep(for: .seconds(2))
-            }
-        }
-    }
-
     private func claimHermesPairingAndConnect() {
-        guard let pairing = hermesPairingRequest else { return }
-        hermesPollingTask?.cancel()
-        hermesPairingStatus = "Claiming the one-time credential…"
         Task {
-            do {
-                let payload = try await pairingBroker.claim(pairing)
-                await MainActor.run {
-                    hermesPairingRequest = nil
-                    hermesReadyHost = nil
-                    copiedAgentPrompt = false
-                    hermesPairingStatus = "Pairing received securely."
-                    handleScannedPayload(payload, connectAfterLoading: true)
-                }
-            } catch {
-                await MainActor.run {
-                    parseError = error.localizedDescription
-                    clearHermesPairingState(
-                        status: "The credential could not be claimed. Copy a new prompt to retry."
-                    )
-                }
+            if let claim = await hermesPairing.claim() {
+                showHermesConfirmation = false
+                handleScannedPayload(
+                    claim.payload,
+                    connectAfterLoading: true,
+                    pairingRequestID: claim.requestID
+                )
             }
         }
     }
 
     private func cancelHermesPairing() {
-        hermesPollingTask?.cancel()
-        if let pairing = hermesPairingRequest {
-            Task { await pairingBroker.cancel(pairing) }
-        }
-        clearHermesPairingState(
-            status: "Create a secure request, then paste the prompt into Hermes."
-        )
-    }
-
-    private func clearHermesPairingState(status: String) {
-        hermesPairingRequest = nil
-        hermesReadyHost = nil
+        hermesPairing.cancel()
         copiedAgentPrompt = false
-        isPreparingAgentPrompt = false
         showHermesConfirmation = false
-        hermesPairingStatus = status
     }
 
-    private func loadAgents(params: AppAlleycatPairPayload) {
+    private func loadAgents(params: AppAlleycatPairPayload, pairingRequestID: String?) {
         isLoadingAgents = true
         Task {
             do {
                 let loaded = try await appModel.serverBridge.listAlleycatAgents(params: params)
                 await MainActor.run {
-                    guard parsedParams?.nodeId == params.nodeId else { return }
+                    guard parsedParams?.nodeId == params.nodeId,
+                          pairingRequestIDForParsedParams == pairingRequestID
+                    else { return }
                     agents = loaded
                     selectedAgentNames = Set(
                         loaded
@@ -809,13 +641,15 @@ struct AlleycatAddServerSheet: View {
                         connectAfterAgentLoad = false
                         Task { @MainActor in
                             await Task.yield()
-                            connect()
+                            connect(pairingRequestID: pairingRequestID)
                         }
                     }
                 }
             } catch {
                 await MainActor.run {
-                    guard parsedParams?.nodeId == params.nodeId else { return }
+                    guard parsedParams?.nodeId == params.nodeId,
+                          pairingRequestIDForParsedParams == pairingRequestID
+                    else { return }
                     agents = []
                     selectedAgentNames = []
                     isLoadingAgents = false
@@ -826,7 +660,7 @@ struct AlleycatAddServerSheet: View {
         }
     }
 
-    private func connect() {
+    private func connect(pairingRequestID: String?) {
         guard let params = parsedParams, let fallbackAgent = selectedAgents.first else { return }
         let trimmedDisplay = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedName = trimmedDisplay.isEmpty ? suggestedDisplayName(for: params) : trimmedDisplay
@@ -846,10 +680,18 @@ struct AlleycatAddServerSheet: View {
                     selectedAgentNames: selectedNames,
                     wire: fallbackAgent.wire
                 )
-                do {
-                    try AlleycatCredentialStore.shared.saveToken(params.token, nodeId: params.nodeId)
-                } catch {
-                    NSLog("[ALLEYCAT_CREDENTIALS] keychain save failed: %@", error.localizedDescription)
+                let credentialCommit = HermesPairingConnectionCommitPolicy.persistCredential(
+                    token: params.token,
+                    nodeID: params.nodeId
+                ) { token, nodeID in
+                    try AlleycatCredentialStore.shared.saveToken(token, nodeId: nodeID)
+                }
+                if case .failure = credentialCommit {
+                    await MainActor.run {
+                        isConnecting = false
+                        connectError = HermesPairingConnectionCommitPolicy.credentialPersistenceFailureMessage
+                    }
+                    return
                 }
                 // First successful alleycat pair triggers the iroh
                 // endpoint bind. Persist the freshly-generated device
@@ -857,6 +699,18 @@ struct AlleycatAddServerSheet: View {
                 // `EndpointId`.
                 await MainActor.run {
                     AppRuntimeController.shared.persistAlleycatSecretKeyIfNeeded()
+                }
+
+                // The broker request stays recoverable until the remote target
+                // is actually connected and its credential is committed.
+                if pairingRequestID != nil,
+                   !hermesPairing.completeConnection(requestID: pairingRequestID) {
+                    await MainActor.run {
+                        isConnecting = false
+                        connectError = hermesPairing.errorMessage
+                            ?? "The host connected, but the active Hermes request changed. The current request was kept."
+                    }
+                    return
                 }
 
                 await MainActor.run {

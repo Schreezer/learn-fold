@@ -197,7 +197,7 @@ ANDROID_RUST_SOURCES := $(shell find $(RUST_DIR) \
 
 $(shell mkdir -p $(STAMPS))
 
-.PHONY: all ios ios-sim ios-sim-fast ios-sim-run ios-device ios-device-fast ios-device-run ios-device-stop ios-run verify-ios-project catalyst catalyst-run catalyst-fast catalyst-fast-run mac-direct mac-direct-run mac-direct-fast mac-direct-fast-run \
+.PHONY: all ios ios-sim ios-sim-fast ios-sim-run ios-device ios-device-fast ios-device-run ios-device-stop ios-run verify-ios-project course-exec check-course-exec catalyst catalyst-run catalyst-fast catalyst-fast-run mac-direct mac-direct-run mac-direct-fast mac-direct-fast-run \
 	android android-fast android-tools android-emulator-fast android-emulator-run android-device-run android-release android-debug android-install android-emulator-install \
 	rust-ios rust-ios-package rust-ios-device-release rust-mac-release rust-ios-device-fast rust-ios-sim-fast rust-ios-macabi-fast rust-android rust-check rust-test rust-host-dev \
 	android-alpine-fs proot-android \
@@ -471,6 +471,12 @@ rust-shellcheck:
 	fi
 
 rust-host-dev: rust-check rust-test
+
+course-exec:
+	@$(IOS_SCRIPTS)/build-course-exec.sh build
+
+check-course-exec:
+	@$(IOS_SCRIPTS)/build-course-exec.sh --check
 
 rust-android: $(STAMP_RUST_ANDROID)
 $(STAMP_RUST_ANDROID): $(STAMP_SYNC) $(STAMP_BINDINGS_K) $(STAMP_GHOSTTY_ANDROID) $(ANDROID_RUST_SOURCES) tools/scripts/build-android-rust.sh Makefile | alleycat-main
@@ -781,7 +787,7 @@ test-rust: alleycat-main
 	@echo "==> Running Rust tests..."
 	@cd $(ROOT) && $(DEV_CARGO_ENV) cargo test --manifest-path $(RUST_DIR)/Cargo.toml -p codex-mobile-client --lib
 
-test-ios: xcgen
+test-ios: check-course-exec xcgen
 	@echo "==> Running iOS tests..."
 	@xcodebuild test -project $(IOS_DIR)/Litter.xcodeproj \
 		-scheme $(IOS_SCHEME) \
@@ -792,7 +798,7 @@ test-android:
 	@echo "==> Running Android tests..."
 	@cd $(ANDROID_DIR) && ./gradlew :app:testDebugUnitTest
 
-ios-release-prep: rust-ios-device-release alpine-fs xcgen
+ios-release-prep: check-course-exec rust-ios-device-release alpine-fs xcgen
 
 mac-release-prep: rust-mac-release xcgen
 

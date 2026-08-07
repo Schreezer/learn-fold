@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test"
+import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 
 const pairPayload = {
@@ -23,7 +23,7 @@ async function createPairing() {
 }
 
 describe("pairing broker", () => {
-  it("keeps credentials hidden until an authorized one-time claim", async () => {
+  it("keeps credentials hidden until an authorized claim", async () => {
     const pairing = await createPairing()
     const authorization = { authorization: `Bearer ${pairing.claim_token}` }
 
@@ -54,8 +54,17 @@ describe("pairing broker", () => {
     const claimed = await SELF.fetch(claimURL, { method: "POST", headers: authorization })
     expect(await claimed.json()).toEqual({ pairing_payload: pairPayload })
 
+    // Simulate losing the first response after the broker completed the request.
     const replay = await SELF.fetch(claimURL, { method: "POST", headers: authorization })
-    expect(replay.ok).toBe(false)
+    expect(replay.status).toBe(200)
+    expect(await replay.json()).toEqual({ pairing_payload: pairPayload })
+
+    const unauthorizedReplay = await SELF.fetch(claimURL, {
+      method: "POST",
+      headers: { authorization: "Bearer wrong" },
+    })
+    expect(unauthorizedReplay.status).toBe(401)
+    expect(JSON.stringify(await unauthorizedReplay.json())).not.toContain("pair-secret")
   })
 
   it("rejects the wrong submit and claim tokens", async () => {
@@ -91,5 +100,74 @@ describe("pairing broker", () => {
       method: "POST",
       body: JSON.stringify({ ...pairPayload, node_id: "different-node" }),
     })).status).toBe(409)
+  })
+
+  it("does not disclose a submitted payload after the request expires", async () => {
+    const pairing = await createPairing()
+    const submitted = await SELF.fetch(pairing.submit_url, {
+      method: "POST",
+      body: JSON.stringify(pairPayload),
+    })
+    expect(submitted.status).toBe(202)
+
+    const stub = env.PAIRING_REQUESTS.get(env.PAIRING_REQUESTS.idFromString(pairing.request_id))
+    await runInDurableObject(stub, async (_instance, state) => {
+      const meta = await state.storage.get<{
+        submitHash: ArrayBuffer
+        claimHash: ArrayBuffer
+        expiresAt: number
+      }>("meta")
+      expect(meta).toBeDefined()
+      await state.storage.put("meta", { ...meta!, expiresAt: Date.now() - 1 })
+    })
+
+    const claim = await SELF.fetch(
+      `https://pair.test/v1/pairing-requests/${pairing.request_id}/claim`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${pairing.claim_token}` },
+      },
+    )
+    expect(claim.status).toBe(401)
+    expect(JSON.stringify(await claim.json())).not.toContain("pair-secret")
+  })
+
+  it("clears a retained claim when the authorized client cancels", async () => {
+    const pairing = await createPairing()
+    const authorization = { authorization: `Bearer ${pairing.claim_token}` }
+    expect((await SELF.fetch(pairing.submit_url, {
+      method: "POST",
+      body: JSON.stringify(pairPayload),
+    })).status).toBe(202)
+
+    const claimURL = `https://pair.test/v1/pairing-requests/${pairing.request_id}/claim`
+    expect((await SELF.fetch(claimURL, { method: "POST", headers: authorization })).status).toBe(200)
+    expect((await SELF.fetch(
+      `https://pair.test/v1/pairing-requests/${pairing.request_id}/cancel`,
+      { method: "DELETE", headers: authorization },
+    )).status).toBe(200)
+
+    const replay = await SELF.fetch(claimURL, { method: "POST", headers: authorization })
+    expect(replay.status).toBe(401)
+    expect(JSON.stringify(await replay.json())).not.toContain("pair-secret")
+  })
+
+  it("clears a retained claim when its expiry alarm runs", async () => {
+    const pairing = await createPairing()
+    const authorization = { authorization: `Bearer ${pairing.claim_token}` }
+    expect((await SELF.fetch(pairing.submit_url, {
+      method: "POST",
+      body: JSON.stringify(pairPayload),
+    })).status).toBe(202)
+
+    const claimURL = `https://pair.test/v1/pairing-requests/${pairing.request_id}/claim`
+    expect((await SELF.fetch(claimURL, { method: "POST", headers: authorization })).status).toBe(200)
+
+    const stub = env.PAIRING_REQUESTS.get(env.PAIRING_REQUESTS.idFromString(pairing.request_id))
+    expect(await runDurableObjectAlarm(stub)).toBe(true)
+
+    const replay = await SELF.fetch(claimURL, { method: "POST", headers: authorization })
+    expect(replay.status).toBe(401)
+    expect(JSON.stringify(await replay.json())).not.toContain("pair-secret")
   })
 })

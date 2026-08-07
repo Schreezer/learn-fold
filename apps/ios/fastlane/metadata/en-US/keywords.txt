@@ -1,1 +1,1 @@
-codex,ssh,developer,terminal,coding,agent,remote
+learning,courses,study,tutor,education,notes,pdf,technical,reader

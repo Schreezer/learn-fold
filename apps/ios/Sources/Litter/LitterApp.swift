@@ -2,11 +2,9 @@ import SwiftUI
 import UIKit
 import UserNotifications
 import Combine
-import CloudKit
 import os
 
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
-    private var pendingPushToken: Data?
     private var pendingNotificationThreadKey: ThreadKey?
     private var splashWindow: UIWindow?
     private weak var windowBeforeSplash: UIWindow?
@@ -16,11 +14,6 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 
     weak var appRuntime: AppRuntimeController? {
         didSet {
-            if let token = pendingPushToken {
-                LLog.info("push", "delivering pending device token to runtime")
-                appRuntime?.setDevicePushToken(token)
-                pendingPushToken = nil
-            }
             if let key = pendingNotificationThreadKey {
                 LLog.info(
                     "push",
@@ -73,7 +66,6 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         DispatchQueue.global(qos: .userInitiated).async {
             AppModel.prewarmRustBridges()
         }
-        application.registerForRemoteNotifications()
         UNUserNotificationCenter.current().delegate = self
         UNUserNotificationCenter.current().setNotificationCategories([
             UNNotificationCategory(
@@ -104,8 +96,15 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         DispatchQueue.main.async {
             CloudKVSBridge.shared.start()
         }
-        Task {
-            await CourseCloudSyncEngine.shared.startIfAvailable()
+        // The XCTest host is not entitled for the production CloudKit container.
+        // Constructing CKContainer there traps before tests can start, so keep the
+        // launch side effect out of unit-test processes. Cloud sync has dedicated
+        // repository/engine tests that inject their own dependencies.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil,
+           ProcessInfo.processInfo.environment["LEARNFOLD_UI_TESTING"] != "1" {
+            Task {
+                await CourseCloudSyncEngine.shared.startIfAvailable()
+            }
         }
         showSplashWindow()
         scheduleKeyboardWarmup()
@@ -205,20 +204,6 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-        let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
-        LLog.info("push", "device token received", fields: ["bytes": deviceToken.count, "hex": hex])
-        if let appRuntime {
-            appRuntime.setDevicePushToken(deviceToken)
-        } else {
-            pendingPushToken = deviceToken
-        }
-    }
-
-    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        LLog.error("push", "registration failed", error: error)
-    }
-
     func applicationWillTerminate(_ application: UIApplication) {
         // Best-effort graceful shutdown of the iroh endpoint. iOS only
         // fires this hook reliably on Catalyst (NSApplicationDelegate)
@@ -237,44 +222,6 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         // Block briefly on the close handshake so iroh can flush
         // CONNECTION_CLOSE frames; bail if iroh's drain takes too long.
         _ = semaphore.wait(timeout: .now() + 2.5)
-    }
-
-    func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any], fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
-        LLog.info(
-            "push",
-            "background push received",
-            fields: [
-                "applicationState": application.applicationState.debugName
-            ],
-            payloadJson: notificationPayloadJson(userInfo)
-        )
-        if CKNotification(fromRemoteNotificationDictionary: userInfo) != nil {
-            Task {
-                let fetchedChanges = await CourseCloudSyncEngine.shared.fetchChanges()
-                LLog.info(
-                    "course-cloud-sync",
-                    "CloudKit push handling completed",
-                    fields: ["result": fetchedChanges ? "newData" : "noData"]
-                )
-                completionHandler(fetchedChanges ? .newData : .noData)
-            }
-            return
-        }
-        if application.applicationState == .active {
-            LLog.info("push", "skipping background push handler because app is already active")
-            completionHandler(.noData)
-            return
-        }
-        guard let appRuntime else {
-            LLog.warn("push", "background push received before runtime was ready")
-            completionHandler(.noData)
-            return
-        }
-        Task { @MainActor in
-            await appRuntime.handleBackgroundPush()
-            LLog.info("push", "background push handling completed", fields: ["result": "newData"])
-            completionHandler(.newData)
-        }
     }
 
     func userNotificationCenter(
@@ -461,7 +408,6 @@ struct ContentView: View {
     @State private var petOverlay = PetOverlayController.shared
     @State private var composerBottomInset: CGFloat = 0
     @State private var splashDismissed = false
-    @State private var showsClassicLitter = false
     @State private var connectsCourseAgentAfterServerSelection = false
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
@@ -476,48 +422,23 @@ struct ContentView: View {
 
         GeometryReader { geometry in
             ZStack {
-                if showsClassicLitter {
-                    LitterTheme.backgroundGradient.ignoresSafeArea()
-                } else {
-                    Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
-                }
+                Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
 
                 #if DEBUG
-                if CourseChatContinuityUITestHarnessView.isEnabled {
+                if MarketingScreenshotHarnessView.isEnabled {
+                    MarketingScreenshotHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseChatContinuityUITestHarnessView.isEnabled {
                     CourseChatContinuityUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if ConversationDisplayUITestHarnessView.isEnabled {
                     ConversationDisplayUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if showsClassicLitter {
-                    standardHomeNavigationView(
-                        topInset: geometry.safeAreaInsets.top,
-                        bottomInset: composerBottomInset
-                    )
                 } else {
                     courseExperienceRoot
                 }
                 #else
-                if showsClassicLitter {
-                    standardHomeNavigationView(
-                        topInset: geometry.safeAreaInsets.top,
-                        bottomInset: composerBottomInset
-                    )
-                } else {
-                    courseExperienceRoot
-                }
-                #endif
-
-                #if DEBUG
-                if !CourseChatContinuityUITestHarnessView.isEnabled,
-                   !ConversationDisplayUITestHarnessView.isEnabled,
-                   showsClassicLitter {
-                    standardOverlays
-                }
-                #else
-                if showsClassicLitter {
-                    standardOverlays
-                }
+                courseExperienceRoot
                 #endif
 
             }
@@ -599,7 +520,6 @@ struct ContentView: View {
                 DiscoveryView(onServerSelected: { server in
                     if connectsCourseAgentAfterServerSelection {
                         SavedProjectStore.selectedServerId = server.id
-                        showsClassicLitter = false
                         Task {
                             await courseStore.selectRemoteAgentServer(
                                 serverID: server.id,
@@ -636,7 +556,6 @@ struct ContentView: View {
     private var courseExperienceRoot: some View {
         CourseExperienceRootView(
             store: courseStore,
-            onOpenClassicLitter: { showsClassicLitter = true },
             onConnectRemoteAgent: {
                 if let hermesServer = appModel.snapshot?.servers.first(where: { server in
                     !server.isLocal

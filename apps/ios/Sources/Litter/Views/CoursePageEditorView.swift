@@ -3,6 +3,14 @@ import NativeBlockEditorUI
 import SwiftUI
 
 struct CoursePageEditorView: View {
+    private struct DiscussionConflict: Identifiable {
+        let id = UUID()
+        let existing: CourseSelectionDiscussion
+        let reference: CourseTextReference
+        let selectedTarget: CourseAgentExecutionTarget
+    }
+
+    @Environment(AppModel.self) private var appModel
     let course: LearningCourse
     let pageID: String
     @Bindable var store: CourseExperienceStore
@@ -11,6 +19,7 @@ struct CoursePageEditorView: View {
     @State private var loadingError: String?
     @State private var chatError: String?
     @State private var activeDiscussion: CourseSelectionDiscussion?
+    @State private var discussionConflict: DiscussionConflict?
 
     var body: some View {
         Group {
@@ -61,15 +70,19 @@ struct CoursePageEditorView: View {
                         store: store,
                         selectionContext: reference,
                         selectionDiscussionID: discussion.id,
-                        showsDismissButton: true
+                        showsDismissButton: true,
+                        onSelectionDiscussionReplaced: { replacement in
+                            activeDiscussion = replacement
+                        }
                     )
                 }
+                .id(discussion.id)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
             }
         }
         .alert(
-            "Can’t open the course agent",
+            "Can’t start discussion",
             isPresented: Binding(
                 get: { chatError != nil },
                 set: { if !$0 { chatError = nil } }
@@ -77,7 +90,37 @@ struct CoursePageEditorView: View {
         ) {
             Button("OK", role: .cancel) { chatError = nil }
         } message: {
-            Text(chatError ?? "The course agent is unavailable.")
+            Text(chatError ?? "The selected agent is unavailable.")
+        }
+        .confirmationDialog(
+            "A discussion already exists",
+            isPresented: Binding(
+                get: { discussionConflict != nil },
+                set: { if !$0 { discussionConflict = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let conflict = discussionConflict {
+                Button(
+                    "Continue with \(conflict.existing.agentRuntimeKind?.displayLabel ?? "Existing Agent")"
+                ) {
+                    activeDiscussion = conflict.existing
+                    discussionConflict = nil
+                }
+                Button(
+                    "Close & Start New with \(conflict.selectedTarget.displayName)",
+                    role: .destructive
+                ) {
+                    replaceConflictingDiscussion()
+                }
+            }
+            Button("Cancel", role: .cancel) { discussionConflict = nil }
+        } message: {
+            if let conflict = discussionConflict {
+                Text(
+                    "This exact passage already has an open discussion with \(conflict.existing.agentRuntimeKind?.displayLabel ?? "another agent"). You selected \(conflict.selectedTarget.displayName)."
+                )
+            }
         }
     }
 
@@ -95,14 +138,37 @@ struct CoursePageEditorView: View {
             chatError = "That selection could not be attached to this page. Select the passage again."
             return
         }
-        guard let discussion = store.beginSelectionDiscussion(
-            for: course,
-            reference: reference
-        ) else {
-            chatError = "This course is no longer connected to its original agent thread."
-            return
+        do {
+            switch try store.beginSelectionDiscussion(for: course, reference: reference) {
+            case .open(let discussion):
+                activeDiscussion = discussion
+            case .targetConflict(let existing, let selected):
+                discussionConflict = DiscussionConflict(
+                    existing: existing,
+                    reference: reference,
+                    selectedTarget: selected
+                )
+            }
+        } catch {
+            chatError = error.localizedDescription
         }
-        activeDiscussion = discussion
+    }
+
+    private func replaceConflictingDiscussion() {
+        guard let conflict = discussionConflict else { return }
+        discussionConflict = nil
+        Task {
+            do {
+                activeDiscussion = try await store.replaceSelectionDiscussion(
+                    existingID: conflict.existing.id,
+                    reference: conflict.reference,
+                    selectedTarget: conflict.selectedTarget,
+                    appModel: appModel
+                )
+            } catch {
+                chatError = error.localizedDescription
+            }
+        }
     }
 
     private func textAnnotations(

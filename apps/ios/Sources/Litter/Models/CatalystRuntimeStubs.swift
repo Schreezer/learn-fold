@@ -47,8 +47,6 @@ final class AppRuntimeController {
         await appModel.client.shutdownAlleycatEndpoint()
     }
 
-    func setDevicePushToken(_ token: Data) {}
-
     func reconnectSavedServers() async {
         guard let appModel else { return }
         let servers = SavedServerStore.reconnectRecords(

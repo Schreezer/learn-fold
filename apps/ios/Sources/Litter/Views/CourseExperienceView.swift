@@ -4,7 +4,6 @@ struct CourseExperienceRootView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(AppState.self) private var appState
     @Bindable var store: CourseExperienceStore
-    var onOpenClassicLitter: () -> Void
     var onConnectRemoteAgent: () -> Void
 
     var body: some View {
@@ -20,7 +19,6 @@ struct CourseExperienceRootView: View {
                 NavigationStack(path: $store.navigationPath) {
                     CourseHomeView(
                         store: store,
-                        onOpenClassicLitter: onOpenClassicLitter,
                         onConnectRemoteAgent: onConnectRemoteAgent
                     )
                     .navigationDestination(for: CourseRoute.self) { route in
@@ -33,8 +31,7 @@ struct CourseExperienceRootView: View {
                             if let course = store.course(withID: courseID) {
                                 CourseDetailView(
                                     course: course,
-                                    store: store,
-                                    onOpenClassicLitter: onOpenClassicLitter
+                                    store: store
                                 )
                             } else {
                                 ContentUnavailableView(
@@ -172,7 +169,7 @@ private struct CourseAgentSetupView: View {
                                 Text("Connect Hermes on a server")
                                     .font(.headline)
                                     .foregroundStyle(.primary)
-                                Text("Pair with Learnfold Link, then continue in a private remote chat.")
+                                Text("Pair with Learnfold Link. Connecting authorizes Hermes to use phone-side tools confined to this course. The shell is read-only until plan approval, read-write afterward, and has no outbound network access.")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                                     .multilineTextAlignment(.leading)
@@ -312,7 +309,6 @@ private struct CourseAgentSetupView: View {
 private struct CourseHomeView: View {
     @Environment(AppModel.self) private var appModel
     @Bindable var store: CourseExperienceStore
-    var onOpenClassicLitter: () -> Void
     var onConnectRemoteAgent: () -> Void
     @State private var showsCourseSettings = false
 
@@ -437,6 +433,39 @@ private struct CourseLibraryEmptyState: View {
     }
 }
 
+struct CourseAgentSettingsDraft: Equatable {
+    var agentID: String
+    var modelID: String
+    var effortID: String
+}
+
+enum CourseAgentSettingsDraftPolicy {
+    static func afterValidation(
+        current: CourseAgentSettingsDraft,
+        proposed: CourseAgentSettingsDraft,
+        isReady: Bool
+    ) -> CourseAgentSettingsDraft {
+        isReady ? proposed : current
+    }
+
+    static func afterCatalogLoad(
+        current: CourseAgentSettingsDraft,
+        availableAgentIDs: Set<String>
+    ) -> CourseAgentSettingsDraft {
+        // An unavailable persisted provider is still the truthful saved value.
+        // Never move the draft checkmark to an unvalidated fallback.
+        current
+    }
+
+    static func afterSave(
+        current: CourseAgentSettingsDraft,
+        persisted: CourseAgentSettingsDraft,
+        didSave: Bool
+    ) -> CourseAgentSettingsDraft {
+        didSave ? current : persisted
+    }
+}
+
 private struct CourseAgentSettingsView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.dismiss) private var dismiss
@@ -448,6 +477,7 @@ private struct CourseAgentSettingsView: View {
     @State private var showsOpenAICompatibleSetup = false
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
     @State private var cloudSyncAvailability: CourseCloudSyncAvailability = .missingEntitlement
+    @State private var validatingAgentID: String?
 
     init(
         store: CourseExperienceStore,
@@ -508,11 +538,7 @@ private struct CourseAgentSettingsView: View {
                 Section {
                     ForEach(store.agentOptions.filter(\.available)) { option in
                         Button {
-                            let optionModels = store.models(for: option.id)
-                            selectedAgent = option.id
-                            let defaultModel = optionModels.first(where: \.isDefault) ?? optionModels.first
-                            selectedModel = defaultModel?.id ?? ""
-                            selectedEffort = defaultModel?.defaultReasoningEffort.wireValue ?? ""
+                            Task { await selectAgent(option) }
                         } label: {
                             HStack(spacing: 14) {
                                 AgentIconView(kind: option.id, size: 32)
@@ -523,11 +549,15 @@ private struct CourseAgentSettingsView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 Spacer()
-                                if selectedAgent == option.id {
+                                if validatingAgentID == option.id {
+                                    ProgressView()
+                                } else if selectedAgent == option.id {
                                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.blue)
                                 }
                             }
                         }
+                        .disabled(validatingAgentID != nil || store.connectionState == .connecting)
+                        .accessibilityIdentifier("course-settings-agent-\(option.id)")
                     }
                 } header: {
                     Text("Course agent")
@@ -626,7 +656,7 @@ private struct CourseAgentSettingsView: View {
                 }
 
                 Section {
-                    Text("This changes the default for new courses. Existing Codex and Apple courses cannot cross provider families. An Apple course can switch between On‑Device and Private Cloud Compute from its chat.")
+                    Text("This changes the default for new courses only. Existing courses stay with the agent that created their conversation, so a Hermes course continues with Hermes. An Apple course can switch between On‑Device and Private Cloud Compute from its chat.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -659,9 +689,7 @@ private struct CourseAgentSettingsView: View {
                 } header: {
                     Text("Remote agent")
                 } footer: {
-                    if connectedHermesServer == nil {
-                        Text("Pairs through Learnfold Link. Hermes can build and edit native course pages through Learnfold’s approval-gated tool bridge.")
-                    }
+                    Text("Connecting Hermes authorizes it to use Learnfold’s phone-side course tools for your course turns. The shell is confined to the active course folder, read-only until you approve the course plan and read-write afterward. It cannot access sibling courses or make outbound network connections.")
                 }
 
                 if let error = store.agentError {
@@ -681,30 +709,33 @@ private struct CourseAgentSettingsView: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(store.connectionState == .connecting ? "Saving…" : "Save") {
+                    Button(validatingAgentID != nil || store.connectionState == .connecting ? "Checking…" : "Save") {
                         Task {
-                            await store.connectLocalAgent(
+                            let didSave = await store.connectLocalAgent(
                                 appModel: appModel,
                                 agentID: selectedAgent,
                                 modelID: selectedModel.isEmpty ? nil : selectedModel,
                                 reasoningEffortID: selectedEffort.isEmpty ? nil : selectedEffort
                             )
-                            if store.connectionState == .connected { dismiss() }
+                            if didSave {
+                                dismiss()
+                            } else {
+                                restoreDraftFromPersistedSelection()
+                            }
                         }
                     }
-                    .disabled(store.connectionState == .connecting)
+                    .disabled(validatingAgentID != nil || store.connectionState == .connecting)
                 }
             }
             .task {
                 await store.prepareLocalAgentCatalog(appModel: appModel)
                 let availableOptions = store.agentOptions.filter(\.available)
-                if !availableOptions.contains(where: { $0.id == selectedAgent }),
-                   let fallback = availableOptions.first {
-                    selectedAgent = fallback.id
-                    selectedModel = store.defaultModelID(for: fallback.id) ?? ""
-                    selectedEffort = ""
-                }
-                if selectedModel.isEmpty {
+                applyDraft(CourseAgentSettingsDraftPolicy.afterCatalogLoad(
+                    current: currentDraft,
+                    availableAgentIDs: Set(availableOptions.map(\.id))
+                ))
+                if availableOptions.contains(where: { $0.id == selectedAgent }),
+                   selectedModel.isEmpty {
                     selectedModel = store.defaultModelID(for: selectedAgent) ?? ""
                 }
                 hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
@@ -718,6 +749,60 @@ private struct CourseAgentSettingsView: View {
                 .environment(appModel)
             }
         }
+    }
+
+    @MainActor
+    private func selectAgent(_ option: CourseAgentOption) async {
+        guard validatingAgentID == nil else { return }
+        let current = currentDraft
+        var isReady = true
+        if option.id == CourseAgentProvider.codex {
+            validatingAgentID = option.id
+            defer { validatingAgentID = nil }
+            isReady = await store.validateAgentSelection(
+                appModel: appModel,
+                agentID: option.id
+            )
+        }
+        let optionModels = store.models(for: option.id)
+        let defaultModel = optionModels.first(where: \.isDefault) ?? optionModels.first
+        let proposed = CourseAgentSettingsDraft(
+            agentID: option.id,
+            modelID: defaultModel?.id ?? "",
+            effortID: defaultModel?.defaultReasoningEffort.wireValue ?? ""
+        )
+        applyDraft(CourseAgentSettingsDraftPolicy.afterValidation(
+            current: current,
+            proposed: proposed,
+            isReady: isReady
+        ))
+    }
+
+    @MainActor
+    private func restoreDraftFromPersistedSelection() {
+        applyDraft(CourseAgentSettingsDraftPolicy.afterSave(
+            current: currentDraft,
+            persisted: CourseAgentSettingsDraft(
+                agentID: store.selectedAgentID ?? "codex",
+                modelID: store.selectedModelID ?? "",
+                effortID: store.selectedReasoningEffortID ?? ""
+            ),
+            didSave: false
+        ))
+    }
+
+    private var currentDraft: CourseAgentSettingsDraft {
+        CourseAgentSettingsDraft(
+            agentID: selectedAgent,
+            modelID: selectedModel,
+            effortID: selectedEffort
+        )
+    }
+
+    private func applyDraft(_ draft: CourseAgentSettingsDraft) {
+        selectedAgent = draft.agentID
+        selectedModel = draft.modelID
+        selectedEffort = draft.effortID
     }
 }
 
@@ -1044,23 +1129,21 @@ private struct CourseDetailView: View {
     @Environment(AppState.self) private var appState
     let course: LearningCourse
     @Bindable var store: CourseExperienceStore
-    let onOpenClassicLitter: () -> Void
 
     @State private var selectedSection: CourseDetailSection
     @State private var workspaceSnapshot: CourseWorkspaceSnapshot?
     @State private var documentOutline: CourseDocumentOutline?
     @State private var structureError: String?
     @State private var expandedLearningNodeIDs: Set<String> = []
+    @State private var courseAgentNavigationError: String?
 
     init(
         course: LearningCourse,
-        store: CourseExperienceStore,
-        onOpenClassicLitter: @escaping () -> Void
+        store: CourseExperienceStore
     ) {
         self.course = course
         self.store = store
-        self.onOpenClassicLitter = onOpenClassicLitter
-        _selectedSection = State(initialValue: course.workspaceID == nil ? .learn : .structure)
+        _selectedSection = State(initialValue: .learn)
     }
 
     private var chapters: [CourseChapter] {
@@ -1159,6 +1242,23 @@ private struct CourseDetailView: View {
             }
             refreshWorkspace()
         }
+        .alert(
+            "Couldn’t Open Course Agent",
+            isPresented: Binding(
+                get: { courseAgentNavigationError != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        courseAgentNavigationError = nil
+                    }
+                }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                courseAgentNavigationError = nil
+            }
+        } message: {
+            Text(courseAgentNavigationError ?? "The course agent is unavailable right now.")
+        }
     }
 
     private var courseHeader: some View {
@@ -1211,7 +1311,7 @@ private struct CourseDetailView: View {
             CourseLearningTreeView(
                 nodes: learningNodes,
                 expandedNodeIDs: $expandedLearningNodeIDs,
-                generationDisabled: isBackgroundGenerationActive,
+                generationDisabled: store.isCourseNodeGenerationDisabled,
                 runtimeID: course.agentRuntimeKind ?? CourseAgentProvider.codex,
                 onOpenMarkdown: { pageID in
                     store.openCoursePage(courseID: course.id, pageID: pageID)
@@ -1284,7 +1384,10 @@ private struct CourseDetailView: View {
 
     private var bottomActionBar: some View {
         Button {
-            store.resumeCourseAgent(for: course)
+            courseAgentNavigationError = nil
+            if case .blocked(let message) = store.resumeCourseAgent(for: course) {
+                courseAgentNavigationError = message
+            }
         } label: {
             Label("Talk to Course Agent", systemImage: "bubble.left.and.bubble.right.fill")
                 .font(.headline)
@@ -1535,6 +1638,11 @@ private struct CourseLearningTreeNodeView: View {
                     .background(.blue, in: Capsule())
                     .buttonStyle(.plain)
                     .accessibilityLabel("Generate \(node.title)")
+                    .accessibilityHint(
+                        generationDisabled
+                            ? "Wait for the current course agent request to finish."
+                            : "Generates this section with your course agent."
+                    )
                     .disabled(generationDisabled)
                     .opacity(generationDisabled ? 0.45 : 1)
             } else {

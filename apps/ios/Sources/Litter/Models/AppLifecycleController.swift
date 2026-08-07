@@ -20,9 +20,6 @@ final class AppLifecycleController {
         let completedNotificationThread: AppThreadSnapshot?
     }
 
-    private let pushProxy = PushProxyClient()
-    private var pushProxyRegistrationId: String?
-    private var devicePushToken: Data?
     private var backgroundedTurnKeys: Set<ThreadKey> = []
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     private var bgWakeCount: Int = 0
@@ -46,10 +43,6 @@ final class AppLifecycleController {
     /// 30s idle timer would make the next user request hang for the
     /// remainder of that window.
     private static let longResumeThreshold: TimeInterval = 15
-
-    func setDevicePushToken(_ token: Data) {
-        devicePushToken = token
-    }
 
     func reconnectSavedServers(appModel: AppModel) async {
         let servers = SavedServerStore.reconnectRecords(
@@ -132,8 +125,6 @@ final class AppLifecycleController {
         )
         bgWakeCount = 0
         liveActivities.sync(snapshot)
-        registerPushProxy()
-
         let bgID = UIApplication.shared.beginBackgroundTask { [weak self] in
             guard let self else { return }
             let expiredID = self.backgroundTaskID
@@ -151,7 +142,6 @@ final class AppLifecycleController {
         let signpostID = OSSignpostID(log: appLifecycleSignpostLog)
         os_signpost(.begin, log: appLifecycleSignpostLog, name: "AppDidBecomeActive", signpostID: signpostID)
         defer { os_signpost(.end, log: appLifecycleSignpostLog, name: "AppDidBecomeActive", signpostID: signpostID) }
-        deregisterPushProxy()
         endBackgroundTaskIfNeeded()
         guard !hasActiveVoiceSession else { return }
         guard !hasRecoveredCurrentForegroundSession else { return }
@@ -287,10 +277,6 @@ final class AppLifecycleController {
                 threadPreview: thread.resolvedPreview,
                 threadKey: thread.key
             )
-        }
-
-        if backgroundedTurnKeys.isEmpty {
-            deregisterPushProxy()
         }
 
         // Refresh the suspension marker so the next push wake (or
@@ -616,49 +602,6 @@ final class AppLifecycleController {
                 error: error,
                 fields: ["key": key.debugLabel]
             )
-        }
-    }
-
-    private func registerPushProxy() {
-        guard let tokenData = devicePushToken else { return }
-        guard pushProxyRegistrationId == nil else { return }
-        let token = tokenData.map { String(format: "%02x", $0) }.joined()
-        LLog.info("push", "registering push proxy")
-        Task {
-            do {
-                let regId = try await pushProxy.register(pushToken: token, interval: 30, ttl: 7200)
-                await MainActor.run {
-                    self.pushProxyRegistrationId = regId
-                    LLog.info("push", "push proxy registered", fields: ["registrationId": regId])
-                }
-            } catch {
-                await MainActor.run {
-                    LLog.error("push", "push proxy registration failed", error: error)
-                }
-            }
-        }
-    }
-
-    private func deregisterPushProxy() {
-        guard let regId = pushProxyRegistrationId else { return }
-        pushProxyRegistrationId = nil
-        LLog.info("push", "deregistering push proxy", fields: ["registrationId": regId])
-        Task {
-            do {
-                try await pushProxy.deregister(registrationId: regId)
-                await MainActor.run {
-                    LLog.info("push", "push proxy deregistered", fields: ["registrationId": regId])
-                }
-            } catch {
-                await MainActor.run {
-                    LLog.error(
-                        "push",
-                        "push proxy deregistration failed",
-                        error: error,
-                        fields: ["registrationId": regId]
-                    )
-                }
-            }
         }
     }
 

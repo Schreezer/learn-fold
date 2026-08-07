@@ -38,6 +38,13 @@ PROFILE="release"
 CARGO_PROFILE_FLAG="--release"
 IOS_RUST_PROFILE="${IOS_RUST_PROFILE:-release}"
 
+# Bundled SQLite's Apple-only VFS branch queries statfs solely to choose
+# network/FAT locking behavior. Learnfold databases are confined to the local
+# app container, so compile SQLite's ordinary POSIX Unix VFS instead. This
+# avoids importing Apple's required-reason disk-space APIs without reporting
+# synthetic capacity or weakening SQLite's byte-range locking.
+export LIBSQLITE3_FLAGS="${LIBSQLITE3_FLAGS:+$LIBSQLITE3_FLAGS }-U__APPLE__"
+
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in
   arm64|aarch64) MACABI_HOST_TARGET="aarch64-apple-ios-macabi" ;;

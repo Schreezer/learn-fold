@@ -272,7 +272,9 @@ export class PairingRequest extends DurableObject<Env> {
       if (!await this.authorize(request, "claim")) return json({ error: "unauthorized_or_expired" }, 401)
       const payload = await this.ctx.storage.get<PairPayload>("payload")
       if (!payload) return json({ error: "not_ready" }, 409)
-      await this.ctx.storage.deleteAll()
+      // Keep the payload until the existing alarm (or an explicit cancel) clears it.
+      // The client can then retry with the same claim capability if this response is
+      // lost after the broker has handled the request.
       return json({ pairing_payload: payload })
     }
 

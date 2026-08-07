@@ -195,7 +195,6 @@ struct HomeDashboardView: View {
                     selectedSearchRuntimeKind = nil
                 }
             }
-            .task { await TipJarStore.shared.loadProducts() }
             .onAppear { autoHydrateIfNeeded() }
             .onChange(of: visibleSessions.map { hydrationId($0.key) }) { _, _ in
                 autoHydrateIfNeeded()
@@ -313,11 +312,7 @@ struct HomeDashboardView: View {
             if chrome == .sidebar {
                 AnimatedLogo(size: 44)
             } else {
-                HStack(spacing: 4) {
-                    SupporterKittyBadges(tierIndices: 0..<2)
-                    AnimatedLogo(size: 64)
-                    SupporterKittyBadges(tierIndices: 2..<4)
-                }
+                AnimatedLogo(size: 64)
             }
         }
         if chrome == .full {

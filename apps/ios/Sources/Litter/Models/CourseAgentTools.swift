@@ -7,6 +7,7 @@ struct CourseMCPToolDefinition {
     let inputSchema: [String: Any]
     let readOnly: Bool
     let destructive: Bool
+    let openWorld: Bool
 
     var jsonObject: [String: Any] {
         [
@@ -17,7 +18,7 @@ struct CourseMCPToolDefinition {
                 "readOnlyHint": readOnly,
                 "destructiveHint": destructive,
                 "idempotentHint": readOnly,
-                "openWorldHint": false,
+                "openWorldHint": openWorld,
             ],
         ]
     }
@@ -28,6 +29,7 @@ enum CourseAgentTools {
     static let mcpDirectNamespace = "mcp__\(mcpServerName)"
     static let workspaceIDArgument = "workspace_id"
     static let presentPlan = "present_course_plan"
+    static let courseBash = "course_bash"
 
     static func dynamicToolSpec() throws -> AppDynamicToolSpec {
         try DynamicToolSpecParams(
@@ -37,6 +39,21 @@ enum CourseAgentTools {
             """,
             inputSchema: AnyEncodable(schema)
         ).rpcSpec()
+    }
+
+    static func courseBashDynamicToolSpec() throws -> AppDynamicToolSpec {
+        let schemaData = try JSONSerialization.data(
+            withJSONObject: addingWorkspaceID(to: courseBashSchema),
+            options: [.sortedKeys]
+        )
+        return AppDynamicToolSpec(
+            name: courseBash,
+            description: """
+            Run a shell script on the learner's iPhone against only the active course folder at /workspace. The workspace is read-only until the learner approves the protected course plan and read-write afterward. Network sockets and symbolic links are unavailable. Include the exact active workspace_id in every call.
+            """,
+            inputSchemaJson: String(decoding: schemaData, as: UTF8.self),
+            deferLoading: false
+        )
     }
 
     static func documentToolSpecs() throws -> [AppDynamicToolSpec] {
@@ -62,9 +79,22 @@ enum CourseAgentTools {
                 """,
                 inputSchema: addingWorkspaceID(to: planSchema),
                 readOnly: true,
-                destructive: false
+                destructive: false,
+                openWorld: false
             )
         ]
+        definitions.append(
+            CourseMCPToolDefinition(
+                name: courseBash,
+                description: """
+                Run a shell script on this iPhone against the live course folder at /workspace. Before the learner approves the latest protected course plan, /workspace is read-only so you may inspect deterministic source material but cannot alter course files. After approval it is read-write. The shell cannot navigate to sibling courses or unrelated app files, symbolic links are unsupported, and internet/network sockets are unavailable. Use normal commands such as find, grep, sed, awk, cat, cp, mv, mkdir, and rm. Commands may partially modify files after approval even when they exit nonzero, so inspect the workspace before retrying a failed mutation.
+                """,
+                inputSchema: addingWorkspaceID(to: courseBashSchema),
+                readOnly: false,
+                destructive: true,
+                openWorld: false
+            )
+        )
         definitions.append(contentsOf: try NativeEditorMCPToolCatalog.tools.map { tool in
             let schemaData = try JSONEncoder().encode(tool.inputSchema)
             return CourseMCPToolDefinition(
@@ -72,7 +102,8 @@ enum CourseAgentTools {
                 description: tool.description,
                 inputSchema: addingWorkspaceID(to: try schemaObject(from: schemaData)),
                 readOnly: tool.readOnly,
-                destructive: tool.destructive
+                destructive: tool.destructive,
+                openWorld: false
             )
         })
         return definitions
@@ -86,6 +117,14 @@ enum CourseAgentTools {
         NativeEditorMCPToolCatalog.tools.contains {
             $0.name == name && !$0.readOnly
         }
+    }
+
+    static func isCourseTool(_ name: String) -> Bool {
+        name == presentPlan || name == courseBash || isEditorTool(name)
+    }
+
+    static func isMutatingCourseTool(_ name: String) -> Bool {
+        name == courseBash || isMutatingEditorTool(name)
     }
 
     private static func schemaObject(from data: Data) throws -> [String: Any] {
@@ -139,4 +178,24 @@ enum CourseAgentTools {
         "estimated_duration",
         "chapters"
     ])
+
+    private static let courseBashSchema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "script": [
+                "type": "string",
+                "description": "Shell script to run from /workspace.",
+                "minLength": 1,
+                "maxLength": CourseBashTool.maximumScriptBytes,
+            ],
+            "timeout_seconds": [
+                "type": "integer",
+                "description": "Optional execution deadline from 1 through 120 seconds.",
+                "minimum": 1,
+                "maximum": CourseBashTool.maximumTimeoutSeconds,
+            ],
+        ],
+        "required": ["script"],
+        "additionalProperties": false,
+    ]
 }

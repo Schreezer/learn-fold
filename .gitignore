@@ -3,6 +3,7 @@
 
 # Local gated-agent workflow checkpoints
 .agent-workflow/
+.opencode/
 
 # Build system stamps
 .build-stamps/

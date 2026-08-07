@@ -81,10 +81,6 @@ final class AppRuntimeController {
         await appModel.client.shutdownAlleycatEndpoint()
     }
 
-    func setDevicePushToken(_ token: Data) {
-        lifecycle.setDevicePushToken(token)
-    }
-
     func reconnectSavedServers() async {
         guard let appModel else { return }
         await lifecycle.reconnectSavedServers(appModel: appModel)

@@ -80,7 +80,11 @@ pub(super) async fn execute_dynamic_tool_call(
             crate::widget_guidelines::handle_visualize_read_me(&params.arguments)
         }
         "show_widget" => crate::widget_guidelines::handle_show_widget(&params.arguments),
-        "present_course_plan" => handle_present_course_plan(&params.arguments),
+        "present_course_plan" => execute_present_course_plan(
+            &platform_dynamic_tool_handler,
+            &params.thread_id,
+            &params.arguments,
+        ),
         tool => execute_platform_dynamic_tool(
             &platform_dynamic_tool_handler,
             &params.thread_id,
@@ -88,6 +92,26 @@ pub(super) async fn execute_dynamic_tool_call(
             &params.arguments,
         ),
     }
+}
+
+fn execute_present_course_plan(
+    platform_dynamic_tool_handler: &Arc<
+        StdMutex<Option<Arc<dyn crate::types::models::PlatformDynamicToolHandler>>>,
+    >,
+    thread_id: &str,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
+    // Validate the shared schema first, then synchronously cross the platform
+    // boundary. iOS owns the protected presented/approved plan files;
+    // returning success before that write would let course_bash reuse approval
+    // for an older revision.
+    handle_present_course_plan(arguments)?;
+    execute_platform_dynamic_tool(
+        platform_dynamic_tool_handler,
+        thread_id,
+        "present_course_plan",
+        arguments,
+    )
 }
 
 fn execute_platform_dynamic_tool(
@@ -198,7 +222,9 @@ fn handle_present_course_plan(arguments: &serde_json::Value) -> Result<String, S
 
 #[cfg(test)]
 mod course_plan_tests {
-    use super::{execute_platform_dynamic_tool, handle_present_course_plan};
+    use super::{
+        execute_platform_dynamic_tool, execute_present_course_plan, handle_present_course_plan,
+    };
     use crate::types::models::{
         AppPlatformDynamicToolInvocation, AppPlatformDynamicToolResult, PlatformDynamicToolHandler,
     };
@@ -219,6 +245,20 @@ mod course_plan_tests {
                     "arguments": invocation.arguments_json,
                 })
                 .to_string(),
+            })
+        }
+    }
+
+    struct CoursePlanTool;
+
+    impl PlatformDynamicToolHandler for CoursePlanTool {
+        fn handle_dynamic_tool(
+            &self,
+            invocation: AppPlatformDynamicToolInvocation,
+        ) -> Option<AppPlatformDynamicToolResult> {
+            (invocation.tool == "present_course_plan").then(|| AppPlatformDynamicToolResult {
+                success: true,
+                output: format!("persisted:{}", invocation.thread_id),
             })
         }
     }
@@ -267,6 +307,32 @@ mod course_plan_tests {
             handle_present_course_plan(&plan)
                 .expect_err("blank deliverable must fail")
                 .contains("non-empty strings")
+        );
+    }
+
+    #[test]
+    fn valid_plan_must_persist_through_phone_handler_before_success() {
+        let handler: Arc<dyn PlatformDynamicToolHandler> = Arc::new(CoursePlanTool);
+        let slot = Arc::new(Mutex::new(Some(handler)));
+        assert_eq!(
+            execute_present_course_plan(&slot, "thread-course-7", &valid_plan())
+                .expect("phone persisted plan"),
+            "persisted:thread-course-7"
+        );
+
+        let missing = Arc::new(Mutex::new(None));
+        assert!(
+            execute_present_course_plan(&missing, "thread-course-7", &valid_plan())
+                .expect_err("missing phone handler must fail")
+                .contains("Unknown dynamic tool")
+        );
+
+        let declining: Arc<dyn PlatformDynamicToolHandler> = Arc::new(NativePageTool);
+        let declining_slot = Arc::new(Mutex::new(Some(declining)));
+        assert!(
+            execute_present_course_plan(&declining_slot, "thread-course-7", &valid_plan())
+                .expect_err("declined plan must fail")
+                .contains("Unknown dynamic tool")
         );
     }
 

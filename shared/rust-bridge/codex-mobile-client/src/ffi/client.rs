@@ -8,7 +8,47 @@ use base64::Engine;
 use codex_app_server_protocol as upstream;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
+
+const PROVIDER_CREDENTIAL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn probe_openai_compatible_credentials_request(
+    base_url: &str,
+    api_key: &str,
+    timeout: Duration,
+) -> Result<(), ClientError> {
+    let normalized_base_url = format!("{}/", base_url.trim_end_matches('/'));
+    let models_url = Url::parse(&normalized_base_url)
+        .and_then(|url| url.join("models"))
+        .map_err(|error| {
+            ClientError::InvalidParams(format!("invalid provider base URL: {error}"))
+        })?;
+    let client = reqwest::Client::builder()
+        // Never forward the bearer credential to a redirect target.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|error| {
+            ClientError::Transport(format!("could not build provider probe: {error}"))
+        })?;
+    let response = client
+        .get(models_url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|error| {
+            ClientError::Transport(format!("provider credential probe failed: {error}"))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ClientError::Rpc(format!(
+            "provider rejected the credential probe with HTTP {}",
+            status.as_u16()
+        )));
+    }
+    Ok(())
+}
 
 async fn rpc<T: serde::de::DeserializeOwned>(
     client: &MobileClient,
@@ -1251,6 +1291,24 @@ impl AppClient {
             )
             .await?;
             Ok(response.into())
+        })
+    }
+
+    /// Performs a non-billable authenticated request against an
+    /// OpenAI-compatible provider. This deliberately uses `GET /models`
+    /// instead of creating a thread or starting a completion.
+    pub async fn probe_openai_compatible_credentials(
+        &self,
+        base_url: String,
+        api_key: String,
+    ) -> Result<(), ClientError> {
+        blocking_async!(self.rt, self.inner, |_c| {
+            probe_openai_compatible_credentials_request(
+                &base_url,
+                &api_key,
+                PROVIDER_CREDENTIAL_PROBE_TIMEOUT,
+            )
+            .await
         })
     }
 
@@ -3023,15 +3081,181 @@ mod tests {
     use super::{
         ImageViewSource, append_cached_models_for_failed_runtimes, append_missing_amp_mode_models,
         choose_saved_app_update_server_id, image_read_command, is_mobile_hidden_skill,
-        normalize_model_info_for_runtime, normalized_image_path, runtime_exposes_model_choices,
+        normalize_model_info_for_runtime, normalized_image_path,
+        probe_openai_compatible_credentials_request, runtime_exposes_model_choices,
         splice_generative_ui_preamble,
     };
+    use crate::ffi::ClientError;
     use crate::store::snapshot::ServerTransportDiagnostics;
     use crate::store::{AppSnapshot, ServerHealthSnapshot, ServerSnapshot};
     use crate::types::models::{AbsolutePath, AppDynamicToolSpec, SkillMetadata, SkillScope};
     use crate::types::{AgentRuntimeKind, ModelInfo, ReasoningEffort, ReasoningEffortOption};
     use crate::widget_guidelines::GENERATIVE_UI_PREAMBLE;
     use std::collections::{HashMap, HashSet};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set request read timeout");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    request.extend_from_slice(&chunk[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("read local probe request: {error}"),
+            }
+        }
+        String::from_utf8(request).expect("HTTP request is UTF-8")
+    }
+
+    fn spawn_http_response_server(
+        response: String,
+        response_delay: Duration,
+    ) -> (String, Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local HTTP server");
+        let address = listener.local_addr().expect("local HTTP address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept local HTTP request");
+            let request = read_http_request(&mut stream);
+            request_tx.send(request).expect("record local HTTP request");
+            if !response_delay.is_zero() {
+                thread::sleep(response_delay);
+            }
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{address}"), request_rx, handle)
+    }
+
+    fn empty_http_response(status: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    #[tokio::test]
+    async fn provider_credential_probe_accepts_2xx_and_preserves_base_path() {
+        for status in ["200 OK", "204 No Content"] {
+            let (base_url, requests, server) =
+                spawn_http_response_server(empty_http_response(status), Duration::ZERO);
+
+            probe_openai_compatible_credentials_request(
+                &format!("{base_url}/v1"),
+                "test-secret",
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("2xx provider probe succeeds");
+
+            let request = requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("provider request recorded");
+            let lowercase_request = request.to_ascii_lowercase();
+            assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+            assert!(lowercase_request.contains("authorization: bearer test-secret\r\n"));
+            server.join().expect("local HTTP server exits");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_credential_probe_rejects_unauthorized_statuses() {
+        for (status, expected_code) in [("401 Unauthorized", "401"), ("403 Forbidden", "403")] {
+            let (base_url, requests, server) =
+                spawn_http_response_server(empty_http_response(status), Duration::ZERO);
+
+            let error = probe_openai_compatible_credentials_request(
+                &base_url,
+                "rejected-secret",
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("401/403 provider probe fails");
+
+            assert!(matches!(error, ClientError::Rpc(message) if message.contains(expected_code)));
+            let _ = requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("provider request recorded");
+            server.join().expect("local HTTP server exits");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_credential_probe_refuses_redirect_without_forwarding_authorization() {
+        let redirect_target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        redirect_target
+            .set_nonblocking(true)
+            .expect("make redirect target nonblocking");
+        let target_url = format!(
+            "http://{}/capture",
+            redirect_target
+                .local_addr()
+                .expect("redirect target address")
+        );
+        let redirect_response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (base_url, requests, redirect_server) =
+            spawn_http_response_server(redirect_response, Duration::ZERO);
+
+        let error = probe_openai_compatible_credentials_request(
+            &base_url,
+            "must-not-be-forwarded",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("redirect response is rejected");
+
+        assert!(matches!(error, ClientError::Rpc(message) if message.contains("302")));
+        let redirect_request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("redirect request recorded")
+            .to_ascii_lowercase();
+        assert!(redirect_request.contains("authorization: bearer must-not-be-forwarded\r\n"));
+        assert!(matches!(
+            redirect_target.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        redirect_server.join().expect("redirect server exits");
+    }
+
+    #[tokio::test]
+    async fn provider_credential_probe_has_bounded_transport_timeout() {
+        let (base_url, requests, server) =
+            spawn_http_response_server(empty_http_response("200 OK"), Duration::from_millis(200));
+        let started = Instant::now();
+
+        let error = probe_openai_compatible_credentials_request(
+            &base_url,
+            "slow-secret",
+            Duration::from_millis(40),
+        )
+        .await
+        .expect_err("slow provider probe times out");
+
+        assert!(matches!(error, ClientError::Transport(_)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("slow provider request recorded");
+        server.join().expect("slow local HTTP server exits");
+    }
 
     fn show_widget_spec() -> AppDynamicToolSpec {
         AppDynamicToolSpec {

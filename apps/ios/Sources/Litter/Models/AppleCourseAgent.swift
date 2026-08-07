@@ -188,14 +188,35 @@ enum AppleCourseApprovalPolicy {
     static let approvedPlanFilename = "approved-plan.json"
     static let lessonTargetFilename = "current-lesson-target.json"
 
+    /// Approval receipts are deliberately outside the live course directory.
+    /// `course_bash` owns every byte inside that directory, so no file there
+    /// can be an authority for explicit learner consent.
+    static func protectedMetadataDirectory(courseDirectory: URL) -> URL {
+        courseDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent(".learnfold-control", isDirectory: true)
+            .appendingPathComponent(courseDirectory.lastPathComponent, isDirectory: true)
+            .appendingPathComponent("approval", isDirectory: true)
+    }
+
+    static func protectedPlanURL(courseDirectory: URL, filename: String) -> URL {
+        protectedMetadataDirectory(courseDirectory: courseDirectory)
+            .appendingPathComponent(filename)
+    }
+
     static func isLatestPlanApproved(courseDirectory: URL) -> Bool {
-        let metadataDirectory = courseDirectory.appendingPathComponent(".course", isDirectory: true)
         guard
             let presentedData = try? Data(
-                contentsOf: metadataDirectory.appendingPathComponent(presentedPlanFilename)
+                contentsOf: protectedPlanURL(
+                    courseDirectory: courseDirectory,
+                    filename: presentedPlanFilename
+                )
             ),
             let approvedData = try? Data(
-                contentsOf: metadataDirectory.appendingPathComponent(approvedPlanFilename)
+                contentsOf: protectedPlanURL(
+                    courseDirectory: courseDirectory,
+                    filename: approvedPlanFilename
+                )
             ),
             let presented = try? JSONDecoder().decode(CourseBrief.self, from: presentedData),
             let approved = try? JSONDecoder().decode(CourseBrief.self, from: approvedData),
@@ -610,6 +631,7 @@ protocol AppleCourseAgentRuntime: AnyObject {
         providerID: String,
         workspaceID: String,
         prompt: String,
+        onAccepted: @escaping @MainActor () -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws
@@ -669,6 +691,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         providerID: String,
         workspaceID: String,
         prompt: String,
+        onAccepted: @escaping @MainActor () -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
@@ -835,6 +858,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             state.toolMode = toolMode
             state.messages.append(.init(role: .learner, text: prompt))
             try saveState(state, sessionID: sessionID, workspaceID: workspaceID)
+            onAccepted()
             LLog.info(
                 "AppleCourseAgent",
                 "request state persisted",
@@ -1715,14 +1739,13 @@ private extension SystemAppleCourseAgentRuntime {
     }
 
     static func durableCourseState(workspaceID: String) -> String? {
-        let metadata = FileManager.default.urls(
+        let courseDirectory = FileManager.default.urls(
             for: .documentDirectory,
             in: .userDomainMask
         )[0]
             .appendingPathComponent("Apps", isDirectory: true)
             .appendingPathComponent("Courses", isDirectory: true)
             .appendingPathComponent(workspaceID, isDirectory: true)
-            .appendingPathComponent(".course", isDirectory: true)
         let filenames = [
             AppleCourseApprovalPolicy.presentedPlanFilename,
             AppleCourseApprovalPolicy.approvedPlanFilename,
@@ -1730,7 +1753,10 @@ private extension SystemAppleCourseAgentRuntime {
         let entries = filenames.compactMap { filename -> String? in
             guard
                 let data = try? Data(
-                    contentsOf: metadata.appendingPathComponent(filename)
+                    contentsOf: AppleCourseApprovalPolicy.protectedPlanURL(
+                        courseDirectory: courseDirectory,
+                        filename: filename
+                    )
                 ),
                 let plan = try? JSONDecoder().decode(CourseBrief.self, from: data)
             else {
@@ -2093,7 +2119,7 @@ private enum AppleCourseToolFactory {
         }
         var properties: [String: Any] = [
             "course_node_id": target.nodeID,
-            "course_role": "lesson",
+            "course_role": target.courseRole ?? "lesson",
         ]
         if write.markGenerated {
             properties["generation_status"] = "generated"
