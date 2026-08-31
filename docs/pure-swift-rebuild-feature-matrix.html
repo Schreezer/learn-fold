@@ -1,0 +1,891 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Learnfold — Pure Swift Rebuild Feature Matrix</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: light-dark(#f5f3ed, #0b0d0c);
+        --surface: light-dark(rgba(255, 255, 255, 0.82), rgba(19, 23, 21, 0.9));
+        --surface-strong: light-dark(#ffffff, #141815);
+        --ink: light-dark(#17201b, #edf7f1);
+        --muted: light-dark(#647069, #9ca9a2);
+        --line: light-dark(#d8ddd9, #29322d);
+        --green: #00b874;
+        --green-soft: light-dark(#e0f8ed, #0d3023);
+        --amber: #d88913;
+        --amber-soft: light-dark(#fff1d9, #36250e);
+        --red: #d95757;
+        --red-soft: light-dark(#ffebeb, #351718);
+        --blue: #3e7edb;
+        --blue-soft: light-dark(#e7f0ff, #14243b);
+        --shadow: 0 18px 48px
+          light-dark(rgba(36, 50, 42, 0.1), rgba(0, 0, 0, 0.28));
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        background:
+          radial-gradient(
+            circle at 12% 0%,
+            color-mix(in srgb, var(--green) 13%, transparent),
+            transparent 32rem
+          ),
+          radial-gradient(
+            circle at 94% 14%,
+            color-mix(in srgb, var(--blue) 11%, transparent),
+            transparent 30rem
+          ),
+          var(--bg);
+        color: var(--ink);
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        line-height: 1.55;
+      }
+
+      button {
+        font: inherit;
+      }
+
+      .shell {
+        width: min(1180px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 42px 0 72px;
+      }
+
+      .hero {
+        position: relative;
+        overflow: hidden;
+        padding: clamp(28px, 5vw, 60px);
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(18px);
+      }
+
+      .hero::after {
+        content: "SWIFT";
+        position: absolute;
+        right: -12px;
+        bottom: -54px;
+        color: color-mix(in srgb, var(--green) 9%, transparent);
+        font-size: clamp(90px, 19vw, 220px);
+        font-weight: 900;
+        letter-spacing: -0.1em;
+        pointer-events: none;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 18px;
+        color: var(--green);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow::before {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 18px var(--green);
+        content: "";
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 880px;
+        margin-bottom: 18px;
+        font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+        font-size: clamp(38px, 6vw, 76px);
+        line-height: 0.98;
+        letter-spacing: -0.055em;
+      }
+
+      .hero-copy {
+        position: relative;
+        z-index: 1;
+        max-width: 790px;
+        margin-bottom: 28px;
+        color: var(--muted);
+        font-family: system-ui, sans-serif;
+        font-size: clamp(17px, 2.2vw, 22px);
+        line-height: 1.5;
+      }
+
+      .verdict {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+        max-width: 880px;
+      }
+
+      .verdict-card {
+        min-height: 132px;
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
+      }
+
+      .verdict-card strong {
+        display: block;
+        margin-bottom: 7px;
+        font-family: system-ui, sans-serif;
+        font-size: 16px;
+      }
+
+      .verdict-card span {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .section {
+        margin-top: 44px;
+      }
+
+      .section-header {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 20px;
+        margin-bottom: 18px;
+      }
+
+      h2 {
+        margin-bottom: 6px;
+        font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+        font-size: clamp(26px, 4vw, 40px);
+        letter-spacing: -0.035em;
+      }
+
+      .section-subtitle {
+        max-width: 720px;
+        margin-bottom: 0;
+        color: var(--muted);
+        font-family: system-ui, sans-serif;
+      }
+
+      .filters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 22px 0;
+      }
+
+      .filter {
+        padding: 9px 13px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+      }
+
+      .filter:hover {
+        color: var(--ink);
+      }
+
+      .filter[aria-pressed="true"] {
+        border-color: var(--ink);
+        background: var(--ink);
+        color: var(--bg);
+      }
+
+      .matrix {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .feature {
+        display: flex;
+        flex-direction: column;
+        min-height: 214px;
+        padding: 20px;
+        border: 1px solid var(--line);
+        border-top: 4px solid var(--tone);
+        border-radius: 18px;
+        background: var(--surface);
+        box-shadow: 0 8px 24px
+          light-dark(rgba(36, 50, 42, 0.055), rgba(0, 0, 0, 0.15));
+      }
+
+      .feature[data-state="keep"] {
+        --tone: var(--green);
+        --tone-soft: var(--green-soft);
+      }
+      .feature[data-state="rewrite"] {
+        --tone: var(--amber);
+        --tone-soft: var(--amber-soft);
+      }
+      .feature[data-state="remove"] {
+        --tone: var(--red);
+        --tone-soft: var(--red-soft);
+      }
+      .feature[hidden] {
+        display: none;
+      }
+
+      .tag {
+        align-self: flex-start;
+        padding: 5px 8px;
+        border-radius: 7px;
+        background: var(--tone-soft);
+        color: var(--tone);
+        font-size: 10px;
+        font-weight: 900;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .feature h3 {
+        margin: 16px 0 8px;
+        font-family: system-ui, sans-serif;
+        font-size: 19px;
+        line-height: 1.22;
+      }
+
+      .feature p {
+        margin-bottom: 14px;
+        color: var(--muted);
+        font-family: system-ui, sans-serif;
+        font-size: 14px;
+      }
+
+      .feature .why {
+        margin-top: auto;
+        padding-top: 12px;
+        border-top: 1px solid var(--line);
+        color: var(--ink);
+        font-size: 11px;
+      }
+
+      .stack {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 16px;
+      }
+
+      .panel {
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background: var(--surface);
+      }
+
+      .diagram {
+        display: grid;
+        gap: 10px;
+        margin-top: 20px;
+      }
+
+      .layer {
+        display: grid;
+        grid-template-columns: 136px 1fr;
+        gap: 14px;
+        align-items: center;
+        min-height: 72px;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--surface-strong);
+      }
+
+      .layer-name {
+        color: var(--green);
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .layer-content {
+        font-family: system-ui, sans-serif;
+        font-size: 14px;
+      }
+
+      .removed-list {
+        display: grid;
+        gap: 10px;
+        margin: 18px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .removed-list li {
+        padding: 12px 14px;
+        border-left: 3px solid var(--red);
+        border-radius: 0 10px 10px 0;
+        background: var(--red-soft);
+        color: color-mix(in srgb, var(--ink) 86%, var(--red));
+        font-family: system-ui, sans-serif;
+        font-size: 14px;
+      }
+
+      .callout {
+        margin-top: 16px;
+        padding: 18px;
+        border: 1px solid color-mix(in srgb, var(--amber) 50%, var(--line));
+        border-radius: 14px;
+        background: var(--amber-soft);
+        font-family: system-ui, sans-serif;
+        font-size: 14px;
+      }
+
+      .assumption {
+        margin-top: 26px;
+        padding: 20px;
+        border: 1px dashed var(--line);
+        border-radius: 16px;
+        color: var(--muted);
+        font-family: system-ui, sans-serif;
+        font-size: 13px;
+      }
+
+      .assumption strong {
+        color: var(--ink);
+      }
+
+      .sources {
+        margin-top: 18px;
+        color: var(--muted);
+        font-size: 10px;
+        line-height: 1.8;
+      }
+
+      @media (max-width: 900px) {
+        .verdict,
+        .matrix {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .stack {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 620px) {
+        .shell {
+          width: min(100% - 20px, 1180px);
+          padding-top: 18px;
+        }
+        .hero {
+          padding: 24px 20px;
+          border-radius: 20px;
+        }
+        .verdict,
+        .matrix {
+          grid-template-columns: 1fr;
+        }
+        .section-header {
+          display: block;
+        }
+        .feature {
+          min-height: 0;
+        }
+        .layer {
+          grid-template-columns: 1fr;
+          gap: 4px;
+        }
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .feature {
+          transition:
+            transform 0.18s ease,
+            opacity 0.18s ease;
+        }
+        .feature:hover {
+          transform: translateY(-2px);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="eyebrow">Learnfold rebuild decision</div>
+        <h1>
+          Pure Swift keeps the learning studio. It drops the remote agent
+          platform.
+        </h1>
+        <p class="hero-copy">
+          A no-Rust, no-built-in-Codex rebuild can still create, edit, sync, and
+          generate personal courses with Apple Foundation Models. What
+          disappears is the generic Codex/Hermes runtime: remote computers,
+          coding-agent threads, terminal, SSH, approvals, and multi-agent
+          orchestration.
+        </p>
+        <div class="verdict" aria-label="Summary">
+          <div class="verdict-card">
+            <strong>Keep the product core</strong>
+            <span
+              >Course library, plans, lessons, editor, sources, local recovery,
+              and iCloud.</span
+            >
+          </div>
+          <div class="verdict-card">
+            <strong>Rewrite the glue</strong>
+            <span
+              >Swift state, streaming conversations, tool dispatch, and
+              Apple-platform projections.</span
+            >
+          </div>
+          <div class="verdict-card">
+            <strong>Remove the agent shell</strong>
+            <span
+              >Codex app-server, UniFFI, Rust store, Hermes/Alleycat, SSH,
+              terminal, and generic coding tools.</span
+            >
+          </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="matrix-title">
+        <div class="section-header">
+          <div>
+            <h2 id="matrix-title">Feature-by-feature outcome</h2>
+            <p class="section-subtitle">
+              “Keep” means the capability already has a Swift/Apple-native
+              foundation. “Rewrite” means the product feature can remain, but
+              its current Rust-facing control path cannot.
+            </p>
+          </div>
+        </div>
+
+        <div class="filters" role="group" aria-label="Filter feature outcomes">
+          <button
+            class="filter"
+            type="button"
+            data-filter="all"
+            aria-pressed="true"
+          >
+            All
+          </button>
+          <button
+            class="filter"
+            type="button"
+            data-filter="keep"
+            aria-pressed="false"
+          >
+            Will have
+          </button>
+          <button
+            class="filter"
+            type="button"
+            data-filter="rewrite"
+            aria-pressed="false"
+          >
+            Needs Swift rebuild
+          </button>
+          <button
+            class="filter"
+            type="button"
+            data-filter="remove"
+            aria-pressed="false"
+          >
+            Won’t have
+          </button>
+        </div>
+
+        <div class="matrix" id="feature-matrix">
+          <article class="feature" data-state="keep">
+            <span class="tag">Will have</span>
+            <h3>My Courses library</h3>
+            <p>
+              Course cards, progress, continue-learning, course detail, and the
+              learning-path tree stay as native SwiftUI product surfaces.
+            </p>
+            <div class="why">
+              Already lives in SwiftUI + local course models.
+            </div>
+          </article>
+
+          <article class="feature" data-state="keep">
+            <span class="tag">Will have</span>
+            <h3>Guided course creation</h3>
+            <p>
+              Start from a topic, run the learner diagnostic, review a proposed
+              course plan, explicitly approve it, and progressively generate
+              lessons.
+            </p>
+            <div class="why">
+              AppleCourseAgent already implements the Apple-native path.
+            </div>
+          </article>
+
+          <article class="feature" data-state="keep">
+            <span class="tag">Will have</span>
+            <h3>Apple intelligence providers</h3>
+            <p>
+              Apple On-Device and Apple Private Cloud Compute can remain the
+              default course agents, including provider switching and context
+              compaction.
+            </p>
+            <div class="why">
+              Uses Foundation Models directly from Swift; no Codex loopback
+              required.
+            </div>
+          </article>
+
+          <article class="feature" data-state="keep">
+            <span class="tag">Will have</span>
+            <h3>Native course editor</h3>
+            <p>
+              Editable pages, course structure, autosave, save recovery,
+              revision checks, selection highlights, and “Ask AI” discussions
+              can remain.
+            </p>
+            <div class="why">
+              NativeBlockEditor and CourseDocumentRepository are Swift
+              packages/code.
+            </div>
+          </article>
+
+          <article class="feature" data-state="keep">
+            <span class="tag">Will have</span>
+            <h3>Sources and attachments</h3>
+            <p>
+              Topic, link, file, PDF/text extraction, and photo intake can stay,
+              along with bounded local staging and safe URL/download rules.
+            </p>
+            <div class="why">
+              CourseSourceIngestion is a Swift actor using Foundation and
+              PDFKit.
+            </div>
+          </article>
+
+          <article class="feature" data-state="keep">
+            <span class="tag">Will have</span>
+            <h3>Local-first persistence</h3>
+            <p>
+              Course workspaces, drafts, protected plan approvals, pending
+              edits, relaunch recovery, and legacy course import can remain on
+              device.
+            </p>
+            <div class="why">
+              The authoritative course repository is already native
+              Swift/SQLite-backed.
+            </div>
+          </article>
+
+          <article class="feature" data-state="keep">
+            <span class="tag">Will have</span>
+            <h3>iCloud course sync</h3>
+            <p>
+              Private CloudKit sync, checksummed generations, account isolation,
+              conflict handling, and offline outbox behavior can remain.
+            </p>
+            <div class="why">
+              CourseCloudSyncEngine is native Swift + CKSyncEngine.
+            </div>
+          </article>
+
+          <article class="feature" data-state="keep">
+            <span class="tag">Will have</span>
+            <h3>Native look and accessibility</h3>
+            <p>
+              SwiftUI navigation, dark/light appearance, Dynamic Type, VoiceOver
+              semantics, wallpapers, branding, and other visual polish are
+              independent of Rust.
+            </p>
+            <div class="why">
+              Presentation stays entirely Apple-platform code.
+            </div>
+          </article>
+
+          <article class="feature" data-state="rewrite">
+            <span class="tag">Rebuild in Swift</span>
+            <h3>Course chat state</h3>
+            <p>
+              The learner-facing chat can stay, but thread snapshots, streaming
+              status, interruption, hydration, retry, and draft reconciliation
+              need a new Swift-owned store.
+            </p>
+            <div class="why">
+              CourseExperienceStore currently mixes course state with
+              AppModel/Rust thread state.
+            </div>
+          </article>
+
+          <article class="feature" data-state="rewrite">
+            <span class="tag">Rebuild in Swift</span>
+            <h3>Course tool execution</h3>
+            <p>
+              Plan presentation and editor tools can remain, but the baseline
+              should call Swift repository methods directly instead of Codex
+              MCP/dynamic-tool transport.
+            </p>
+            <div class="why">
+              Apple agents already prove the direct-call architecture.
+            </div>
+          </article>
+
+          <article class="feature" data-state="rewrite">
+            <span class="tag">Rebuild in Swift</span>
+            <h3>Background generation recovery</h3>
+            <p>
+              Apple-model turns can keep durable progress and recovery, but
+              Codex/Hermes-specific accepted-turn journals and multi-turn remote
+              recovery should be replaced with one Swift lifecycle.
+            </p>
+            <div class="why">
+              The learner promise stays; the runtime-specific implementation
+              does not.
+            </div>
+          </article>
+
+          <article class="feature" data-state="rewrite">
+            <span class="tag">Optional later</span>
+            <h3>Non-Apple model providers</h3>
+            <p>
+              A pure Swift URLSession/SSE provider client could add
+              OpenAI-compatible APIs later, without bundling Codex or
+              reintroducing Rust.
+            </p>
+            <div class="why">
+              Not part of the clean baseline; it is a separate provider adapter.
+            </div>
+          </article>
+
+          <article class="feature" data-state="rewrite">
+            <span class="tag">Rebuild in Swift</span>
+            <h3>Voice, Watch, Live Activities</h3>
+            <p>
+              The Apple UI shells may stay, but their task/thread projections
+              and voice handoff currently depend on the shared runtime and must
+              be redesigned around course sessions.
+            </p>
+            <div class="why">
+              Platform code exists, but the data/control source is Rust-owned
+              today.
+            </div>
+          </article>
+
+          <article class="feature" data-state="remove">
+            <span class="tag">Won’t have</span>
+            <h3>Built-in Codex runtime</h3>
+            <p>
+              No on-device Codex app-server, Codex binary bootstrap, ChatGPT
+              login bridge, API-key configuration for Codex, model catalog, or
+              Codex thread management.
+            </p>
+            <div class="why">
+              Explicitly removed with the Codex submodule and Rust client.
+            </div>
+          </article>
+
+          <article class="feature" data-state="remove">
+            <span class="tag">Won’t have</span>
+            <h3>Hermes / Learnfold Link</h3>
+            <p>
+              No Telegram pairing flow, Alleycat encrypted remote transport,
+              VPS-hosted Hermes runs, remote tool-result loop, or Hermes
+              cold-launch recovery.
+            </p>
+            <div class="why">
+              The current connection, transport, and session path is
+              Rust-backed.
+            </div>
+          </article>
+
+          <article class="feature" data-state="remove">
+            <span class="tag">Won’t have</span>
+            <h3>Remote computers and SSH</h3>
+            <p>
+              No Bonjour server discovery, SSH credentials/host trust, remote
+              bootstrap, reconnect policy, port forwarding, or cross-server
+              session dashboard.
+            </p>
+            <div class="why">
+              These are core services of codex-mobile-client.
+            </div>
+          </article>
+
+          <article class="feature" data-state="remove">
+            <span class="tag">Won’t have</span>
+            <h3>Terminal and local Unix runtime</h3>
+            <p>
+              No Ghostty-backed terminal session, iSH/proot environment, shell
+              execution, filesystem mount runtime, or remote Alleycat terminal.
+            </p>
+            <div class="why">
+              The present terminal backend and execution lifecycle are
+              Rust-owned.
+            </div>
+          </article>
+
+          <article class="feature" data-state="remove">
+            <span class="tag">Won’t have</span>
+            <h3>Generic coding-agent features</h3>
+            <p>
+              No approvals/sandbox controls, diffs, computer-use tool cards,
+              subagents, saved generated apps/widgets, image-generation tools,
+              or cross-server agent handoff.
+            </p>
+            <div class="why">
+              Those surfaces consume Codex-compatible events and tool state.
+            </div>
+          </article>
+
+          <article class="feature" data-state="remove">
+            <span class="tag">Won’t have</span>
+            <h3>Other agent runtimes</h3>
+            <p>
+              No Claude Code, OpenCode, Droid, Pi, Amp, Grok, Devin, or runtime
+              catalog supplied by a connected app server.
+            </p>
+            <div class="why">
+              They are runtime plugins, not native Learnfold course engines.
+            </div>
+          </article>
+
+          <article class="feature" data-state="remove">
+            <span class="tag">Won’t have</span>
+            <h3>Android shared-core parity</h3>
+            <p>
+              The rebuild becomes an Apple-only product unless Android is
+              separately reimplemented; there is no Rust core or UniFFI contract
+              to share.
+            </p>
+            <div class="why">
+              Pure Swift deliberately chooses the iOS product boundary.
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section stack" aria-labelledby="architecture-title">
+        <div class="panel">
+          <h2 id="architecture-title">Clean target architecture</h2>
+          <p class="section-subtitle">
+            A much smaller app graph, with the course—not the agent runtime—as
+            the center of the product.
+          </p>
+          <div class="diagram" aria-label="Pure Swift target architecture">
+            <div class="layer">
+              <span class="layer-name">Experience</span>
+              <span class="layer-content"
+                >SwiftUI course library · guided creation · lesson reader/editor
+                · course chat</span
+              >
+            </div>
+            <div class="layer">
+              <span class="layer-name">App state</span>
+              <span class="layer-content"
+                >Swift Observation store · course drafts · streaming messages ·
+                recovery journal</span
+              >
+            </div>
+            <div class="layer">
+              <span class="layer-name">Intelligence</span>
+              <span class="layer-content"
+                >Apple On-Device · Apple Private Cloud Compute · optional
+                pure-Swift API adapter later</span
+              >
+            </div>
+            <div class="layer">
+              <span class="layer-name">Course data</span>
+              <span class="layer-content"
+                >NativeBlockEditor · local SQLite/files · source ingestion ·
+                CloudKit sync</span
+              >
+            </div>
+            <div class="layer">
+              <span class="layer-name">Build</span>
+              <span class="layer-content"
+                >Xcode + Swift Package Manager + XcodeGen — no Cargo, UniFFI,
+                generated bindings, or Rust static libraries</span
+              >
+            </div>
+          </div>
+        </div>
+
+        <aside class="panel" aria-labelledby="deleted-title">
+          <h2 id="deleted-title">Entire setup removed</h2>
+          <ul class="removed-list">
+            <li><code>shared/rust-bridge/</code> and Cargo toolchains</li>
+            <li><code>shared/third_party/codex/</code> and Codex patches</li>
+            <li>UniFFI-generated Swift/Kotlin bindings</li>
+            <li>
+              <code>GeneratedRust</code> staticlibs and XCFramework packaging
+            </li>
+            <li>Rust/AppStore/AppClient bridge initialization</li>
+            <li>Rust-specific Make targets and cache stamps</li>
+          </ul>
+          <div class="callout">
+            <strong>Important:</strong> deleting Rust today will not leave a
+            compiling app. The course UI is native, but the current root app and
+            course conversation store still reference Rust-generated types. This
+            is a focused rebuild of the app shell and state boundary, not just
+            dependency cleanup.
+          </div>
+        </aside>
+      </section>
+
+      <div class="assumption">
+        <strong>Assumption used for this comparison:</strong> the new baseline
+        is iOS-only, keeps Apple Foundation Models and CloudKit, keeps the
+        current native course/editor experience, and intentionally removes all
+        local/remote coding-agent infrastructure. “Won’t have” means absent from
+        that clean baseline—not technically impossible to add later in pure
+        Swift.
+        <div class="sources">
+          Grounded in the current repository: README.md · apps/ios/project.yml ·
+          AppleCourseAgent.swift · CourseExperienceStore.swift ·
+          CourseDocumentRepository.swift · CourseSourceIngestion.swift ·
+          CourseCloudSyncEngine.swift · AppModel.swift ·
+          shared/rust-bridge/codex-mobile-client/src/
+        </div>
+      </div>
+    </main>
+
+    <script>
+      (() => {
+        const buttons = Array.from(document.querySelectorAll(".filter"));
+        const cards = Array.from(document.querySelectorAll(".feature"));
+
+        function applyFilter(filter) {
+          buttons.forEach((button) => {
+            button.setAttribute(
+              "aria-pressed",
+              String(button.dataset.filter === filter),
+            );
+          });
+          cards.forEach((card) => {
+            card.hidden = filter !== "all" && card.dataset.state !== filter;
+          });
+        }
+
+        buttons.forEach((button) => {
+          button.addEventListener("click", () =>
+            applyFilter(button.dataset.filter),
+          );
+        });
+      })();
+    </script>
+  </body>
+</html>

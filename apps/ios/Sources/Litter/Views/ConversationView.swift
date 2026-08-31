@@ -1154,7 +1154,7 @@ private struct ConversationMessageList: View {
 
 }
 
-private struct ConversationTurnRow: View, Equatable {
+private struct ConversationTurnRow: View, @preconcurrency Equatable {
     let turn: TranscriptTurn
     let isExpanded: Bool
     let canCollapse: Bool

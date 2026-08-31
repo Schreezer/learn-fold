@@ -23,3 +23,29 @@ final class LitterAppearanceModeTests: XCTestCase {
         XCTAssertEqual(LitterAppearanceMode.dark.userInterfaceStyle, .dark)
     }
 }
+
+final class WallpaperConfigOptionalStateTests: XCTestCase {
+    func testMissingConfigIsNeitherActiveNorAnExplicitNoneSelection() {
+        let config: WallpaperConfig? = nil
+
+        XCTAssertFalse(config.containsActiveWallpaper)
+        XCTAssertFalse(config.explicitlySelectsNoWallpaper)
+    }
+
+    func testExplicitNoneConfigIsSelectedButNotActive() {
+        let config: WallpaperConfig? = WallpaperConfig(type: WallpaperType.none)
+
+        XCTAssertFalse(config.containsActiveWallpaper)
+        XCTAssertTrue(config.explicitlySelectsNoWallpaper)
+    }
+
+    func testNonNoneConfigIsActiveAndNotAnExplicitNoneSelection() {
+        let config: WallpaperConfig? = WallpaperConfig(
+            type: WallpaperType.theme,
+            themeSlug: "midnight"
+        )
+
+        XCTAssertTrue(config.containsActiveWallpaper)
+        XCTAssertFalse(config.explicitlySelectsNoWallpaper)
+    }
+}

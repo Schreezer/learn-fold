@@ -1,5 +1,4 @@
 import SwiftUI
-import HairballUI
 import UIKit
 
 func isDiffLanguage(_ language: String?) -> Bool {
@@ -112,24 +111,13 @@ private func attributedDiffLine(
     monoFont: UIFont
 ) -> NSAttributedString {
     let displayText = text.isEmpty ? " " : text
-    let line = NSMutableAttributedString(
-        string: displayText,
-        attributes: [
-            .font: monoFont,
-            .foregroundColor: kind.foregroundColor,
-            .backgroundColor: kind.backgroundColor,
-        ]
-    )
-    line.append(
-        NSAttributedString(
-            string: "\n",
-            attributes: [
-                .font: monoFont,
-                .foregroundColor: kind.foregroundColor,
-                .backgroundColor: kind.backgroundColor,
-            ]
-        )
-    )
+    let attributes: [NSAttributedString.Key: Any] = [
+        NSAttributedString.Key.font: monoFont,
+        NSAttributedString.Key.foregroundColor: kind.foregroundColor,
+        NSAttributedString.Key.backgroundColor: kind.backgroundColor,
+    ]
+    let line = NSMutableAttributedString(string: displayText, attributes: attributes)
+    line.append(NSAttributedString(string: "\n", attributes: attributes))
     return line
 }
 

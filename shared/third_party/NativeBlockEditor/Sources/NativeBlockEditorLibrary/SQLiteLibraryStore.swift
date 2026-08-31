@@ -8,6 +8,7 @@ public enum LibraryStoreError: Error, Equatable, Sendable {
     case sqlite(code: Int32, message: String)
     case corruptData(String)
     case revisionConflict(pageID: String, expected: Int64, actual: Int64)
+    case workspaceGenerationConflict(expected: Int64, actual: Int64)
 }
 
 extension LibraryStoreError: LocalizedError {
@@ -18,6 +19,8 @@ extension LibraryStoreError: LocalizedError {
         case let .corruptData(message): "The library database contains invalid data: \(message)"
         case let .revisionConflict(pageID, expected, actual):
             "Page \(pageID) changed from revision \(expected) to \(actual). Reload it before saving."
+        case let .workspaceGenerationConflict(expected, actual):
+            "The workspace changed from generation \(expected) to \(actual). Reload it before saving."
         }
     }
 }
@@ -25,10 +28,16 @@ extension LibraryStoreError: LocalizedError {
 public struct PersistedLibrary: Sendable {
     public var workspace: PageWorkspace
     public var lastOpenPageID: String?
+    public var workspaceGeneration: Int64
 
-    public init(workspace: PageWorkspace, lastOpenPageID: String?) {
+    public init(
+        workspace: PageWorkspace,
+        lastOpenPageID: String?,
+        workspaceGeneration: Int64 = 0
+    ) {
         self.workspace = workspace
         self.lastOpenPageID = lastOpenPageID
+        self.workspaceGeneration = workspaceGeneration
     }
 }
 
@@ -181,23 +190,34 @@ public actor SQLiteLibraryStore {
             let workspace = try PageWorkspace(rootPageID: rootPageID, pages: pages, items: items)
             return PersistedLibrary(
                 workspace: workspace,
-                lastOpenPageID: try metadataValue(for: "last_open_page_id")
+                lastOpenPageID: try metadataValue(for: "last_open_page_id"),
+                workspaceGeneration: try workspaceGeneration()
             )
         } catch {
             throw LibraryStoreError.corruptData(error.localizedDescription)
         }
     }
 
+    @discardableResult
     public func save(
         _ workspace: PageWorkspace,
         lastOpenPageID: String?,
         changedPageIDs: Set<String>? = nil,
         recordHistory: Bool = true,
-        expectedRevisions: [String: Int64] = [:]
-    ) throws {
+        expectedRevisions: [String: Int64] = [:],
+        expectedWorkspaceGeneration: Int64? = nil
+    ) throws -> Int64 {
         try workspace.validate()
         try execute("BEGIN IMMEDIATE")
         do {
+            let currentWorkspaceGeneration = try workspaceGeneration()
+            if let expectedWorkspaceGeneration,
+               currentWorkspaceGeneration != expectedWorkspaceGeneration {
+                throw LibraryStoreError.workspaceGenerationConflict(
+                    expected: expectedWorkspaceGeneration,
+                    actual: currentWorkspaceGeneration
+                )
+            }
             let previousItemIDs = try allItemIDs()
             for (pageID, expectedRevision) in expectedRevisions {
                 let actualRevision = try existingPage(pageID)?.revision ?? 0
@@ -232,7 +252,13 @@ public actor SQLiteLibraryStore {
                 changedPageIDs: (changedPageIDs ?? currentPageIDs).sorted(),
                 deletedItemIDs: previousItemIDs.subtracting(currentItemIDs).sorted()
             )
+            let committedWorkspaceGeneration = currentWorkspaceGeneration &+ 1
+            try setMetadata(
+                "workspace_generation",
+                value: String(committedWorkspaceGeneration)
+            )
             try execute("COMMIT")
+            return committedWorkspaceGeneration
         } catch {
             try? execute("ROLLBACK")
             throw error
@@ -469,6 +495,18 @@ public actor SQLiteLibraryStore {
             value = Self.text(statement, 0)
         }
         return value
+    }
+
+    private func workspaceGeneration() throws -> Int64 {
+        guard let rawValue = try metadataValue(for: "workspace_generation") else {
+            return 0
+        }
+        guard let generation = Int64(rawValue), generation >= 0 else {
+            throw LibraryStoreError.corruptData(
+                "The workspace generation metadata is invalid."
+            )
+        }
+        return generation
     }
 
     private func setMetadata(_ key: String, value: String) throws {

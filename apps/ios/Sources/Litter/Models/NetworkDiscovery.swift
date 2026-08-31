@@ -93,6 +93,12 @@ private actor TailscaleDiscoveryDiagnostics {
 @MainActor
 @Observable
 final class NetworkDiscovery {
+    enum RuntimeMode: Equatable {
+        case live
+        case inertCheckpoint
+    }
+
+    let runtimeMode: RuntimeMode
     var servers: [DiscoveredServer] = []
     var isScanning = false
     var isInitialLoad = false
@@ -106,10 +112,23 @@ final class NetworkDiscovery {
     @ObservationIgnored private var initialLoadTask: Task<Void, Never>?
     @ObservationIgnored private var activeScanID = UUID()
     @ObservationIgnored private var networkServerLastSeen: [String: Date] = [:]
-    @ObservationIgnored private let discoveryStore = DiscoveryBridge()
+    @ObservationIgnored private let discoveryStore: DiscoveryBridge?
 
     private let cacheKey = "litter.discovery.networkServers.v1"
     private let cacheRetention: TimeInterval = 7 * 24 * 60 * 60
+
+    init(runtimeMode: RuntimeMode = .live) {
+        self.runtimeMode = runtimeMode
+        switch runtimeMode {
+        case .live:
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "NetworkDiscovery.DiscoveryBridge.init"
+            )
+            discoveryStore = DiscoveryBridge()
+        case .inertCheckpoint:
+            discoveryStore = nil
+        }
+    }
 
     private struct CachedNetworkServer: Codable {
         let id: String
@@ -129,6 +148,12 @@ final class NetworkDiscovery {
     }
 
     func startScanning() {
+        guard runtimeMode == .live, discoveryStore != nil else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "NetworkDiscovery.inertCheckpoint.startScanning"
+            )
+            return
+        }
         stopScanning()
         let scanID = UUID()
         activeScanID = scanID
@@ -298,6 +323,12 @@ final class NetworkDiscovery {
     }
 
     private func reconcileNetworkServers(_ candidates: [DiscoveredServer]) -> [DiscoveredServer] {
+        guard let discoveryStore else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "NetworkDiscovery.inertCheckpoint.reconcileServers"
+            )
+            return candidates
+        }
         var existingByKey: [String: DiscoveredServer] = [:]
         for server in candidates where server.source != .local {
             existingByKey[server.deduplicationKey] = server

@@ -35,7 +35,8 @@ enum OpenAICompatibleProviderConfiguration {
     }
 }
 
-final class OpenAIApiKeyStore {
+/// Keychain calls are synchronous and the instance has no mutable state.
+final class OpenAIApiKeyStore: @unchecked Sendable {
     static let shared = OpenAIApiKeyStore()
 
     private let service = "com.chirag.learnfold.openai-api-key"

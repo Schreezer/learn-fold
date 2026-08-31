@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 #if canImport(FoundationModels)
@@ -11,6 +12,7 @@ enum CourseAgentProvider {
     }
 
     static let codex = "codex"
+    static let hosted = "hosted"
     static let appleOnDevice = "apple-on-device"
     static let applePrivateCloud = "apple-private-cloud"
 
@@ -18,12 +20,24 @@ enum CourseAgentProvider {
         id == appleOnDevice || id == applePrivateCloud
     }
 
+    static func usesLocalMessages(_ id: String) -> Bool {
+        id == hosted || isApple(id)
+    }
+
+    static func usesAppServer(_ id: String) -> Bool {
+        !usesLocalMessages(id)
+    }
+
+    static func supportsBinarySources(_ id: String) -> Bool {
+        usesAppServer(id)
+    }
+
     static func canContinueThread(from current: String, with proposed: String) -> Bool {
         current == proposed || (isApple(current) && isApple(proposed))
     }
 
     static func preferredDefault(in options: [CourseAgentOption]) -> String? {
-        for id in [applePrivateCloud, appleOnDevice, codex] {
+        for id in [hosted, applePrivateCloud, appleOnDevice, codex] {
             if options.first(where: { $0.id == id })?.available == true {
                 return id
             }
@@ -118,6 +132,10 @@ enum AppleCourseToolMode: String, Codable, Equatable, Sendable {
     case appendingLesson
     case full
 
+    var exposesPlanningTool: Bool {
+        self == .planning || self == .full
+    }
+
     static func forTurn(
         providerID: String,
         hasApprovedPlan: Bool,
@@ -205,27 +223,44 @@ enum AppleCourseApprovalPolicy {
     }
 
     static func isLatestPlanApproved(courseDirectory: URL) -> Bool {
+        approvedPlan(courseDirectory: courseDirectory) != nil
+    }
+
+    static func presentedPlan(courseDirectory: URL) -> CourseBrief? {
         guard
-            let presentedData = try? Data(
+            let data = try? Data(
                 contentsOf: protectedPlanURL(
                     courseDirectory: courseDirectory,
                     filename: presentedPlanFilename
                 )
             ),
+            let plan = try? JSONDecoder().decode(CourseBrief.self, from: data),
+            AppleCoursePlanValidator.issue(
+                in: plan,
+                requiresTypedHierarchy: true
+            ) == nil
+        else {
+            return nil
+        }
+        return plan
+    }
+
+    static func approvedPlan(courseDirectory: URL) -> CourseBrief? {
+        guard
             let approvedData = try? Data(
                 contentsOf: protectedPlanURL(
                     courseDirectory: courseDirectory,
                     filename: approvedPlanFilename
                 )
             ),
-            let presented = try? JSONDecoder().decode(CourseBrief.self, from: presentedData),
+            let presented = presentedPlan(courseDirectory: courseDirectory),
             let approved = try? JSONDecoder().decode(CourseBrief.self, from: approvedData),
             !presented.planID.isEmpty,
             presented == approved
         else {
-            return false
+            return nil
         }
-        return true
+        return approved
     }
 }
 
@@ -238,8 +273,19 @@ struct AppleCourseAgentAvailability: Equatable, Sendable {
     let onDevice: Capability
     let privateCloud: Capability
 
-    static func current(environment: [String: String] = ProcessInfo.processInfo.environment) -> Self {
-        if let forced = forcedAvailability(environment: environment) {
+    static func current(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        hasXCTestConfiguration: Bool? = nil,
+        hasExplicitUITestingAuthority: Bool? = nil
+    ) -> Self {
+        let processEnvironment = ProcessInfo.processInfo.environment
+        if let forced = forcedAvailability(
+            environment: environment,
+            hasXCTestConfiguration: hasXCTestConfiguration
+                ?? (processEnvironment[LearnfoldUITestLaunchPolicy.xctestConfigurationKey] != nil),
+            hasExplicitUITestingAuthority: hasExplicitUITestingAuthority
+                ?? (processEnvironment[LearnfoldUITestLaunchPolicy.explicitUITestingKey] == "1")
+        ) {
             return forced
         }
 
@@ -250,7 +296,18 @@ struct AppleCourseAgentAvailability: Equatable, Sendable {
         )
     }
 
-    private static func forcedAvailability(environment: [String: String]) -> Self? {
+    static func forcedAvailability(
+        environment: [String: String],
+        hasXCTestConfiguration: Bool,
+        hasExplicitUITestingAuthority: Bool
+    ) -> Self? {
+        guard LearnfoldUITestLaunchPolicy.allowsTestOnlyOverrides(
+            environment: environment,
+            hasXCTestConfiguration: hasXCTestConfiguration,
+            hasExplicitUITestingAuthority: hasExplicitUITestingAuthority
+        ) else {
+            return nil
+        }
         let onDeviceValue = environment["SNAPPY_APPLE_ON_DEVICE_AVAILABLE"]
         let cloudValue = environment["SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE"]
         guard onDeviceValue != nil || cloudValue != nil else { return nil }
@@ -346,19 +403,26 @@ struct AppleCourseAgentAvailability: Equatable, Sendable {
 }
 
 enum AppleCoursePlanValidator {
-    static func issue(in brief: CourseBrief) -> String? {
+    static func issue(
+        in brief: CourseBrief,
+        requiresTypedHierarchy: Bool = false
+    ) -> String? {
         func containsSerializedKeyFragment(_ value: String) -> Bool {
             let normalized = value.lowercased()
             let schemaKeys = [
                 "chapters",
+                "children",
                 "deliverables",
                 "estimated_duration",
                 "focus_gap",
+                "learning_path",
                 "objective",
                 "outcome",
                 "plan_id",
                 "revision",
+                "role",
                 "starting_point",
+                "structure_version",
                 "summary",
                 "title",
             ]
@@ -387,7 +451,13 @@ enum AppleCoursePlanValidator {
         if brief.planID.wholeMatch(of: planIDPattern) == nil || brief.revision < 1 {
             return "plan_id must be non-empty and revision must be positive"
         }
-        if !isNaturalLanguage(brief.title) {
+        if CoursePlanHierarchyPolicy.reservedContextNodeIDs.contains(brief.planID) {
+            return "plan_id must not reuse a reserved course context page ID"
+        }
+        if brief.title.count > CoursePlanHierarchyPolicy.maximumPlanTitleLength {
+            return "title must be at most \(CoursePlanHierarchyPolicy.maximumPlanTitleLength) characters"
+        }
+        if !isNaturalLanguage(brief.title, minimumWords: 1) {
             return "title must be a natural-language course title"
         }
         let narrativeFields = [
@@ -395,9 +465,18 @@ enum AppleCoursePlanValidator {
             brief.outcome,
             brief.startingPoint,
             brief.focusGap,
-            brief.estimatedDuration,
         ]
-        if narrativeFields.contains(where: { !isNaturalLanguage($0) }) {
+        if narrativeFields.contains(where: {
+            $0.count > CoursePlanHierarchyPolicy.maximumNarrativeFieldLength
+        }) {
+            return "plan narrative fields must be at most \(CoursePlanHierarchyPolicy.maximumNarrativeFieldLength) characters"
+        }
+        if brief.estimatedDuration.count
+            > CoursePlanHierarchyPolicy.maximumEstimatedDurationLength {
+            return "estimated_duration must be at most \(CoursePlanHierarchyPolicy.maximumEstimatedDurationLength) characters"
+        }
+        if narrativeFields.contains(where: { !isNaturalLanguage($0) })
+            || !isNaturalLanguage(brief.estimatedDuration, minimumWords: 1) {
             return "all plan summary fields must contain natural language, not serialized schema fragments"
         }
         if !(1...8).contains(brief.chapters.count) {
@@ -408,55 +487,352 @@ enum AppleCoursePlanValidator {
             return "chapter IDs must be unique"
         }
         for chapter in brief.chapters {
+            if chapter.title.count > CoursePlanHierarchyPolicy.maximumNodeTitleLength {
+                return "every chapter title must be at most \(CoursePlanHierarchyPolicy.maximumNodeTitleLength) characters"
+            }
+            if chapter.objective.count
+                > CoursePlanHierarchyPolicy.maximumChapterObjectiveLength {
+                return "every chapter objective must be at most \(CoursePlanHierarchyPolicy.maximumChapterObjectiveLength) characters"
+            }
             if chapter.id.wholeMatch(of: planIDPattern) == nil
-                || !isNaturalLanguage(chapter.title)
+                || !isNaturalLanguage(chapter.title, minimumWords: 1)
                 || !isNaturalLanguage(chapter.objective)
             {
                 return "every chapter needs a valid ID plus natural-language title and objective"
             }
-            if chapter.deliverables.isEmpty
+            if chapter.deliverables.contains(where: {
+                $0.count > CoursePlanHierarchyPolicy.maximumDeliverableLength
+            }) {
+                return "every chapter deliverable must be at most \(CoursePlanHierarchyPolicy.maximumDeliverableLength) characters"
+            }
+            if !(1...CoursePlanHierarchyPolicy.maximumDirectChildren).contains(
+                chapter.deliverables.count
+            )
                 || chapter.deliverables.contains(where: { !isNaturalLanguage($0) })
             {
-                return "every chapter needs at least one natural-language deliverable"
+                return "every chapter needs 1 to \(CoursePlanHierarchyPolicy.maximumDirectChildren) natural-language deliverables"
             }
         }
-        return nil
+        return CoursePlanHierarchyPolicy.validationIssue(
+            in: brief,
+            requiresTypedHierarchy: requiresTypedHierarchy
+        )
+    }
+}
+
+struct AppleCourseGeneratedLessonContent: Decodable, Equatable, Sendable {
+    let explanation: String
+    let example: String
+    let exercise: String
+}
+
+enum AppleCourseLessonSemanticRequirement: Equatable, Sendable {
+    case declaresSwiftActor
+}
+
+struct AppleCourseLessonValidationContext: Equatable, Sendable {
+    let exampleKind: CourseLessonExampleKind
+    let semanticRequirement: AppleCourseLessonSemanticRequirement?
+}
+
+enum AppleCourseLessonValidationBinding: Equatable, Sendable {
+    case bound(AppleCourseLessonValidationContext)
+    case rejected(String)
+}
+
+enum AppleCourseLessonSemanticRequirementPolicy {
+    static func binding(
+        approvedPlan: CourseBrief?,
+        target: PreparedCourseLessonTarget
+    ) -> AppleCourseLessonValidationBinding {
+        guard let approvedPlan else {
+            return .rejected(
+                "Learnfold could not find the latest protected approved course plan."
+            )
+        }
+        guard
+            let roleName = target.courseRole?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+            let targetRole = CourseLearningNode.Role(rawValue: roleName)
+        else {
+            return .rejected(
+                "The prepared lesson target has no valid approved course role."
+            )
+        }
+
+        let matches = CoursePlanHierarchyPolicy.outlineEntries(for: approvedPlan)
+            .filter { $0.id == target.nodeID }
+        guard matches.count == 1, matches[0].role == targetRole else {
+            return .rejected(
+                "The prepared lesson target does not match exactly one node and role in the latest approved plan."
+            )
+        }
+
+        let exampleKind = CourseLessonExamplePolicy.kind(for: approvedPlan)
+        let titleTokens = Set(
+            matches[0].title
+                .lowercased()
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+        )
+        let semanticRequirement: AppleCourseLessonSemanticRequirement?
+        if AppleCourseGeneratedLessonValidator.requiresSwiftValidation(exampleKind),
+           !titleTokens.isDisjoint(with: ["actor", "actors"]) {
+            semanticRequirement = .declaresSwiftActor
+        } else {
+            semanticRequirement = nil
+        }
+        return .bound(AppleCourseLessonValidationContext(
+            exampleKind: exampleKind,
+            semanticRequirement: semanticRequirement
+        ))
     }
 }
 
 enum AppleCourseGeneratedLessonValidator {
-    static let safeActorExample = """
-    actor Counter {
-        private var value = 0
+    static func issue(
+        in content: AppleCourseGeneratedLessonContent,
+        exampleKind: CourseLessonExampleKind,
+        semanticRequirement: AppleCourseLessonSemanticRequirement? = nil
+    ) -> String? {
+        guard requiresSwiftValidation(exampleKind) else { return nil }
+        return swiftCodeIssue(
+            content.example,
+            semanticRequirement: semanticRequirement
+        )
+    }
 
-        func increment() -> Int {
-            value += 1
-            return value
+    static func requiresSwiftValidation(_ exampleKind: CourseLessonExampleKind) -> Bool {
+        guard case .runnableCode(let languageOrFramework) = exampleKind else {
+            return false
+        }
+        switch languageOrFramework.lowercased() {
+        case "swift", "swiftui":
+            return true
+        default:
+            return false
         }
     }
 
-    let counter = Counter()
-    Task {
-        print(await counter.increment())
-    }
-    """
-
-    static func validatedSwiftCode(_ code: String) -> String {
-        swiftCodeIssue(code) == nil ? code : safeActorExample
-    }
-
-    static func swiftCodeIssue(_ code: String) -> String? {
+    static func swiftCodeIssue(
+        _ code: String,
+        semanticRequirement: AppleCourseLessonSemanticRequirement? = nil
+    ) -> String? {
         let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return "the Swift example is empty"
         }
-        guard trimmed.range(
-            of: #"\bactor\s+[A-Za-z_][A-Za-z0-9_]*"#,
-            options: .regularExpression
-        ) != nil else {
-            return "the Swift example must declare an actor, not merely describe one"
+        guard !trimmed.contains("```") else {
+            return "the Swift example must not contain Markdown fences"
+        }
+        guard !trimmed.contains("<#"), !trimmed.contains("#>") else {
+            return "the Swift example contains an unresolved Xcode placeholder"
         }
 
+        let scrubbed = scrubNonCodeText(from: trimmed)
+        if let lexicalIssue = scrubbed.issue {
+            return lexicalIssue
+        }
+        if semanticRequirement == .declaresSwiftActor,
+           scrubbed.containsExtendedRegexLiteral {
+            return "the approved Swift actors lesson contains an extended regex literal that cannot satisfy the required `actor TypeName { ... }` declaration"
+        }
+        if let delimiterIssue = delimiterIssue(in: scrubbed.code) {
+            return delimiterIssue
+        }
+        if semanticRequirement == .declaresSwiftActor,
+           !containsSwiftActorDeclaration(in: scrubbed.code) {
+            return "the approved Swift actors lesson must declare a real Swift actor using `actor TypeName { ... }`"
+        }
+
+        let declaredTypes = capturedIdentifiers(
+            pattern: #"\b(?:actor|class|struct|enum|protocol|typealias)\s+([A-Z_][A-Za-z0-9_]*)\b"#,
+            in: scrubbed.code
+        )
+        let constructedTypes = capturedIdentifiers(
+            pattern: #"\b([A-Z][A-Za-z0-9_]*)\s*(?:<[^<>{}\n()]+>)?\s*\("#,
+            in: scrubbed.code
+        )
+        if let undefinedType = constructedTypes
+            .subtracting(declaredTypes)
+            .subtracting(knownStandaloneTypeNames)
+            .sorted()
+            .first {
+            return "the Swift example constructs \(undefinedType) without declaring it"
+        }
+        return nil
+    }
+
+    private static func containsSwiftActorDeclaration(in code: String) -> Bool {
+        // Anchor the declaration to a source line so prose-like tokens inside regex literals or
+        // expressions cannot satisfy the semantic boundary. Support the ordinary attribute and
+        // access-modifier forms used by standalone teaching examples.
+        let pattern = #"(?m)^(?:[\t ]*@[A-Za-z_][A-Za-z0-9_.]*(?:[\t ]*\([^\n]*\))?[\t ]*\n)*[\t ]*(?:(?:@[A-Za-z_][A-Za-z0-9_.]*(?:[\t ]*\([^\n]*\))?|public|package|internal|fileprivate|private|nonisolated|distributed|final)[\t ]+)*actor[\t ]+[A-Z_][A-Za-z0-9_]*(?:[\t ]*:[^{\n]+)?[\t ]*(?:\n[\t ]*)?\{"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return false
+        }
+        let range = NSRange(code.startIndex..<code.endIndex, in: code)
+        return expression.firstMatch(in: code, range: range) != nil
+    }
+
+    private struct ScrubbedCode {
+        let code: String
+        let issue: String?
+        let containsExtendedRegexLiteral: Bool
+    }
+
+    private static func scrubNonCodeText(from source: String) -> ScrubbedCode {
+        let characters = Array(source)
+        var output = ""
+        var index = 0
+        var isInLineComment = false
+        var blockCommentDepth = 0
+        var isInString = false
+        var isInMultilineString = false
+        var extendedRegexPoundCount: Int?
+        var containsExtendedRegexLiteral = false
+
+        func matches(_ expected: [Character], at start: Int) -> Bool {
+            guard start + expected.count <= characters.count else { return false }
+            return Array(characters[start..<(start + expected.count)]) == expected
+        }
+
+        func appendPlaceholder(for character: Character) {
+            output.append(character == "\n" ? "\n" : " ")
+        }
+
+        func extendedRegexOpeningPoundCount(at start: Int) -> Int? {
+            var cursor = start
+            while cursor < characters.count, characters[cursor] == "#" {
+                cursor += 1
+            }
+            let poundCount = cursor - start
+            guard poundCount > 0,
+                  cursor < characters.count,
+                  characters[cursor] == "/" else {
+                return nil
+            }
+            return poundCount
+        }
+
+        while index < characters.count {
+            let character = characters[index]
+            if isInLineComment {
+                appendPlaceholder(for: character)
+                index += 1
+                if character == "\n" {
+                    isInLineComment = false
+                }
+                continue
+            }
+            if blockCommentDepth > 0 {
+                if matches(["/", "*"], at: index) {
+                    output += "  "
+                    blockCommentDepth += 1
+                    index += 2
+                } else if matches(["*", "/"], at: index) {
+                    output += "  "
+                    blockCommentDepth -= 1
+                    index += 2
+                } else {
+                    appendPlaceholder(for: character)
+                    index += 1
+                }
+                continue
+            }
+            if isInMultilineString {
+                if matches(["\"", "\"", "\""], at: index) {
+                    output += "   "
+                    isInMultilineString = false
+                    index += 3
+                } else {
+                    appendPlaceholder(for: character)
+                    index += 1
+                }
+                continue
+            }
+            if isInString {
+                if character == "\\" {
+                    output.append(" ")
+                    index += 1
+                    if index < characters.count {
+                        appendPlaceholder(for: characters[index])
+                        index += 1
+                    }
+                } else {
+                    appendPlaceholder(for: character)
+                    index += 1
+                    if character == "\"" {
+                        isInString = false
+                    }
+                }
+                continue
+            }
+            if let poundCount = extendedRegexPoundCount {
+                let closing: [Character] = ["/"]
+                    + Array(repeating: "#", count: poundCount)
+                if matches(closing, at: index) {
+                    for closingCharacter in closing {
+                        appendPlaceholder(for: closingCharacter)
+                    }
+                    extendedRegexPoundCount = nil
+                    index += closing.count
+                } else {
+                    appendPlaceholder(for: character)
+                    index += 1
+                }
+                continue
+            }
+
+            if matches(["/", "/"], at: index) {
+                output += "  "
+                isInLineComment = true
+                index += 2
+            } else if matches(["/", "*"], at: index) {
+                output += "  "
+                blockCommentDepth = 1
+                index += 2
+            } else if matches(["\"", "\"", "\""], at: index) {
+                output += "   "
+                isInMultilineString = true
+                index += 3
+            } else if character == "\"" {
+                output.append(" ")
+                isInString = true
+                index += 1
+            } else if let poundCount = extendedRegexOpeningPoundCount(at: index) {
+                containsExtendedRegexLiteral = true
+                extendedRegexPoundCount = poundCount
+                let openingLength = poundCount + 1
+                for offset in 0..<openingLength {
+                    appendPlaceholder(for: characters[index + offset])
+                }
+                index += openingLength
+            } else {
+                output.append(character)
+                index += 1
+            }
+        }
+
+        let issue: String?
+        if blockCommentDepth > 0 {
+            issue = "the Swift example has an unterminated block comment"
+        } else if isInString || isInMultilineString {
+            issue = "the Swift example has an unterminated string literal"
+        } else if extendedRegexPoundCount != nil {
+            issue = "the Swift example has an unterminated extended regex literal"
+        } else {
+            issue = nil
+        }
+        return ScrubbedCode(
+            code: output,
+            issue: issue,
+            containsExtendedRegexLiteral: containsExtendedRegexLiteral
+        )
+    }
+
+    private static func delimiterIssue(in code: String) -> String? {
         let openingToClosing: [Character: Character] = [
             "(": ")",
             "[": "]",
@@ -464,7 +840,7 @@ enum AppleCourseGeneratedLessonValidator {
         ]
         let closing = Set(openingToClosing.values)
         var stack: [Character] = []
-        for character in trimmed {
+        for character in code {
             if openingToClosing[character] != nil {
                 stack.append(character)
             } else if closing.contains(character) {
@@ -474,10 +850,153 @@ enum AppleCourseGeneratedLessonValidator {
                 }
             }
         }
-        guard stack.isEmpty else {
-            return "the Swift example is truncated or has unclosed delimiters"
+        return stack.isEmpty
+            ? nil
+            : "the Swift example is truncated or has unclosed delimiters"
+    }
+
+    private static func capturedIdentifiers(
+        pattern: String,
+        in source: String
+    ) -> Set<String> {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return []
         }
-        return nil
+        let sourceRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        return Set(expression.matches(in: source, range: sourceRange).compactMap { match in
+            guard match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: source) else {
+                return nil
+            }
+            return String(source[range])
+        })
+    }
+
+    private static let knownStandaloneTypeNames: Set<String> = [
+        "AnyHashable", "Array", "AsyncStream", "Binding", "Bool", "Button", "Calendar",
+        "Capsule", "Character", "CheckedContinuation", "Circle", "ClosedRange", "Color",
+        "ContiguousArray", "Data", "Date", "DateComponents", "DateFormatter", "Decimal",
+        "Dictionary", "Divider", "Double", "Duration", "EmptyView", "Float", "ForEach",
+        "Form", "GeometryReader", "Group", "HStack", "ISO8601DateFormatter", "Image", "Int",
+        "Int16", "Int32", "Int64", "Int8", "JSONDecoder", "JSONEncoder", "Label",
+        "LazyHGrid", "LazyVGrid", "LinearGradient", "List", "NavigationStack",
+        "NumberFormatter", "Optional", "Picker", "ProgressView", "Range", "Result",
+        "RoundedRectangle", "ScrollView", "Section", "Set", "Spacer", "State", "String",
+        "Substring", "Text", "TextField", "TimeZone", "Toggle", "UInt", "UInt16", "UInt32",
+        "UInt64", "UInt8", "URL", "URLComponents", "UUID", "VStack", "ZStack",
+    ]
+}
+
+enum AppleCourseLessonValidationRetryDecision: Equatable, Sendable {
+    case retry
+    case stop
+}
+
+@MainActor
+final class AppleCourseLessonValidationRetryGate {
+    static let maximumCorrectiveRetries = 1
+
+    private enum State {
+        case awaitingCorrection
+        case stopped
+    }
+
+    private var states: [String: State] = [:]
+
+    func beginTurn() {
+        states.removeAll(keepingCapacity: true)
+    }
+
+    func recordFailure(for key: String) -> AppleCourseLessonValidationRetryDecision {
+        switch states[key] {
+        case nil:
+            states[key] = .awaitingCorrection
+            return .retry
+        case .awaitingCorrection:
+            states[key] = .stopped
+            return .stop
+        case .stopped:
+            return .stop
+        }
+    }
+
+    func acceptValid(for key: String) -> Bool {
+        guard states[key] != .stopped else { return false }
+        states[key] = nil
+        return true
+    }
+}
+
+@MainActor
+enum AppleCourseLessonValidationTurnPolicy {
+    static func beginTurn(
+        reusing gate: AppleCourseLessonValidationRetryGate?
+    ) -> AppleCourseLessonValidationRetryGate {
+        let gate = gate ?? AppleCourseLessonValidationRetryGate()
+        gate.beginTurn()
+        return gate
+    }
+}
+
+enum AppleCourseLessonContentPolicy {
+    static func exampleSchemaDescription(for kind: CourseLessonExampleKind) -> String {
+        switch kind {
+        case .topicDemonstration:
+            "A small topic-relevant demonstration, worked example, or concrete scenario in prose or ordinary notation."
+        case .runnableCode(let languageOrFramework):
+            if AppleCourseGeneratedLessonValidator.requiresSwiftValidation(kind) {
+                "A small standalone runnable \(languageOrFramework) example without Markdown fences. Declare every custom type and referenced value inside the snippet, and close every delimiter."
+            } else {
+                "A small runnable \(languageOrFramework) example without Markdown fences."
+            }
+        case .runnableCodeNamedByPlan:
+            "A small runnable example using the language or framework specified by the approved plan, without Markdown fences."
+        }
+    }
+
+    static func markdown(
+        content: AppleCourseGeneratedLessonContent,
+        exampleKind: CourseLessonExampleKind
+    ) -> String {
+        let exampleSection: String
+        switch exampleKind {
+        case .topicDemonstration:
+            exampleSection = """
+            ## Worked example
+
+            \(content.example)
+            """
+        case .runnableCode(let languageOrFramework):
+            let fence = CourseLessonExamplePolicy.codeFenceLanguage(
+                for: languageOrFramework
+            )
+            exampleSection = """
+            ## \(languageOrFramework) example
+
+            ```\(fence)
+            \(content.example)
+            ```
+            """
+        case .runnableCodeNamedByPlan:
+            exampleSection = """
+            ## Runnable example
+
+            ```
+            \(content.example)
+            ```
+            """
+        }
+        return """
+        ## Explanation
+
+        \(content.explanation)
+
+        \(exampleSection)
+
+        ## Exercise
+
+        \(content.exercise)
+        """
     }
 }
 
@@ -486,6 +1005,7 @@ enum AppleCourseGenerationSchemaOrdering {
         "operation",
         "plan_id",
         "revision",
+        "structure_version",
         "title",
         "summary",
         "outcome",
@@ -495,6 +1015,9 @@ enum AppleCourseGenerationSchemaOrdering {
         "id",
         "objective",
         "deliverables",
+        "role",
+        "children",
+        "learning_path",
         "chapters",
         "arguments_json",
         "plan",
@@ -515,6 +1038,1625 @@ enum AppleCourseGenerationSchemaOrdering {
             }
             return lhs < rhs
         }
+    }
+}
+
+enum AppleCoursePlanningProfile: String, Codable, CaseIterable, Equatable, Sendable {
+    case full
+    case focused
+
+    static let selectionOrder: [Self] = [.full, .focused]
+
+    var maximumChapters: Int {
+        switch self {
+        case .full: 8
+        case .focused: 4
+        }
+    }
+
+    var maximumLearningNodes: Int {
+        switch self {
+        case .full: CoursePlanHierarchyPolicy.maximumNodeCount
+        case .focused: 24
+        }
+    }
+
+    var maximumDeliverablesPerChapter: Int {
+        CoursePlanHierarchyPolicy.maximumDirectChildren
+    }
+
+    var responseTokenCap: Int {
+        switch self {
+        case .full: 2_048
+        case .focused: 1_280
+        }
+    }
+
+    func supports(_ requirements: AppleCoursePlanningRequirements) -> Bool {
+        guard
+            requirements.minimumChapters <= maximumChapters,
+            requirements.minimumLearningNodes <= maximumLearningNodes
+        else {
+            return false
+        }
+        if let exactChapterCount = requirements.exactChapterCount,
+           !(1...maximumChapters).contains(exactChapterCount) {
+            return false
+        }
+        if let exactTotalLearningNodes = requirements.exactTotalLearningNodes,
+           (exactTotalLearningNodes < requirements.requestedMinimumLearningNodes
+                || exactTotalLearningNodes > maximumLearningNodes) {
+            return false
+        }
+        if let explicitShape = requirements.explicitShape {
+            guard
+                explicitShape.chapterCount <= maximumChapters,
+                explicitShape.totalNodeCount <= maximumLearningNodes,
+                requirements.requestedMinimumLearningNodes <= explicitShape.totalNodeCount,
+                (requirements.exactChapterCount.map({
+                    $0 == explicitShape.chapterCount
+                }) ?? true),
+                (requirements.exactTotalLearningNodes.map({
+                    $0 == explicitShape.totalNodeCount
+                }) ?? true)
+            else {
+                return false
+            }
+        }
+        return true
+    }
+
+    func issue(in plan: AppleCourseGroupedPlan) -> String? {
+        if plan.chapters.count > maximumChapters {
+            return "the \(rawValue) planning profile supports at most \(maximumChapters) chapters"
+        }
+        if plan.topology.totalNodeCount > maximumLearningNodes {
+            return "the \(rawValue) planning profile supports at most \(maximumLearningNodes) learning nodes"
+        }
+        if plan.chapters.contains(where: {
+            $0.deliverables.count > maximumDeliverablesPerChapter
+        }) {
+            return "the \(rawValue) planning profile supports at most \(maximumDeliverablesPerChapter) deliverables per chapter"
+        }
+        return nil
+    }
+}
+
+struct AppleCoursePlanningExplicitShape: Codable, Equatable, Sendable {
+    let chapterCount: Int
+    let directLeafCountPerChapter: Int
+    let totalNodeCount: Int
+
+    var allowedLeafRoles: [CourseLearningNode.Role] {
+        [.lesson, .module, .explainer]
+    }
+}
+
+struct AppleCoursePlanningSchemaContract: Codable, Equatable, Sendable {
+    enum ChildVariant: String, Codable, Equatable, Sendable {
+        case leaf
+        case subchapter
+    }
+
+    static let wireVersion = "grouped-v1"
+    static let generationSchemaEncodingVersion = "fm-shared-object-v1"
+    static let cardinalitySemanticsVersion = "requested-cardinality-v1"
+
+    let profile: AppleCoursePlanningProfile
+    let minimumChapters: Int
+    let maximumChapters: Int
+    let exactChapterCount: Int?
+    let minimumChapterChildren: Int
+    let maximumChapterChildren: Int
+    let allowedChildVariants: [ChildVariant]
+    let minimumSubchapterChildren: Int
+    let maximumSubchapterChildren: Int
+    let maximumSubchapterLevels: Int
+    let minimumTotalNodes: Int
+    let maximumTotalNodes: Int
+    let exactTotalNodes: Int?
+    let allowedLeafRoles: [CourseLearningNode.Role]
+
+    init(
+        profile: AppleCoursePlanningProfile,
+        exactChapterCount requestedExactChapterCount: Int? = nil,
+        minimumTotalNodes requestedMinimumTotalNodes: Int = 2,
+        exactTotalNodes requestedExactTotalNodes: Int? = nil,
+        explicitShape: AppleCoursePlanningExplicitShape? = nil
+    ) {
+        self.profile = profile
+        if let explicitShape {
+            minimumChapters = explicitShape.chapterCount
+            maximumChapters = explicitShape.chapterCount
+            exactChapterCount = explicitShape.chapterCount
+            minimumChapterChildren = explicitShape.directLeafCountPerChapter
+            maximumChapterChildren = explicitShape.directLeafCountPerChapter
+            allowedChildVariants = [.leaf]
+            minimumTotalNodes = max(requestedMinimumTotalNodes, explicitShape.totalNodeCount)
+            exactTotalNodes = explicitShape.totalNodeCount
+            allowedLeafRoles = explicitShape.allowedLeafRoles
+        } else {
+            minimumChapters = requestedExactChapterCount ?? 1
+            maximumChapters = requestedExactChapterCount ?? profile.maximumChapters
+            exactChapterCount = requestedExactChapterCount
+            minimumChapterChildren = 1
+            maximumChapterChildren = CoursePlanHierarchyPolicy.maximumDirectChildren
+            allowedChildVariants = [.leaf, .subchapter]
+            minimumTotalNodes = max(2, requestedMinimumTotalNodes)
+            exactTotalNodes = requestedExactTotalNodes
+            allowedLeafRoles = [.lesson, .module, .explainer]
+        }
+        minimumSubchapterChildren = 1
+        maximumSubchapterChildren = CoursePlanHierarchyPolicy.maximumDirectChildren
+        maximumSubchapterLevels = 1
+        maximumTotalNodes = profile.maximumLearningNodes
+    }
+
+    var fingerprint: String {
+        [
+            Self.wireVersion,
+            Self.generationSchemaEncodingVersion,
+            Self.cardinalitySemanticsVersion,
+            profile.rawValue,
+            "chapters=\(minimumChapters)...\(maximumChapters)",
+            "chapters_exact=\(exactChapterCount.map(String.init) ?? "none")",
+            "chapter_children=\(minimumChapterChildren)...\(maximumChapterChildren)",
+            "variants=\(allowedChildVariants.map(\.rawValue).joined(separator: ","))",
+            "subchapter_children=\(minimumSubchapterChildren)...\(maximumSubchapterChildren)",
+            "subchapter_levels=\(maximumSubchapterLevels)",
+            "total_min=\(minimumTotalNodes)",
+            "total_max=\(maximumTotalNodes)",
+            "total_exact=\(exactTotalNodes.map(String.init) ?? "none")",
+            "leaf_roles=\(allowedLeafRoles.map(\.rawValue).joined(separator: ","))",
+        ].joined(separator: "|")
+    }
+}
+
+struct AppleCoursePlanningRequirements: Equatable, Sendable {
+    // These two floors select a profile large enough to read and reconcile protected state.
+    // They do not constrain the accepted output of a revision.
+    let minimumChapters: Int
+    let minimumLearningNodes: Int
+    // These fields describe only the learner's requested output cardinality.
+    let exactChapterCount: Int?
+    let requestedMinimumLearningNodes: Int
+    let exactTotalLearningNodes: Int?
+    let explicitShape: AppleCoursePlanningExplicitShape?
+
+    init(
+        minimumChapters: Int = 1,
+        minimumLearningNodes: Int = 2,
+        exactChapterCount: Int? = nil,
+        requestedMinimumLearningNodes: Int = 2,
+        exactTotalLearningNodes: Int? = nil,
+        explicitShape: AppleCoursePlanningExplicitShape? = nil
+    ) {
+        self.minimumChapters = max(1, minimumChapters)
+        self.minimumLearningNodes = max(2, minimumLearningNodes)
+        self.exactChapterCount = exactChapterCount
+        self.requestedMinimumLearningNodes = max(2, requestedMinimumLearningNodes)
+        self.exactTotalLearningNodes = exactTotalLearningNodes
+        self.explicitShape = explicitShape
+    }
+
+    func schemaContract(
+        for profile: AppleCoursePlanningProfile
+    ) -> AppleCoursePlanningSchemaContract {
+        AppleCoursePlanningSchemaContract(
+            profile: profile,
+            exactChapterCount: exactChapterCount,
+            minimumTotalNodes: requestedMinimumLearningNodes,
+            exactTotalNodes: exactTotalLearningNodes,
+            explicitShape: explicitShape
+        )
+    }
+}
+
+struct AppleCoursePlanningProfileMeasurement: Equatable, Sendable {
+    let profile: AppleCoursePlanningProfile
+    let contextSize: Int
+    let instructionTokens: Int
+    let toolTokens: Int
+    let promptTokens: Int
+
+    var staticInputTokens: Int {
+        instructionTokens + toolTokens + promptTokens
+    }
+
+    var postResponseHeadroomTokens: Int {
+        contextSize - staticInputTokens - profile.responseTokenCap
+    }
+
+    var fits: Bool {
+        AppleCoursePlanningSchemaPolicy.fitsPlanningTurn(
+            contextSize: contextSize,
+            instructionTokens: instructionTokens,
+            toolTokens: toolTokens,
+            promptTokens: promptTokens,
+            responseTokenCap: profile.responseTokenCap
+        )
+    }
+}
+
+enum AppleCoursePlanningProfileSelectionPolicy {
+    static func select(
+        requirements: AppleCoursePlanningRequirements,
+        measurements: [AppleCoursePlanningProfileMeasurement]
+    ) -> AppleCoursePlanningProfileMeasurement? {
+        let byProfile = Dictionary(uniqueKeysWithValues: measurements.map {
+            ($0.profile, $0)
+        })
+        return AppleCoursePlanningProfile.selectionOrder.lazy.compactMap { profile in
+            guard
+                profile.supports(requirements),
+                let measurement = byProfile[profile],
+                measurement.fits
+            else {
+                return nil
+            }
+            return measurement
+        }.first
+    }
+}
+
+enum AppleCoursePlanningProfilePersistencePolicy {
+    static func semanticProfile(
+        for persistedProfile: AppleCoursePlanningProfile?
+    ) -> AppleCoursePlanningProfile {
+        persistedProfile ?? .full
+    }
+
+    static func requiresTranscriptRebase(
+        persistedProfile: AppleCoursePlanningProfile?,
+        persistedShapeFingerprint: String? = nil,
+        selectedContract: AppleCoursePlanningSchemaContract
+    ) -> Bool {
+        persistedProfile == nil
+            || persistedProfile != selectedContract.profile
+            || persistedShapeFingerprint != selectedContract.fingerprint
+    }
+
+    static func requiresTranscriptRebase(
+        toolMode: AppleCourseToolMode,
+        persistedProfile: AppleCoursePlanningProfile?,
+        persistedShapeFingerprint: String? = nil,
+        selectedContract: AppleCoursePlanningSchemaContract
+    ) -> Bool {
+        guard toolMode.exposesPlanningTool else { return false }
+        return requiresTranscriptRebase(
+            persistedProfile: persistedProfile,
+            persistedShapeFingerprint: persistedShapeFingerprint,
+            selectedContract: selectedContract
+        )
+    }
+}
+
+struct AppleCoursePlanningSessionIdentity: Equatable, Sendable {
+    let profile: AppleCoursePlanningProfile
+    let shapeFingerprint: String
+
+    static func current(
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile,
+        planningContract: AppleCoursePlanningSchemaContract
+    ) -> Self? {
+        current(
+            toolMode: toolMode,
+            planningProfile: planningProfile,
+            planningShapeFingerprint: planningContract.fingerprint
+        )
+    }
+
+    static func current(
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile,
+        planningShapeFingerprint: String
+    ) -> Self? {
+        guard toolMode.exposesPlanningTool else { return nil }
+        return Self(
+            profile: planningProfile,
+            shapeFingerprint: planningShapeFingerprint
+        )
+    }
+}
+
+enum AppleCoursePlanningRequestPolicy {
+    private static let folderNouns = [
+        "subchapter", "subchapters", "sub chapter", "sub chapters", "sub-chapter",
+        "sub-chapters", "folder", "folders",
+    ]
+    private static let leafNouns = [
+        "lesson", "lessons", "module", "modules", "explainer", "explainers",
+    ]
+    private static let unitWordPattern =
+        "one|two|three|four|five|six|seven|eight|nine"
+    private static let smallNumberWordPattern =
+        unitWordPattern + "|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
+        + "seventeen|eighteen|nineteen"
+    private static let tensWordPattern = "twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety"
+    private static let groupedNumberWordPattern =
+        "(?:(?:" + unitWordPattern + ")[- ](?:dozen|hundred|thousand)|"
+        + "dozen|hundred|thousand)"
+    private static let numberWordPattern =
+        "(?:" + smallNumberWordPattern + "|(?:" + tensWordPattern + ")"
+        + "(?:[- ](?:" + unitWordPattern + "))?|" + groupedNumberWordPattern + ")"
+    private static let countPattern = "(?:0*[1-9][0-9]*|" + numberWordPattern + ")"
+
+    static func requirements(
+        currentPrompt: String,
+        previousLearnerPrompts: [String],
+        protectedPlan: CourseBrief?
+    ) -> AppleCoursePlanningRequirements {
+        let prompts = [currentPrompt] + previousLearnerPrompts.reversed()
+        let explicitChapters = prompts.lazy.compactMap {
+            explicitCount(in: $0, nouns: ["chapter", "chapters"])
+        }.first
+        let explicitTotalNodes = prompts.lazy.compactMap {
+            explicitCount(
+                in: $0,
+                nouns: ["node", "nodes", "page", "pages"]
+            )
+        }.first
+        let explicitFolderNodes = prompts.lazy.compactMap {
+            explicitCount(in: $0, nouns: folderNouns)
+        }.first
+        let explicitLeafNodes = prompts.lazy.compactMap {
+            explicitCount(in: $0, nouns: leafNouns)
+        }.first
+        let explicitFolderNodesPerChapter = prompts.lazy.compactMap {
+            explicitPerChapterCount(in: $0, nouns: folderNouns)
+        }.first
+        let explicitLeafNodesPerChapter = prompts.lazy.compactMap {
+            explicitPerChapterCount(in: $0, nouns: leafNouns)
+        }.first
+        let protectedChapters = protectedPlan?.chapters.count ?? 0
+        let protectedNodes = protectedPlan.map {
+            CoursePlanHierarchyPolicy.outlineEntries(for: $0).count
+        } ?? 0
+        let requestedChapters = explicitChapters ?? 0
+        let hasExplicitDescendants = explicitFolderNodes != nil || explicitLeafNodes != nil
+        let implicitChapterRoots = hasExplicitDescendants ? max(1, requestedChapters) : 0
+        let folderNodes = explicitFolderNodes ?? 0
+        let leafNodes = explicitLeafNodes ?? 0
+        let explicitDescendantShapeNodes = saturatedAdd(
+            folderNodes,
+            max(leafNodes, folderNodes)
+        )
+        let hasRepeatedDescendants = explicitFolderNodesPerChapter != nil
+            || explicitLeafNodesPerChapter != nil
+        let repeatedChapterCount = !hasRepeatedDescendants
+            ? 0
+            : max(1, explicitChapters ?? protectedChapters)
+        let folderNodesPerChapter = explicitFolderNodesPerChapter ?? 0
+        let leafNodesPerChapter = explicitLeafNodesPerChapter ?? 0
+        let descendantsPerChapter = saturatedAdd(
+            folderNodesPerChapter,
+            max(leafNodesPerChapter, folderNodesPerChapter)
+        )
+        let repeatedDescendants = saturatedMultiply(
+            repeatedChapterCount,
+            descendantsPerChapter
+        )
+        let repeatedShapeNodes = saturatedAdd(repeatedChapterCount, repeatedDescendants)
+        let explicitShape: AppleCoursePlanningExplicitShape? = {
+            guard
+                let chapterCount = explicitChapters,
+                let directLeafCount = explicitLeafNodesPerChapter,
+                explicitFolderNodes == nil,
+                explicitFolderNodesPerChapter == nil,
+                (1...8).contains(chapterCount),
+                (1...CoursePlanHierarchyPolicy.maximumDirectChildren).contains(
+                    directLeafCount
+                )
+            else {
+                return nil
+            }
+            let totalNodeCount = saturatedMultiply(
+                chapterCount,
+                saturatedAdd(1, directLeafCount)
+            )
+            guard
+                totalNodeCount <= CoursePlanHierarchyPolicy.maximumNodeCount,
+                explicitTotalNodes.map({ $0 == totalNodeCount }) ?? true
+            else {
+                return nil
+            }
+            return AppleCoursePlanningExplicitShape(
+                chapterCount: chapterCount,
+                directLeafCountPerChapter: directLeafCount,
+                totalNodeCount: totalNodeCount
+            )
+        }()
+        // Planning capacity counts chapter roots as well as their descendants. A request for four
+        // chapters and 24 lessons therefore needs capacity for 28 pages, not merely 24. Even when
+        // the learner only specifies chapters, every valid chapter folder needs at least one
+        // child. Multiplicative wording such as "eight chapters, each with six lessons" requires
+        // all eight roots plus all 48 descendants. A descendants-only request still needs at least
+        // one implicit chapter root.
+        let minimumNodesForRequestedShape = max(
+            explicitTotalNodes ?? 0,
+            saturatedAdd(implicitChapterRoots, explicitDescendantShapeNodes),
+            repeatedShapeNodes,
+            saturatedMultiply(requestedChapters, 2)
+        )
+        return AppleCoursePlanningRequirements(
+            minimumChapters: max(explicitChapters ?? 0, protectedChapters),
+            minimumLearningNodes: max(minimumNodesForRequestedShape, protectedNodes),
+            exactChapterCount: explicitChapters,
+            requestedMinimumLearningNodes: minimumNodesForRequestedShape,
+            exactTotalLearningNodes: explicitTotalNodes,
+            explicitShape: explicitShape
+        )
+    }
+
+    private static func explicitCount(in text: String, nouns: [String]) -> Int? {
+        let nounPattern = nouns.map(NSRegularExpression.escapedPattern).joined(separator: "|")
+        return firstCount(
+            in: text,
+            patterns: [
+                "\\b(" + countPattern + ")\\s*[- ]\\s*(?:total\\s+)?(?:"
+                    + nounPattern + ")\\b",
+            ]
+        )
+    }
+
+    private static func explicitPerChapterCount(in text: String, nouns: [String]) -> Int? {
+        let nounPattern = nouns.map(NSRegularExpression.escapedPattern).joined(separator: "|")
+        let count = "(" + countPattern + ")"
+        let countedNoun = count + "\\s*[- ]\\s*(?:" + nounPattern + ")\\b"
+        return firstCount(
+            in: text,
+            patterns: [
+                "\\bchapters?\\b[^.!?\\n]{0,80}?\\beach\\b"
+                    + "(?:\\s+(?:with|containing|having|including))?\\s+" + countedNoun,
+                "\\bchapters?\\b[^.!?\\n]{0,80}?\\b"
+                    + "(?:with|containing|having|including)\\s+" + countedNoun
+                    + "[^.!?\\n]{0,20}?\\beach\\b",
+                "\\b" + countedNoun
+                    + "\\s+(?:per\\s+chapter|for\\s+each\\s+chapter|in\\s+each\\s+chapter)\\b",
+                "\\beach\\s+chapter\\b[^.!?\\n]{0,40}?\\b"
+                    + "(?:has|with|contains|containing|includes|including)\\s+" + countedNoun,
+            ]
+        )
+    }
+
+    private static func firstCount(in text: String, patterns: [String]) -> Int? {
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(
+                pattern: pattern,
+                options: [.caseInsensitive]
+            ) else {
+                continue
+            }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            guard
+                let match = expression.firstMatch(in: text, range: range),
+                match.numberOfRanges > 1,
+                let captureRange = Range(match.range(at: 1), in: text)
+            else {
+                continue
+            }
+            return parsedCount(String(text[captureRange]))
+        }
+        return nil
+    }
+
+    private static func parsedCount(_ rawValue: String) -> Int? {
+        let normalized = rawValue
+            .lowercased()
+            .replacingOccurrences(of: "-", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+        guard !normalized.isEmpty else { return nil }
+        if normalized.count == 1,
+           normalized[0].allSatisfy(\.isNumber) {
+            // A positive integer too large for `Int` is necessarily beyond every bounded profile.
+            return Int(normalized[0]) ?? Int.max
+        }
+        let smallValues = [
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+            "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+            "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+            "nineteen": 19,
+        ]
+        if normalized.count == 1 {
+            return smallValues[normalized[0]] ?? [
+                "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+                "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+                "dozen": 12, "hundred": 100, "thousand": 1_000,
+            ][normalized[0]]
+        }
+        if normalized.count == 2,
+           let units = smallValues[normalized[0]],
+           units < 10,
+           let multiplier = ["dozen": 12, "hundred": 100, "thousand": 1_000][normalized[1]] {
+            return saturatedMultiply(units, multiplier)
+        }
+        let tensValues = [
+            "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+            "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+        ]
+        guard
+            normalized.count == 2,
+            let tens = tensValues[normalized[0]],
+            let units = smallValues[normalized[1]],
+            units < 10
+        else {
+            return nil
+        }
+        return tens + units
+    }
+
+    private static func saturatedAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (result, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : result
+    }
+
+    private static func saturatedMultiply(_ lhs: Int, _ rhs: Int) -> Int {
+        let (result, overflow) = lhs.multipliedReportingOverflow(by: rhs)
+        return overflow ? Int.max : result
+    }
+}
+
+enum AppleCoursePlanningSchemaPolicy {
+    static let maximumToolTokens = 1_400
+    static let maximumResponseTokens = AppleCoursePlanningProfile.full.responseTokenCap
+    static let minimumPostToolAcknowledgementTokens = 256
+    static let minimumPostResponseHeadroomTokens = 512
+
+    static func compact(_ schema: [String: Any]) -> [String: Any] {
+        compactValue(schema) as? [String: Any] ?? schema
+    }
+
+    static func planningInputSchema(
+        from source: [String: Any],
+        profile: AppleCoursePlanningProfile = .full,
+        contract suppliedContract: AppleCoursePlanningSchemaContract? = nil
+    ) throws -> [String: Any] {
+        guard
+            var properties = source["properties"] as? [String: Any],
+            var chapters = properties["chapters"] as? [String: Any]
+        else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        let contract = suppliedContract
+            ?? AppleCoursePlanningSchemaContract(profile: profile)
+        guard contract.profile == profile else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        if let exactChapterCount = contract.exactChapterCount,
+           exactChapterCount > profile.maximumChapters {
+            throw AppleCourseAgentError.toolFailed(
+                "This request asks for exactly \(exactChapterCount) chapters, but Learnfold’s "
+                    + "Apple course planner supports at most \(profile.maximumChapters). Request "
+                    + "\(profile.maximumChapters) or fewer chapters."
+            )
+        }
+        if let exactTotalNodes = contract.exactTotalNodes,
+           exactTotalNodes > contract.maximumTotalNodes {
+            throw AppleCourseAgentError.toolFailed(
+                "This request asks for exactly \(exactTotalNodes) total pages, but Learnfold’s "
+                    + "Apple course planner supports at most \(contract.maximumTotalNodes). "
+                    + "Request \(contract.maximumTotalNodes) or fewer total pages."
+            )
+        }
+        if contract.minimumTotalNodes > contract.maximumTotalNodes {
+            throw AppleCourseAgentError.toolFailed(
+                "This request needs at least \(contract.minimumTotalNodes) total pages, but "
+                    + "Learnfold’s Apple course planner supports at most "
+                    + "\(contract.maximumTotalNodes). Request \(contract.maximumTotalNodes) or "
+                    + "fewer total pages."
+            )
+        }
+        let exactChapterCountIsConsistent = contract.exactChapterCount.map {
+            $0 == contract.minimumChapters && $0 == contract.maximumChapters
+        } ?? true
+        let exactTotalNodesIsConsistent = contract.exactTotalNodes.map {
+            $0 >= contract.minimumTotalNodes && $0 <= contract.maximumTotalNodes
+        } ?? true
+        guard
+            contract.minimumChapters <= contract.maximumChapters,
+            contract.maximumChapters <= profile.maximumChapters,
+            exactChapterCountIsConsistent,
+            exactTotalNodesIsConsistent
+        else {
+            throw CocoaError(.coderInvalidValue)
+        }
+
+        func stableIDSchema() -> [String: Any] {
+            [
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$",
+            ]
+        }
+        func titleSchema() -> [String: Any] {
+            [
+                "type": "string",
+                "minLength": 1,
+                "maxLength": CoursePlanHierarchyPolicy.maximumNodeTitleLength,
+            ]
+        }
+        func leafSchema() -> [String: Any] {
+            [
+                "type": "object",
+                "additionalProperties": false,
+                "properties": [
+                    "id": stableIDSchema(),
+                    "title": titleSchema(),
+                    "role": [
+                        "type": "string",
+                        "enum": contract.allowedLeafRoles.map(\.rawValue),
+                    ],
+                ],
+                "required": ["id", "title", "role"],
+            ]
+        }
+        func subchapterSchema() -> [String: Any] {
+            [
+                "type": "object",
+                "additionalProperties": false,
+                "properties": [
+                    "id": stableIDSchema(),
+                    "title": titleSchema(),
+                    "children": [
+                        "type": "array",
+                        "minItems": contract.minimumSubchapterChildren,
+                        "maxItems": contract.maximumSubchapterChildren,
+                        "items": leafSchema(),
+                    ],
+                ],
+                "required": ["id", "title", "children"],
+            ]
+        }
+        let chapterChildSchema: [String: Any]
+        if contract.allowedChildVariants == [.leaf] {
+            chapterChildSchema = leafSchema()
+        } else {
+            chapterChildSchema = [
+                "anyOf": [leafSchema(), subchapterSchema()],
+            ]
+        }
+
+        chapters["minItems"] = contract.minimumChapters
+        chapters["maxItems"] = contract.maximumChapters
+        guard
+            var chapter = chapters["items"] as? [String: Any],
+            var chapterProperties = chapter["properties"] as? [String: Any],
+            var deliverables = chapterProperties["deliverables"] as? [String: Any]
+        else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        deliverables["minItems"] = 1
+        deliverables["maxItems"] = profile.maximumDeliverablesPerChapter
+        chapterProperties["deliverables"] = deliverables
+        chapterProperties["children"] = [
+            "type": "array",
+            "minItems": contract.minimumChapterChildren,
+            "maxItems": contract.maximumChapterChildren,
+            "items": chapterChildSchema,
+        ]
+        var chapterRequired = chapter["required"] as? [String] ?? []
+        if !chapterRequired.contains("children") {
+            chapterRequired.append("children")
+        }
+        chapter["properties"] = chapterProperties
+        chapter["required"] = chapterRequired
+        chapters["items"] = chapter
+
+        properties["chapters"] = chapters
+        properties.removeValue(forKey: "learning_path")
+        properties.removeValue(forKey: "learning_nodes")
+
+        var required = source["required"] as? [String] ?? []
+        required.removeAll(where: { $0 == "learning_path" })
+        required.removeAll(where: { $0 == "learning_nodes" })
+        var root = source
+        root["properties"] = properties
+        root["required"] = required
+        return compact(root)
+    }
+
+    static func fitsOnDeviceContext(
+        contextSize: Int,
+        instructionTokens: Int,
+        toolTokens: Int,
+        promptTokens: Int,
+        reservedTokens: Int
+    ) -> Bool {
+        let usedTokens = instructionTokens + toolTokens + promptTokens
+        return usedTokens < contextSize - reservedTokens
+    }
+
+    static func fitsPlanningTurn(
+        contextSize: Int,
+        instructionTokens: Int,
+        toolTokens: Int,
+        promptTokens: Int,
+        responseTokenCap: Int = maximumResponseTokens
+    ) -> Bool {
+        let staticInputTokens = instructionTokens + toolTokens + promptTokens
+        return toolTokens <= maximumToolTokens
+            && responseTokenCap <= maximumResponseTokens
+            && contextSize - staticInputTokens - responseTokenCap
+                >= minimumPostResponseHeadroomTokens
+    }
+
+    static func responseTokenCap(
+        providerID: String,
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile = .full
+    ) -> Int? {
+        providerID == CourseAgentProvider.appleOnDevice && toolMode == .planning
+            ? planningProfile.responseTokenCap
+            : nil
+    }
+
+    private static func compactValue(_ value: Any) -> Any {
+        if var dictionary = value as? [String: Any] {
+            dictionary.removeValue(forKey: "description")
+            for (key, child) in dictionary {
+                dictionary[key] = compactValue(child)
+            }
+            return dictionary
+        }
+        if let array = value as? [Any] {
+            return array.map(compactValue)
+        }
+        return value
+    }
+}
+
+enum AppleCoursePlanningPromptPolicy {
+    private static let fullInstructions = """
+    You are Learnfold’s concise course planner. Assess the learner’s starting point before \
+    proposing a course. Use the exact requested chapter count; otherwise use 3 to 8 focused \
+    chapters. When ready, call present_course_plan once with every typed field. For a new plan, use \
+    revision 1. For a revision, reuse plan_id and unchanged node IDs, then increase revision. \
+    Each chapter must contain 1 to 6 ordered children. A child is either a lesson/module/explainer \
+    leaf, or one subchapter with 1 to 6 leaf children. Do not nest subchapters deeper or put \
+    children under leaves. The grouped chapter tree must describe every planned native page. Never \
+    print or summarize plan fields in chat, write course content, or call a lesson-writing tool \
+    before approval.
+    """
+
+    static var instructions: String {
+        fullInstructions
+    }
+
+    static func instructions(
+        for profile: AppleCoursePlanningProfile,
+        contract suppliedContract: AppleCoursePlanningSchemaContract? = nil,
+        compactedSummary: String? = nil,
+        protectedOutline: String? = nil
+    ) -> String {
+        let contract = suppliedContract
+            ?? AppleCoursePlanningSchemaContract(profile: profile)
+        let baseInstructions = switch profile {
+        case .full:
+            fullInstructions
+        case .focused:
+            """
+            You are Learnfold’s concise course planner. Assess the learner’s starting point before \
+            proposing a course. This focused turn supports 1 to 4 chapters and at most 24 total \
+            native pages. Use the exact requested chapter count only when it fits those limits. \
+            When ready, call present_course_plan once with every typed field. For a new plan, use \
+            revision 1. For a revision, reuse plan_id and unchanged node IDs, then increase \
+            revision. Each chapter must contain 1 to 6 ordered children. A child is either a \
+            lesson/module/explainer leaf, or one subchapter with 1 to 6 leaf children. Do not nest \
+            subchapters deeper or put children under leaves. Never print or summarize plan fields \
+            in chat, write course content, or call a lesson-writing tool before approval.
+            """
+        }
+        var sections = [baseInstructions]
+        if let exactTotalNodes = contract.exactTotalNodes {
+            sections.append(
+                """
+                The tool contract fixes this turn at \(exactTotalNodes) native pages. Honor it \
+                exactly; do not add, drop, or reparent nodes.
+                """
+            )
+        } else if contract.minimumTotalNodes > 2 {
+            sections.append(
+                """
+                The learner’s requested descendants require at least \
+                \(contract.minimumTotalNodes) native pages. Do not return an underfilled plan.
+                """
+            )
+        }
+        if let compactedSummary, !compactedSummary.isEmpty {
+            sections.append(
+                """
+                Durable summary of the earlier conversation and course state:
+                \(compactedSummary)
+
+                Treat the summary as prior context. Do not mention compaction unless asked.
+                """
+            )
+        }
+        if let protectedOutline, !protectedOutline.isEmpty {
+            sections.append(
+                """
+                Authoritative protected plan outline. Preserve every unchanged ID, role, parent, \
+                order, and title when revising:
+                \(protectedOutline)
+                """
+            )
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
+    static func runtimePrompt(
+        for learnerPrompt: String,
+        profile: AppleCoursePlanningProfile = .full,
+        contract suppliedContract: AppleCoursePlanningSchemaContract? = nil
+    ) -> String {
+        _ = suppliedContract ?? AppleCoursePlanningSchemaContract(profile: profile)
+        return """
+        \(learnerPrompt)
+
+        If ready, call present_course_plan. Otherwise answer normally.
+        """
+    }
+}
+
+enum AppleCourseDurableStatePolicy {
+    static func renderProtectedPlan(
+        filename: String,
+        plan: CourseBrief
+    ) -> String {
+        func quoted(_ value: String) -> String {
+            guard
+                let data = try? JSONEncoder().encode(value),
+                let encoded = String(data: data, encoding: .utf8)
+            else {
+                return "\"\(value.replacingOccurrences(of: "\"", with: "\\\""))\""
+            }
+            return encoded
+        }
+
+        var outline: [String] = []
+        func append(
+            _ nodes: [CourseLearningNode],
+            parentID: String?
+        ) {
+            for (index, node) in nodes.enumerated() {
+                let role = node.role
+                    ?? (parentID == nil ? .chapter : node.children.isEmpty ? .lesson : .subchapter)
+                outline.append(
+                    "- id=\(quoted(node.id)) role=\(role.rawValue) "
+                        + "parent_id=\(parentID.map(quoted) ?? "null") order=\(index + 1) "
+                        + "title=\(quoted(node.title))"
+                )
+                append(node.children, parentID: node.id)
+            }
+        }
+        append(plan.plannedLearningPath, parentID: nil)
+        return """
+        \(filename): plan_id=\(quoted(plan.planID)) revision=\(plan.revision) \
+        title=\(quoted(plan.title)) chapters=\(plan.chapters.count)
+        protected_outline:
+        \(outline.joined(separator: "\n"))
+        """
+    }
+}
+
+enum AppleCoursePlanningAttemptPolicy {
+    static let unpresentedAttemptMessage = """
+    Apple’s model attempted a course plan, but Learnfold could not validate and present it. No \
+    course was created. Start a new request to try again; if this keeps happening on-device, use \
+    Apple Private Cloud Compute.
+    """
+
+    static func rejectedPlanMessage(_ reason: String) -> String {
+        _ = reason
+        return unpresentedAttemptMessage
+    }
+
+    static let repeatedAttemptMessage = """
+    A plan was already attempted in this turn. Do not call present_course_plan again. Reply \
+    briefly that the learner must retry in a new turn or use Apple Private Cloud Compute.
+    """
+
+    static func requirePresentedPlanAfterAttempt(
+        didAttemptCoursePlan: Bool,
+        didPresentCoursePlan: Bool
+    ) throws {
+        guard !didAttemptCoursePlan || didPresentCoursePlan else {
+            throw AppleCourseAgentError.toolFailed(unpresentedAttemptMessage)
+        }
+    }
+}
+
+enum AppleCoursePlanningRejectionStage: String, Codable, Equatable, Sendable {
+    case repeatedAttempt = "repeated_attempt"
+    case decode
+    case profile
+    case projection
+    case transition
+}
+
+struct AppleCoursePlanningRejection: Equatable, Sendable {
+    let stage: AppleCoursePlanningRejectionStage
+    let diagnosticReason: String
+
+    var userMessage: String {
+        AppleCoursePlanningAttemptPolicy.unpresentedAttemptMessage
+    }
+}
+
+@available(iOS 26.0, *)
+actor AppleCoursePlanningAttemptGate {
+    private var didAttempt = false
+    private var rejection: AppleCoursePlanningRejection?
+
+    func beginTurn() {
+        didAttempt = false
+        rejection = nil
+    }
+
+    func claimAttempt() -> Bool {
+        guard !didAttempt else { return false }
+        didAttempt = true
+        return true
+    }
+
+    func hasAttempted() -> Bool {
+        didAttempt
+    }
+
+    @discardableResult
+    func recordRejection(
+        stage: AppleCoursePlanningRejectionStage,
+        diagnosticReason: String
+    ) -> AppleCoursePlanningRejection {
+        if let rejection {
+            return rejection
+        }
+        let recorded = AppleCoursePlanningRejection(
+            stage: stage,
+            diagnosticReason: diagnosticReason
+        )
+        rejection = recorded
+        return recorded
+    }
+
+    func recordedRejection() -> AppleCoursePlanningRejection? {
+        rejection
+    }
+}
+
+private struct AppleCourseGroupedAnyCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int?
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+        intValue = nil
+    }
+
+    init?(intValue: Int) {
+        stringValue = String(intValue)
+        self.intValue = intValue
+    }
+}
+
+private enum AppleCourseGroupedDecodingPolicy {
+    static func rejectUnknownKeys(
+        in decoder: Decoder,
+        allowed: Set<String>
+    ) throws {
+        let container = try decoder.container(keyedBy: AppleCourseGroupedAnyCodingKey.self)
+        let unknown = Set(container.allKeys.map(\.stringValue)).subtracting(allowed)
+        guard unknown.isEmpty else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "grouped plan contains unsupported fields"
+                )
+            )
+        }
+    }
+}
+
+struct AppleCourseGroupedLeaf: Codable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let role: CourseLearningNode.Role
+
+    init(id: String, title: String, role: CourseLearningNode.Role) {
+        self.id = id
+        self.title = title
+        self.role = role
+    }
+
+    init(from decoder: Decoder) throws {
+        try AppleCourseGroupedDecodingPolicy.rejectUnknownKeys(
+            in: decoder,
+            allowed: ["id", "title", "role"]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        role = try container.decode(CourseLearningNode.Role.self, forKey: .role)
+        guard !role.isFolder else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .role,
+                in: container,
+                debugDescription: "grouped leaf role must be lesson, module, or explainer"
+            )
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case role
+    }
+}
+
+struct AppleCourseGroupedChapterChild: Codable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let role: CourseLearningNode.Role?
+    let children: [AppleCourseGroupedLeaf]?
+
+    init(
+        id: String,
+        title: String,
+        role: CourseLearningNode.Role?,
+        children: [AppleCourseGroupedLeaf]?
+    ) {
+        self.id = id
+        self.title = title
+        self.role = role
+        self.children = children
+    }
+
+    init(from decoder: Decoder) throws {
+        try AppleCourseGroupedDecodingPolicy.rejectUnknownKeys(
+            in: decoder,
+            allowed: ["id", "title", "role", "children"]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        role = try container.decodeIfPresent(CourseLearningNode.Role.self, forKey: .role)
+        children = try container.decodeIfPresent(
+            [AppleCourseGroupedLeaf].self,
+            forKey: .children
+        )
+        guard (role == nil) != (children == nil) else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "grouped child must be exactly one leaf or subchapter"
+                )
+            )
+        }
+        if let role, role.isFolder {
+            throw DecodingError.dataCorruptedError(
+                forKey: .role,
+                in: container,
+                debugDescription: "grouped chapter leaf cannot use a folder role"
+            )
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case role
+        case children
+    }
+
+    static func leaf(
+        id: String,
+        title: String,
+        role: CourseLearningNode.Role = .lesson
+    ) -> Self {
+        Self(id: id, title: title, role: role, children: nil)
+    }
+
+    static func subchapter(
+        id: String,
+        title: String,
+        children: [AppleCourseGroupedLeaf]
+    ) -> Self {
+        Self(id: id, title: title, role: nil, children: children)
+    }
+}
+
+struct AppleCourseGroupedChapter: Codable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let objective: String
+    let deliverables: [String]
+    let children: [AppleCourseGroupedChapterChild]
+
+    init(
+        id: String,
+        title: String,
+        objective: String,
+        deliverables: [String],
+        children: [AppleCourseGroupedChapterChild]
+    ) {
+        self.id = id
+        self.title = title
+        self.objective = objective
+        self.deliverables = deliverables
+        self.children = children
+    }
+
+    init(from decoder: Decoder) throws {
+        try AppleCourseGroupedDecodingPolicy.rejectUnknownKeys(
+            in: decoder,
+            allowed: ["id", "title", "objective", "deliverables", "children"]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        objective = try container.decode(String.self, forKey: .objective)
+        deliverables = try container.decode([String].self, forKey: .deliverables)
+        children = try container.decode(
+            [AppleCourseGroupedChapterChild].self,
+            forKey: .children
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case objective
+        case deliverables
+        case children
+    }
+}
+
+struct AppleCourseGroupedTopology: Equatable, Sendable {
+    let rootCount: Int
+    let totalNodeCount: Int
+    let roleCounts: [String: Int]
+    let invalidRoleCount: Int
+    let childCountHistogram: [Int: Int]
+    let maximumDirectChildCount: Int
+
+    var redactedLogFields: [String: Any] {
+        let roleSummary = ["chapter", "subchapter", "lesson", "module", "explainer"].map {
+            "\($0):\(roleCounts[$0, default: 0])"
+        }.joined(separator: ",")
+        let childSummary = childCountHistogram.keys.sorted().map {
+            "\($0):\(childCountHistogram[$0, default: 0])"
+        }.joined(separator: ",")
+        return [
+            "topology_root_count": rootCount,
+            "topology_total_node_count": totalNodeCount,
+            "topology_role_counts": roleSummary,
+            "topology_invalid_role_count": invalidRoleCount,
+            "topology_child_count_histogram": childSummary,
+            "topology_maximum_direct_child_count": maximumDirectChildCount,
+        ]
+    }
+}
+
+struct AppleCourseGroupedPlan: Codable, Equatable, Sendable {
+    let planID: String
+    let revision: Int
+    let structureVersion: Int
+    let title: String
+    let summary: String
+    let outcome: String
+    let startingPoint: String
+    let focusGap: String
+    let estimatedDuration: String
+    let chapters: [AppleCourseGroupedChapter]
+
+    init(
+        planID: String,
+        revision: Int,
+        structureVersion: Int,
+        title: String,
+        summary: String,
+        outcome: String,
+        startingPoint: String,
+        focusGap: String,
+        estimatedDuration: String,
+        chapters: [AppleCourseGroupedChapter]
+    ) {
+        self.planID = planID
+        self.revision = revision
+        self.structureVersion = structureVersion
+        self.title = title
+        self.summary = summary
+        self.outcome = outcome
+        self.startingPoint = startingPoint
+        self.focusGap = focusGap
+        self.estimatedDuration = estimatedDuration
+        self.chapters = chapters
+    }
+
+    init(from decoder: Decoder) throws {
+        try AppleCourseGroupedDecodingPolicy.rejectUnknownKeys(
+            in: decoder,
+            allowed: [
+                "plan_id", "revision", "structure_version", "title", "summary", "outcome",
+                "starting_point", "focus_gap", "estimated_duration", "chapters",
+            ]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        planID = try container.decode(String.self, forKey: .planID)
+        revision = try container.decode(Int.self, forKey: .revision)
+        structureVersion = try container.decode(Int.self, forKey: .structureVersion)
+        title = try container.decode(String.self, forKey: .title)
+        summary = try container.decode(String.self, forKey: .summary)
+        outcome = try container.decode(String.self, forKey: .outcome)
+        startingPoint = try container.decode(String.self, forKey: .startingPoint)
+        focusGap = try container.decode(String.self, forKey: .focusGap)
+        estimatedDuration = try container.decode(String.self, forKey: .estimatedDuration)
+        chapters = try container.decode([AppleCourseGroupedChapter].self, forKey: .chapters)
+    }
+
+    var topology: AppleCourseGroupedTopology {
+        var roleCounts: [String: Int] = [CourseLearningNode.Role.chapter.rawValue: chapters.count]
+        var invalidRoleCount = 0
+        var childCounts: [Int] = []
+        var totalNodeCount = chapters.count
+        for chapter in chapters {
+            childCounts.append(chapter.children.count)
+            totalNodeCount += chapter.children.count
+            for child in chapter.children {
+                switch (child.role, child.children) {
+                case (.some(let role), nil):
+                    roleCounts[role.rawValue, default: 0] += 1
+                case (nil, .some(let leaves)):
+                    roleCounts[CourseLearningNode.Role.subchapter.rawValue, default: 0] += 1
+                    childCounts.append(leaves.count)
+                    totalNodeCount += leaves.count
+                    for leaf in leaves {
+                        roleCounts[leaf.role.rawValue, default: 0] += 1
+                    }
+                default:
+                    invalidRoleCount += 1
+                }
+            }
+        }
+        let histogram = Dictionary(grouping: childCounts, by: { $0 })
+            .mapValues(\.count)
+        return AppleCourseGroupedTopology(
+            rootCount: chapters.count,
+            totalNodeCount: totalNodeCount,
+            roleCounts: roleCounts,
+            invalidRoleCount: invalidRoleCount,
+            childCountHistogram: histogram,
+            maximumDirectChildCount: childCounts.max() ?? 0
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case planID = "plan_id"
+        case revision
+        case structureVersion = "structure_version"
+        case title
+        case summary
+        case outcome
+        case startingPoint = "starting_point"
+        case focusGap = "focus_gap"
+        case estimatedDuration = "estimated_duration"
+        case chapters
+    }
+}
+
+enum AppleCourseGroupedPlanProjectionError: LocalizedError, Equatable {
+    case invalid(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalid(let message): message
+        }
+    }
+}
+
+enum AppleCourseGroupedPlanProjection {
+    static func project(
+        _ grouped: AppleCourseGroupedPlan,
+        contract: AppleCoursePlanningSchemaContract = AppleCoursePlanningSchemaContract(
+            profile: .full
+        )
+    ) throws -> CourseBrief {
+        let topology = grouped.topology
+        if let exactChapterCount = contract.exactChapterCount,
+           grouped.chapters.count != exactChapterCount {
+            throw invalid(
+                "the requested turn requires exactly \(exactChapterCount) chapter roots"
+            )
+        }
+        guard
+            grouped.chapters.count >= contract.minimumChapters,
+            grouped.chapters.count <= contract.maximumChapters
+        else {
+            throw invalid(
+                "chapters must contain \(contract.minimumChapters) to \(contract.maximumChapters) roots"
+            )
+        }
+        if let issue = contract.profile.issue(in: grouped) {
+            throw invalid(issue)
+        }
+        guard topology.totalNodeCount <= contract.maximumTotalNodes else {
+            throw invalid(
+                "the grouped plan may contain at most \(contract.maximumTotalNodes) total nodes"
+            )
+        }
+        if let exactTotalNodes = contract.exactTotalNodes,
+           topology.totalNodeCount != exactTotalNodes {
+            throw invalid("the requested turn requires exactly \(exactTotalNodes) total nodes")
+        }
+
+        var seenIDs: Set<String> = []
+        func claimID(_ id: String) throws {
+            guard seenIDs.insert(id).inserted else {
+                throw invalid("the grouped plan contains a duplicate stable node ID")
+            }
+        }
+        func projectLeaf(_ leaf: AppleCourseGroupedLeaf) throws -> CourseLearningNode {
+            try claimID(leaf.id)
+            guard
+                !leaf.role.isFolder,
+                contract.allowedLeafRoles.contains(leaf.role)
+            else {
+                throw invalid("leaf nodes must use lesson, module, or explainer role")
+            }
+            return CourseLearningNode(
+                id: leaf.id,
+                title: leaf.title,
+                kind: .markdown,
+                status: .pendingGeneration,
+                role: leaf.role
+            )
+        }
+        func projectChild(
+            _ child: AppleCourseGroupedChapterChild
+        ) throws -> CourseLearningNode {
+            switch (child.role, child.children) {
+            case (.some(let role), nil):
+                guard contract.allowedChildVariants.contains(.leaf), !role.isFolder else {
+                    throw invalid("chapter leaves must use lesson, module, or explainer role")
+                }
+                try claimID(child.id)
+                return CourseLearningNode(
+                    id: child.id,
+                    title: child.title,
+                    kind: .markdown,
+                    status: .pendingGeneration,
+                    role: role
+                )
+            case (nil, .some(let leaves)):
+                guard contract.allowedChildVariants.contains(.subchapter) else {
+                    throw invalid("the explicit turn shape does not allow subchapters")
+                }
+                guard
+                    leaves.count >= contract.minimumSubchapterChildren,
+                    leaves.count <= contract.maximumSubchapterChildren
+                else {
+                    throw invalid(
+                        "every subchapter needs \(contract.minimumSubchapterChildren) to \(contract.maximumSubchapterChildren) leaf children"
+                    )
+                }
+                try claimID(child.id)
+                return CourseLearningNode(
+                    id: child.id,
+                    title: child.title,
+                    kind: .folder,
+                    status: .pendingGeneration,
+                    role: .subchapter,
+                    children: try leaves.map(projectLeaf)
+                )
+            default:
+                throw invalid(
+                    "every chapter child must be exactly one leaf or one subchapter"
+                )
+            }
+        }
+
+        var chapters: [CourseChapter] = []
+        var learningPath: [CourseLearningNode] = []
+        for chapter in grouped.chapters {
+            guard
+                chapter.children.count >= contract.minimumChapterChildren,
+                chapter.children.count <= contract.maximumChapterChildren
+            else {
+                throw invalid(
+                    "every chapter needs \(contract.minimumChapterChildren) to \(contract.maximumChapterChildren) direct children"
+                )
+            }
+            try claimID(chapter.id)
+            chapters.append(CourseChapter(
+                id: chapter.id,
+                title: chapter.title,
+                objective: chapter.objective,
+                deliverables: chapter.deliverables
+            ))
+            learningPath.append(CourseLearningNode(
+                id: chapter.id,
+                title: chapter.title,
+                kind: .folder,
+                status: .pendingGeneration,
+                role: .chapter,
+                children: try chapter.children.map(projectChild)
+            ))
+        }
+
+        // Diagnose malformed hierarchy before a generic aggregate minimum underfill. Exact
+        // learner-requested totals remain dominant above, while this preserves the most
+        // actionable structural rejection for unconstrained plans. Every mismatch is still
+        // fenced before the brief can cross the presentation callback.
+        guard topology.totalNodeCount >= contract.minimumTotalNodes else {
+            throw invalid(
+                "the requested turn requires at least \(contract.minimumTotalNodes) total nodes"
+            )
+        }
+
+        let brief = CourseBrief(
+            planID: grouped.planID,
+            revision: grouped.revision,
+            title: grouped.title,
+            summary: grouped.summary,
+            outcome: grouped.outcome,
+            startingPoint: grouped.startingPoint,
+            focusGap: grouped.focusGap,
+            estimatedDuration: grouped.estimatedDuration,
+            structureVersion: grouped.structureVersion,
+            learningPath: learningPath,
+            chapters: chapters
+        )
+        if let issue = AppleCoursePlanValidator.issue(
+            in: brief,
+            requiresTypedHierarchy: true
+        ) {
+            throw invalid(issue)
+        }
+        return brief
+    }
+
+    private static func invalid(_ message: String) -> AppleCourseGroupedPlanProjectionError {
+        .invalid(message)
+    }
+}
+
+enum AppleCoursePlanTransitionError: LocalizedError, Equatable {
+    case invalid(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalid(let message): message
+        }
+    }
+}
+
+enum AppleCoursePlanTransitionPolicy {
+    static func validate(
+        proposed: CourseBrief,
+        courseDirectory: URL
+    ) throws {
+        if let issue = AppleCoursePlanValidator.issue(
+            in: proposed,
+            requiresTypedHierarchy: true
+        ) {
+            throw invalid(issue)
+        }
+
+        let prior = try protectedPresentedPlan(courseDirectory: courseDirectory)
+        guard let prior else {
+            guard proposed.revision == 1 else {
+                throw invalid("a new plan must start at revision 1")
+            }
+            return
+        }
+
+        guard proposed.planID == prior.planID else {
+            throw invalid("a plan revision must reuse the protected plan_id")
+        }
+        guard proposed.revision > prior.revision else {
+            throw invalid("a plan revision must be higher than the protected revision")
+        }
+
+        let priorEntries = CoursePlanHierarchyPolicy.outlineEntries(for: prior)
+        let proposedEntries = CoursePlanHierarchyPolicy.outlineEntries(for: proposed)
+        let priorByID = Dictionary(uniqueKeysWithValues: priorEntries.map { ($0.id, $0) })
+        let proposedByID = Dictionary(uniqueKeysWithValues: proposedEntries.map { ($0.id, $0) })
+        let sharedIDs = Set(priorByID.keys).intersection(proposedByID.keys)
+
+        for id in sharedIDs {
+            guard priorByID[id]?.role == proposedByID[id]?.role else {
+                throw invalid("stable node ID \(id) cannot change role in a revision")
+            }
+        }
+
+        typealias IdentityKey = String
+        func normalizedIdentity(_ entry: CoursePlanOutlineEntry) -> IdentityKey {
+            let normalizedTitle = entry.title
+                .folding(
+                    options: [.caseInsensitive, .diacriticInsensitive],
+                    locale: Locale(identifier: "en_US_POSIX")
+                )
+                .lowercased()
+                .split(whereSeparator: \.isWhitespace)
+                .joined(separator: " ")
+            return "\(entry.role.rawValue)|\(normalizedTitle)"
+        }
+        let priorByIdentity = Dictionary(grouping: priorEntries, by: normalizedIdentity)
+        let proposedByIdentity = Dictionary(grouping: proposedEntries, by: normalizedIdentity)
+        for (identity, priorMatches) in priorByIdentity where priorMatches.count == 1 {
+            guard let proposedMatches = proposedByIdentity[identity], proposedMatches.count == 1 else {
+                continue
+            }
+            guard priorMatches[0].id == proposedMatches[0].id else {
+                throw invalid(
+                    "a uniquely matching node role and title must retain its stable ID"
+                )
+            }
+        }
+
+        if !priorEntries.isEmpty, !proposedEntries.isEmpty, sharedIDs.isEmpty {
+            throw invalid("a revision cannot replace every stable node ID")
+        }
+    }
+
+    private static func protectedPresentedPlan(
+        courseDirectory: URL
+    ) throws -> CourseBrief? {
+        let url = AppleCourseApprovalPolicy.protectedPlanURL(
+            courseDirectory: courseDirectory,
+            filename: AppleCourseApprovalPolicy.presentedPlanFilename
+        )
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        } catch {
+            throw invalid(
+                "the protected presented plan is unreadable or corrupt; repair it before revising"
+            )
+        }
+        do {
+            let prior = try JSONDecoder().decode(CourseBrief.self, from: data)
+            if let issue = AppleCoursePlanValidator.issue(
+                in: prior,
+                requiresTypedHierarchy: true
+            ) {
+                throw invalid(
+                    "the protected presented plan is invalid and must be repaired: \(issue)"
+                )
+            }
+            return prior
+        } catch let error as AppleCoursePlanTransitionError {
+            throw error
+        } catch {
+            throw invalid(
+                "the protected presented plan is unreadable or corrupt; repair it before revising"
+            )
+        }
+    }
+
+    private static func invalid(_ message: String) -> AppleCoursePlanTransitionError {
+        .invalid(message)
+    }
+}
+
+enum AppleCoursePlanPresentationBoundary {
+    @MainActor
+    static func present(
+        _ proposed: CourseBrief,
+        courseDirectory: URL,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
+    ) async throws {
+        try AppleCoursePlanTransitionPolicy.validate(
+            proposed: proposed,
+            courseDirectory: courseDirectory
+        )
+        try await onCoursePlan(proposed)
     }
 }
 
@@ -549,18 +2691,205 @@ enum AppleCourseGenerationRetryPolicy {
     static let maximumCancellationRetries = 2
     static let mutationFreeAttemptTimeout: Duration = .seconds(90)
     static let watchdogPollInterval: Duration = .milliseconds(100)
-    static let watchdogPollCount = 900
+    static let hiddenPlanningTokensPerSecondFloor = 5
+    static let hiddenPlanningStartupAllowanceSeconds = 60
+    static let planningTimeoutRoundingSeconds = 30
+
+    enum WatchdogPhase: Equatable, Sendable {
+        case preToolPlanning(AppleCoursePlanningProfile)
+        case inactivity
+
+        var logValue: String {
+            switch self {
+            case .preToolPlanning:
+                "pre_tool_hidden"
+            case .inactivity:
+                "observable"
+            }
+        }
+    }
+
+    enum WatchdogTransitionReason: String, Equatable, Sendable {
+        case visibleOutput = "visible_output"
+        case planAttempt = "plan_attempt"
+    }
+
+    struct WatchdogPolicy: Equatable, Sendable {
+        let initialPhase: WatchdogPhase
+        let allowsAutomaticCancellationRetry: Bool
+    }
+
+    enum PostToolDisposition: Equatable, Sendable {
+        case keepWatching
+        case safetyHold
+        case finishSuccessfully
+    }
+
+    struct PostToolState: Equatable, Sendable {
+        let isCoursePlanCallbackInFlight: Bool
+        let didCompleteCoursePlanPresentation: Bool
+        let didCompleteEditorMutation: Bool
+
+        var disposition: PostToolDisposition {
+            AppleCourseGenerationRetryPolicy.postToolDisposition(
+                isCoursePlanCallbackInFlight: isCoursePlanCallbackInFlight,
+                didCompleteCoursePlanPresentation: didCompleteCoursePlanPresentation,
+                didCompleteEditorMutation: didCompleteEditorMutation
+            )
+        }
+    }
+
+    @MainActor
+    static func refreshedPostToolState<T>(
+        after operation: @MainActor () async -> T,
+        readState: @MainActor () -> PostToolState
+    ) async -> (result: T, state: PostToolState) {
+        let result = await operation()
+        return (result, readState())
+    }
+
+    static func postToolDisposition(
+        isCoursePlanCallbackInFlight: Bool,
+        didCompleteCoursePlanPresentation: Bool,
+        didCompleteEditorMutation: Bool
+    ) -> PostToolDisposition {
+        if didCompleteCoursePlanPresentation || didCompleteEditorMutation {
+            return .finishSuccessfully
+        }
+        if isCoursePlanCallbackInFlight {
+            return .safetyHold
+        }
+        return .keepWatching
+    }
+
+    static func watchdogPolicy(
+        providerID: String,
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile
+    ) -> WatchdogPolicy {
+        if providerID == CourseAgentProvider.appleOnDevice, toolMode == .planning {
+            return WatchdogPolicy(
+                initialPhase: .preToolPlanning(planningProfile),
+                allowsAutomaticCancellationRetry: false
+            )
+        }
+        return WatchdogPolicy(
+            initialPhase: .inactivity,
+            allowsAutomaticCancellationRetry: true
+        )
+    }
+
+    static func timeout(for phase: WatchdogPhase) -> Duration {
+        .seconds(timeoutSeconds(for: phase))
+    }
+
+    static func timeoutSeconds(for phase: WatchdogPhase) -> Int {
+        switch phase {
+        case .preToolPlanning(let profile):
+            preToolPlanningTimeoutSeconds(for: profile)
+        case .inactivity:
+            90
+        }
+    }
+
+    static func preToolPlanningTimeoutSeconds(
+        for profile: AppleCoursePlanningProfile
+    ) -> Int {
+        let maximumHiddenArgumentTokens = max(
+            1,
+            profile.responseTokenCap
+                - AppleCoursePlanningSchemaPolicy.minimumPostToolAcknowledgementTokens
+        )
+        let generationSeconds = (
+            maximumHiddenArgumentTokens + hiddenPlanningTokensPerSecondFloor - 1
+        ) / hiddenPlanningTokensPerSecondFloor
+        let unroundedSeconds = generationSeconds + hiddenPlanningStartupAllowanceSeconds
+        return (
+            (unroundedSeconds + planningTimeoutRoundingSeconds - 1)
+                / planningTimeoutRoundingSeconds
+        ) * planningTimeoutRoundingSeconds
+    }
+
+    struct InactivityTracker {
+        private var observedProgressRevision: UInt64
+        private var observedCoursePlanAttempt: Bool
+        private(set) var phase: WatchdogPhase
+        private(set) var deadline: ContinuousClock.Instant
+        private(set) var absoluteDeadline: ContinuousClock.Instant?
+        private(set) var lastTransitionReason: WatchdogTransitionReason?
+
+        init(
+            initialProgressRevision: UInt64,
+            initialCoursePlanAttempt: Bool = false,
+            initialPhase: WatchdogPhase = .inactivity,
+            now: ContinuousClock.Instant = ContinuousClock().now
+        ) {
+            observedProgressRevision = initialProgressRevision
+            observedCoursePlanAttempt = initialCoursePlanAttempt
+            phase = initialProgressRevision == 0 && !initialCoursePlanAttempt
+                ? initialPhase
+                : .inactivity
+            deadline = now.advanced(
+                by: AppleCourseGenerationRetryPolicy.timeout(for: phase)
+            )
+            if case .preToolPlanning = phase {
+                absoluteDeadline = deadline.advanced(
+                    by: AppleCourseGenerationRetryPolicy.mutationFreeAttemptTimeout
+                )
+            } else {
+                absoluteDeadline = nil
+            }
+            lastTransitionReason = nil
+        }
+
+        mutating func didReachTimeout(
+            now: ContinuousClock.Instant,
+            progressRevision: UInt64,
+            didAttemptCoursePlan: Bool
+        ) -> Bool {
+            lastTransitionReason = nil
+            let responseProgressed = progressRevision != observedProgressRevision
+            let coursePlanAttemptStarted = didAttemptCoursePlan
+                && !observedCoursePlanAttempt
+            if responseProgressed || coursePlanAttemptStarted {
+                observedProgressRevision = progressRevision
+                observedCoursePlanAttempt = didAttemptCoursePlan
+                phase = .inactivity
+                let inactivityDeadline = now.advanced(
+                    by: AppleCourseGenerationRetryPolicy.mutationFreeAttemptTimeout
+                )
+                deadline = if let absoluteDeadline {
+                    min(inactivityDeadline, absoluteDeadline)
+                } else {
+                    inactivityDeadline
+                }
+                lastTransitionReason = responseProgressed
+                    ? .visibleOutput
+                    : .planAttempt
+                return false
+            }
+            observedCoursePlanAttempt = observedCoursePlanAttempt || didAttemptCoursePlan
+            return now >= deadline
+        }
+    }
 
     static func canCancelHungAttempt(
         taskWasCancelled: Bool,
         latestResponse: String,
         didPresentCoursePlan: Bool,
-        didAttemptEditorMutation: Bool
+        didAttemptEditorMutation: Bool,
+        didAttemptCoursePlan: Bool = false,
+        isCoursePlanCallbackInFlight: Bool = false
     ) -> Bool {
-        !taskWasCancelled
-            && latestResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Partial output and a claimed plan attempt make replay unsafe, but they are not mutations.
+        // After a full inactivity window, cancellation is still safe when no callback or editor
+        // mutation can have changed durable course state.
+        _ = latestResponse
+        _ = didAttemptCoursePlan
+        return !taskWasCancelled
             && !didPresentCoursePlan
             && !didAttemptEditorMutation
+            && !isCoursePlanCallbackInFlight
     }
 
     static func canRetryCancellation(
@@ -568,28 +2897,90 @@ enum AppleCourseGenerationRetryPolicy {
         taskWasCancelled: Bool,
         latestResponse: String,
         didPresentCoursePlan: Bool,
-        didAttemptEditorMutation: Bool
+        didAttemptEditorMutation: Bool,
+        didAttemptCoursePlan: Bool = false,
+        isCoursePlanCallbackInFlight: Bool = false,
+        allowsAutomaticRetry: Bool = true
     ) -> Bool {
-        retryCount < maximumCancellationRetries
+        allowsAutomaticRetry
+            && retryCount < maximumCancellationRetries
+            && latestResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !didAttemptCoursePlan
             && canCancelHungAttempt(
                 taskWasCancelled: taskWasCancelled,
                 latestResponse: latestResponse,
                 didPresentCoursePlan: didPresentCoursePlan,
-                didAttemptEditorMutation: didAttemptEditorMutation
+                didAttemptEditorMutation: didAttemptEditorMutation,
+                didAttemptCoursePlan: didAttemptCoursePlan,
+                isCoursePlanCallbackInFlight: isCoursePlanCallbackInFlight
             )
+    }
+
+    static func canReplayContextOverflow(
+        cancellationRetryCount: Int,
+        taskWasCancelled: Bool,
+        latestResponse: String,
+        didAttemptCoursePlan: Bool,
+        didPresentCoursePlan: Bool,
+        didAttemptEditorMutation: Bool,
+        didCompleteEditorMutation: Bool,
+        transcriptMatchesBaseline: Bool
+    ) -> Bool {
+        cancellationRetryCount == 0
+            && !taskWasCancelled
+            && latestResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !didAttemptCoursePlan
+            && !didPresentCoursePlan
+            && !didAttemptEditorMutation
+            && !didCompleteEditorMutation
+            && transcriptMatchesBaseline
     }
 }
 
 #if canImport(FoundationModels)
 @available(iOS 26.0, *)
+enum AppleCourseGenerationErrorRoutingPolicy {
+    enum Route: Equatable {
+        case contextOverflow
+        case cancellationRetry
+        case fail
+    }
+
+    static func route(_ error: any Error) -> Route {
+        let generationError = error as? LanguageModelSession.GenerationError
+        let isContextOverflow: Bool
+        if let generationError, case .exceededContextWindowSize = generationError {
+            isContextOverflow = true
+        } else {
+            isContextOverflow = false
+        }
+        return route(
+            isContextOverflow: isContextOverflow,
+            isCancellation: error is CancellationError,
+            isGenerationError: generationError != nil
+        )
+    }
+
+    static func route(
+        isContextOverflow: Bool,
+        isCancellation: Bool,
+        isGenerationError: Bool
+    ) -> Route {
+        if isContextOverflow { return .contextOverflow }
+        if isCancellation || isGenerationError { return .cancellationRetry }
+        return .fail
+    }
+}
+
+@available(iOS 26.0, *)
 @MainActor
 final class AppleCourseLiveSessionCallbacks {
-    private var onCoursePlan: @MainActor (CourseBrief) async throws -> Void
+    private var onCoursePlan: @MainActor @Sendable (CourseBrief) async throws -> Void
     private var onEditorMutationAttempt: @MainActor @Sendable () -> Void
     private var onEditorMutationCompletion: @MainActor @Sendable () -> Void
 
     init(
-        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void,
         onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void,
         onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) {
@@ -599,7 +2990,7 @@ final class AppleCourseLiveSessionCallbacks {
     }
 
     func rebind(
-        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void,
         onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void,
         onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) {
@@ -631,12 +3022,78 @@ protocol AppleCourseAgentRuntime: AnyObject {
         providerID: String,
         workspaceID: String,
         prompt: String,
+        lessonTarget: PreparedCourseLessonTarget?,
         onAccepted: @escaping @MainActor () -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
-        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
     ) async throws
     func cancel(sessionID: UUID)
     func remove(sessionID: UUID, workspaceID: String)
+}
+
+extension AppleCourseAgentRuntime {
+    func send(
+        sessionID: UUID,
+        providerID: String,
+        workspaceID: String,
+        prompt: String,
+        onAccepted: @escaping @MainActor () -> Void,
+        onPartialResponse: @escaping @MainActor (String) -> Void,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
+    ) async throws {
+        try await send(
+            sessionID: sessionID,
+            providerID: providerID,
+            workspaceID: workspaceID,
+            prompt: prompt,
+            lessonTarget: nil,
+            onAccepted: onAccepted,
+            onPartialResponse: onPartialResponse,
+            onCoursePlan: onCoursePlan
+        )
+    }
+}
+
+enum AppleCourseStateFilePersistence {
+    static func write(_ data: Data, to url: URL) throws {
+        let fileManager = FileManager.default
+        let directory = url.deletingLastPathComponent()
+        try fileManager.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+
+        let stagingURL = directory.appendingPathComponent(
+            ".\(url.lastPathComponent).\(UUID().uuidString.lowercased()).tmp"
+        )
+        defer { try? fileManager.removeItem(at: stagingURL) }
+        try data.write(to: stagingURL, options: .withoutOverwriting)
+
+        var renameError: Int32 = 0
+        let published = stagingURL.withUnsafeFileSystemRepresentation { stagingPath in
+            url.withUnsafeFileSystemRepresentation { destinationPath in
+                guard let stagingPath, let destinationPath else {
+                    renameError = EINVAL
+                    return false
+                }
+                guard Darwin.rename(stagingPath, destinationPath) == 0 else {
+                    renameError = errno
+                    return false
+                }
+                return true
+            }
+        }
+        guard published else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(renameError),
+                userInfo: [
+                    NSFilePathErrorKey: url.path,
+                    NSURLErrorKey: url,
+                ]
+            )
+        }
+    }
 }
 
 @MainActor
@@ -647,7 +3104,8 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
     including items whose content remains pending, so the learner can see and generate them \
     separately. A folder is generated when every planned child is generated, pending_generation \
     when every child is pending, and partially_generated when child states are mixed; never leave \
-    a folder pending_generation when all its children are generated.
+    a folder pending_generation when all its children are generated. Learnfold creates the approved \
+    shell; never create a missing planned page yourself. Stop and request course-shell repair.
     """
 
     private let environment: [String: String]
@@ -658,8 +3116,13 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         let workspaceID: String
         let providerID: String
         let toolMode: AppleCourseToolMode
+        let planningIdentity: AppleCoursePlanningSessionIdentity?
+        let lessonTarget: PreparedCourseLessonTarget?
         let session: LanguageModelSession
         let callbacks: AppleCourseLiveSessionCallbacks
+        let planningAttemptGate: AppleCoursePlanningAttemptGate
+        let lessonValidationRetryGate: AppleCourseLessonValidationRetryGate
+        let lessonWriteGate: AppleCourseLessonWriteGate
     }
 
     @available(iOS 26.0, *)
@@ -691,9 +3154,10 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         providerID: String,
         workspaceID: String,
         prompt: String,
+        lessonTarget: PreparedCourseLessonTarget?,
         onAccepted: @escaping @MainActor () -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
-        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
     ) async throws {
         guard CourseAgentProvider.isApple(providerID) else {
             throw AppleCourseAgentError.invalidProvider
@@ -719,22 +3183,50 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         )
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            var state = (try? loadState(sessionID: sessionID, workspaceID: workspaceID))
+            let persistedStateURL = stateURL(
+                sessionID: sessionID,
+                workspaceID: workspaceID
+            )
+            let restoredState = FileManager.default.fileExists(atPath: persistedStateURL.path)
+                ? try? loadState(sessionID: sessionID, workspaceID: workspaceID)
+                : nil
+            var state = restoredState
                 ?? PersistedState(
                     providerID: providerID,
                     toolMode: nil,
+                    planningProfile: nil,
+                    planningShapeFingerprint: nil,
                     transcript: nil,
                     compactedSummary: nil,
                     messages: []
             )
             var didPresentCoursePlan = false
+            var isPresentingCoursePlan = false
+            var didCompleteCoursePlanPresentation = false
             var didAttemptEditorMutation = false
             var didCompleteEditorMutation = false
-            let trackedOnCoursePlan: @MainActor (CourseBrief) async throws -> Void = { plan in
-                didPresentCoursePlan = true
+            let trackedOnEditorMutationAttempt: @MainActor @Sendable () -> Void = {
+                didAttemptEditorMutation = true
                 LLog.info(
                     "AppleCourseAgent",
-                    "course plan tool called",
+                    "editor mutation tool entered",
+                    fields: ["session_id": sessionID.uuidString.lowercased()]
+                )
+            }
+            let trackedOnEditorMutationCompletion: @MainActor @Sendable () -> Void = {
+                didCompleteEditorMutation = true
+                LLog.info(
+                    "AppleCourseAgent",
+                    "editor mutation tool completed",
+                    fields: ["session_id": sessionID.uuidString.lowercased()]
+                )
+            }
+            let trackedOnCoursePlan: @MainActor @Sendable (CourseBrief) async throws -> Void = { plan in
+                isPresentingCoursePlan = true
+                defer { isPresentingCoursePlan = false }
+                LLog.info(
+                    "AppleCourseAgent",
+                    "course plan presentation callback entered",
                     fields: [
                         "chapter_count": plan.chapters.count,
                         "revision": plan.revision,
@@ -742,28 +3234,95 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     ]
                 )
                 try await onCoursePlan(plan)
+                didPresentCoursePlan = true
+                didCompleteCoursePlanPresentation = true
+                LLog.info(
+                    "AppleCourseAgent",
+                    "course plan presentation callback completed",
+                    fields: [
+                        "chapter_count": plan.chapters.count,
+                        "revision": plan.revision,
+                        "session_id": sessionID.uuidString.lowercased(),
+                    ]
+                )
             }
             let budget = AppleCourseContextBudget.forProvider(providerID)
+            let courseDirectory = Self.courseDirectory(workspaceID: workspaceID)
             let toolMode = AppleCourseToolMode.forTurn(
                 providerID: providerID,
                 hasApprovedPlan: AppleCourseApprovalPolicy.isLatestPlanApproved(
-                    courseDirectory: Self.courseDirectory(workspaceID: workspaceID)
+                    courseDirectory: courseDirectory
                 ),
                 learnerPrompt: prompt
             )
+            let planningRequirements = AppleCoursePlanningRequestPolicy.requirements(
+                currentPrompt: prompt,
+                previousLearnerPrompts: state.messages.compactMap {
+                    $0.role == .learner ? $0.text : nil
+                },
+                protectedPlan: AppleCourseApprovalPolicy.presentedPlan(
+                    courseDirectory: courseDirectory
+                )
+            )
+            var preselectedPlanningProfile: AppleCoursePlanningProfile?
             if let transcriptData = state.transcript,
                let transcript = try? JSONDecoder().decode(Transcript.self, from: transcriptData) {
                 let providerChanged = state.providerID != providerID
                 let toolModeChanged = state.toolMode.map { $0 != toolMode } ?? false
-                let contextIsFull = await shouldCompact(
-                    providerID: providerID,
-                    toolMode: toolMode,
-                    workspaceID: workspaceID,
-                    transcript: transcript,
-                    incomingPrompt: prompt,
-                    budget: budget
-                )
-                if providerChanged || toolModeChanged || contextIsFull {
+                let contextIsFull: Bool
+                let planningContractChanged: Bool
+                if providerChanged || toolModeChanged {
+                    contextIsFull = false
+                    planningContractChanged = false
+                } else if
+                    providerID == CourseAgentProvider.appleOnDevice,
+                    toolMode == .planning
+                {
+                    preselectedPlanningProfile = try? await selectPlanningProfile(
+                        workspaceID: workspaceID,
+                        transcript: transcript,
+                        compactedSummary: state.compactedSummary,
+                        prompt: prompt,
+                        requirements: planningRequirements,
+                        onCoursePlan: trackedOnCoursePlan
+                    )
+                    contextIsFull = preselectedPlanningProfile == nil
+                    // A legacy transcript has no proof of which planning schema created it. Treat
+                    // its semantic floor as `full`, but always compact/rebase before installing a
+                    // profiled tool contract instead of reusing that transcript directly.
+                    planningContractChanged = preselectedPlanningProfile.map {
+                        let selectedContract = planningRequirements.schemaContract(for: $0)
+                        return AppleCoursePlanningProfilePersistencePolicy.requiresTranscriptRebase(
+                            toolMode: toolMode,
+                            persistedProfile: state.planningProfile,
+                            persistedShapeFingerprint: state.planningShapeFingerprint,
+                            selectedContract: selectedContract
+                        )
+                    } ?? false
+                } else {
+                    contextIsFull = await shouldCompact(
+                        providerID: providerID,
+                        toolMode: toolMode,
+                        workspaceID: workspaceID,
+                        transcript: transcript,
+                        incomingPrompt: prompt,
+                        budget: budget
+                    )
+                    if toolMode.exposesPlanningTool {
+                        let selectedContract = planningRequirements.schemaContract(for: .full)
+                        planningContractChanged =
+                            AppleCoursePlanningProfilePersistencePolicy
+                                .requiresTranscriptRebase(
+                                    toolMode: toolMode,
+                                    persistedProfile: state.planningProfile,
+                                    persistedShapeFingerprint: state.planningShapeFingerprint,
+                                    selectedContract: selectedContract
+                                )
+                    } else {
+                        planningContractChanged = false
+                    }
+                }
+                if providerChanged || toolModeChanged || planningContractChanged || contextIsFull {
                     // Rebase every Apple model switch through a summary.
                     // Besides fitting a PCC transcript into the smaller
                     // on-device window, this removes the previous model's
@@ -816,11 +3375,35 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     }
                     state.compactedSummary = summary
                     state.transcript = nil
+                    preselectedPlanningProfile = nil
                     liveSessionStore().sessions[sessionID] = nil
                     try saveState(state, sessionID: sessionID, workspaceID: workspaceID)
                 }
             }
-            if state.transcript == nil {
+            let planningProfile: AppleCoursePlanningProfile
+            if
+                providerID == CourseAgentProvider.appleOnDevice,
+                toolMode == .planning
+            {
+                planningProfile = if let preselectedPlanningProfile {
+                    preselectedPlanningProfile
+                } else {
+                    try await selectPlanningProfile(
+                        workspaceID: workspaceID,
+                        transcript: state.transcript.flatMap {
+                            try? JSONDecoder().decode(Transcript.self, from: $0)
+                        },
+                        compactedSummary: state.compactedSummary,
+                        prompt: prompt,
+                        requirements: planningRequirements,
+                        onCoursePlan: trackedOnCoursePlan
+                    )
+                }
+            } else {
+                planningProfile = .full
+            }
+            let planningContract = planningRequirements.schemaContract(for: planningProfile)
+            if state.transcript == nil && toolMode != .planning {
                 try await validateInitialTurnFits(
                     providerID: providerID,
                     workspaceID: workspaceID,
@@ -830,32 +3413,62 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     onCoursePlan: trackedOnCoursePlan
                 )
             }
+            let planningAttemptGate = existingPlanningAttemptGate(
+                sessionID: sessionID,
+                providerID: providerID,
+                workspaceID: workspaceID,
+                toolMode: toolMode,
+                planningProfile: planningProfile,
+                planningShapeFingerprint: planningContract.fingerprint,
+                lessonTarget: lessonTarget
+            ) ?? AppleCoursePlanningAttemptGate()
+            await planningAttemptGate.beginTurn()
+            let lessonValidationRetryGate = AppleCourseLessonValidationTurnPolicy.beginTurn(
+                reusing: existingLessonValidationRetryGate(
+                    sessionID: sessionID,
+                    providerID: providerID,
+                    workspaceID: workspaceID,
+                    toolMode: toolMode,
+                    planningProfile: planningProfile,
+                    planningShapeFingerprint: planningContract.fingerprint,
+                    lessonTarget: lessonTarget
+                )
+            )
+            let lessonWriteGate = existingLessonWriteGate(
+                sessionID: sessionID,
+                providerID: providerID,
+                workspaceID: workspaceID,
+                toolMode: toolMode,
+                planningProfile: planningProfile,
+                planningShapeFingerprint: planningContract.fingerprint,
+                lessonTarget: lessonTarget
+            ) ?? AppleCourseLessonWriteGate()
+            await lessonWriteGate.beginTurn()
             let session = try makeSession(
                 sessionID: sessionID,
                 providerID: providerID,
                 workspaceID: workspaceID,
                 toolMode: toolMode,
+                planningProfile: planningProfile,
+                planningContract: planningContract,
+                lessonTarget: lessonTarget,
+                planningAttemptGate: planningAttemptGate,
+                lessonValidationRetryGate: lessonValidationRetryGate,
+                lessonWriteGate: lessonWriteGate,
                 persistedTranscript: state.transcript,
                 compactedSummary: state.compactedSummary,
                 onCoursePlan: trackedOnCoursePlan,
-                onEditorMutationAttempt: {
-                    didAttemptEditorMutation = true
-                    LLog.info(
-                        "AppleCourseAgent",
-                        "editor mutation tool entered",
-                        fields: ["session_id": sessionID.uuidString.lowercased()]
-                    )
-                },
-                onEditorMutationCompletion: {
-                    didCompleteEditorMutation = true
-                    LLog.info(
-                        "AppleCourseAgent",
-                        "editor mutation tool completed",
-                        fields: ["session_id": sessionID.uuidString.lowercased()]
-                    )
-                }
+                onEditorMutationAttempt: trackedOnEditorMutationAttempt,
+                onEditorMutationCompletion: trackedOnEditorMutationCompletion
             )
             state.toolMode = toolMode
+            let planningIdentity = AppleCoursePlanningSessionIdentity.current(
+                toolMode: toolMode,
+                planningProfile: planningProfile,
+                planningContract: planningContract
+            )
+            state.planningProfile = planningIdentity?.profile
+            state.planningShapeFingerprint = planningIdentity?.shapeFingerprint
             state.messages.append(.init(role: .learner, text: prompt))
             try saveState(state, sessionID: sessionID, workspaceID: workspaceID)
             onAccepted()
@@ -870,7 +3483,13 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             )
 
             var latest = ""
+            var responseProgressRevision: UInt64 = 0
             var completedSession = session
+            let watchdogPolicy = AppleCourseGenerationRetryPolicy.watchdogPolicy(
+                providerID: providerID,
+                toolMode: toolMode,
+                planningProfile: planningProfile
+            )
             @MainActor
             func consume(
                 _ activeSession: LanguageModelSession,
@@ -879,7 +3498,9 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 let runtimePrompt = Self.runtimePrompt(
                     for: prompt,
                     providerID: providerID,
-                    toolMode: toolMode
+                    toolMode: toolMode,
+                    planningProfile: planningProfile,
+                    planningContract: planningContract
                 )
                 LLog.info(
                     "AppleCourseAgent",
@@ -899,6 +3520,9 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     )
                     for try await snapshot in stream {
                         try Task.checkCancellation()
+                        if snapshot.content != latest {
+                            responseProgressRevision &+= 1
+                        }
                         latest = snapshot.content
                         onPartialResponse(latest)
                     }
@@ -916,9 +3540,20 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     return
                 }
 #endif
-                let stream = activeSession.streamResponse(to: runtimePrompt)
+                let responseTokenCap = AppleCoursePlanningSchemaPolicy.responseTokenCap(
+                    providerID: providerID,
+                    toolMode: toolMode,
+                    planningProfile: planningProfile
+                )
+                let stream = activeSession.streamResponse(
+                    to: runtimePrompt,
+                    options: GenerationOptions(maximumResponseTokens: responseTokenCap)
+                )
                 for try await snapshot in stream {
                     try Task.checkCancellation()
+                    if snapshot.content != latest {
+                        responseProgressRevision &+= 1
+                    }
                     latest = snapshot.content
                     onPartialResponse(latest)
                 }
@@ -944,7 +3579,29 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     try await consume(activeSession, attemptNumber: attemptNumber)
                 }
                 let watchdogTask = Task { @MainActor in
-                    for _ in 0..<AppleCourseGenerationRetryPolicy.watchdogPollCount {
+                    let clock = ContinuousClock()
+                    var inactivityTracker = AppleCourseGenerationRetryPolicy.InactivityTracker(
+                        initialProgressRevision: responseProgressRevision,
+                        initialPhase: watchdogPolicy.initialPhase,
+                        now: clock.now
+                    )
+                    LLog.info(
+                        "AppleCourseAgent",
+                        "generation watchdog started",
+                        fields: [
+                            "attempt": attemptNumber,
+                            "phase": inactivityTracker.phase.logValue,
+                            "planning_profile": toolMode == .planning
+                                ? planningProfile.rawValue
+                                : "none",
+                            "session_id": sessionID.uuidString.lowercased(),
+                            "timeout_seconds":
+                                AppleCourseGenerationRetryPolicy.timeoutSeconds(
+                                    for: inactivityTracker.phase
+                                ),
+                        ]
+                    )
+                    while true {
                         do {
                             try await Task.sleep(
                                 for: AppleCourseGenerationRetryPolicy.watchdogPollInterval
@@ -952,7 +3609,26 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                         } catch {
                             return
                         }
-                        if didCompleteEditorMutation {
+                        let refreshedPostToolState = await
+                            AppleCourseGenerationRetryPolicy.refreshedPostToolState(
+                                after: { await planningAttemptGate.hasAttempted() },
+                                readState: {
+                                    AppleCourseGenerationRetryPolicy.PostToolState(
+                                        isCoursePlanCallbackInFlight: isPresentingCoursePlan,
+                                        didCompleteCoursePlanPresentation:
+                                            didCompleteCoursePlanPresentation,
+                                        didCompleteEditorMutation: didCompleteEditorMutation
+                                    )
+                                }
+                            )
+                        // The state above is deliberately read after the actor hop. The plan tool
+                        // can enter or complete its @MainActor callback while `hasAttempted()` is
+                        // suspended, so a pre-await disposition could cancel an in-flight callback.
+                        let didAttemptCoursePlan = refreshedPostToolState.result
+                        let postToolState = refreshedPostToolState.state
+                        let postToolDisposition = postToolState.disposition
+                        if postToolDisposition == .finishSuccessfully,
+                           didCompleteEditorMutation {
                             LLog.info(
                                 "AppleCourseAgent",
                                 "ending generation after verified editor mutation",
@@ -964,54 +3640,147 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                             generationTask.cancel()
                             return
                         }
-                    }
-                    guard AppleCourseGenerationRetryPolicy.canCancelHungAttempt(
-                        taskWasCancelled: generationTask.isCancelled,
-                        latestResponse: latest,
-                        didPresentCoursePlan: didPresentCoursePlan,
-                        didAttemptEditorMutation: didAttemptEditorMutation
-                    ) else {
-                        LLog.info(
+                        if postToolDisposition == .finishSuccessfully,
+                           didCompleteCoursePlanPresentation {
+                            LLog.info(
+                                "AppleCourseAgent",
+                                "ending generation after completed course plan presentation",
+                                fields: [
+                                    "attempt": attemptNumber,
+                                    "planning_profile": toolMode == .planning
+                                        ? planningProfile.rawValue
+                                        : "none",
+                                    "session_id": sessionID.uuidString.lowercased(),
+                                ]
+                            )
+                            generationTask.cancel()
+                            return
+                        }
+                        let didReachTimeout = inactivityTracker.didReachTimeout(
+                            now: clock.now,
+                            progressRevision: responseProgressRevision,
+                            didAttemptCoursePlan: didAttemptCoursePlan
+                        )
+                        if let transitionReason = inactivityTracker.lastTransitionReason {
+                            LLog.info(
+                                "AppleCourseAgent",
+                                "generation watchdog observed progress",
+                                fields: [
+                                    "attempt": attemptNumber,
+                                    "phase": inactivityTracker.phase.logValue,
+                                    "planning_profile": toolMode == .planning
+                                        ? planningProfile.rawValue
+                                        : "none",
+                                    "session_id": sessionID.uuidString.lowercased(),
+                                    "timeout_seconds":
+                                        AppleCourseGenerationRetryPolicy.timeoutSeconds(
+                                            for: inactivityTracker.phase
+                                        ),
+                                    "transition_reason": transitionReason.rawValue,
+                                ]
+                            )
+                        }
+                        if didReachTimeout, postToolDisposition == .safetyHold {
+                            LLog.info(
+                                "AppleCourseAgent",
+                                "generation watchdog holding for in-flight course plan callback",
+                                fields: [
+                                    "attempt": attemptNumber,
+                                    "phase": inactivityTracker.phase.logValue,
+                                    "planning_profile": toolMode == .planning
+                                        ? planningProfile.rawValue
+                                        : "none",
+                                    "safety_hold": "course_plan_callback_in_flight",
+                                    "session_id": sessionID.uuidString.lowercased(),
+                                    "timeout_seconds":
+                                        AppleCourseGenerationRetryPolicy.timeoutSeconds(
+                                            for: inactivityTracker.phase
+                                        ),
+                                ]
+                            )
+                            continue
+                        }
+                        guard didReachTimeout else { continue }
+                        guard AppleCourseGenerationRetryPolicy.canCancelHungAttempt(
+                            taskWasCancelled: generationTask.isCancelled,
+                            latestResponse: latest,
+                            didPresentCoursePlan: didPresentCoursePlan,
+                            didAttemptEditorMutation: didAttemptEditorMutation,
+                            didAttemptCoursePlan: didAttemptCoursePlan,
+                            isCoursePlanCallbackInFlight:
+                                postToolState.isCoursePlanCallbackInFlight
+                        ) else {
+                            LLog.info(
+                                "AppleCourseAgent",
+                                "generation watchdog left active attempt running",
+                                fields: [
+                                    "attempt": attemptNumber,
+                                    "did_complete_course_plan_presentation":
+                                        didCompleteCoursePlanPresentation,
+                                    "did_attempt_editor_mutation": didAttemptEditorMutation,
+                                    "did_present_course_plan": didPresentCoursePlan,
+                                    "is_presenting_course_plan": isPresentingCoursePlan,
+                                    "phase": inactivityTracker.phase.logValue,
+                                    "planning_profile": toolMode == .planning
+                                        ? planningProfile.rawValue
+                                        : "none",
+                                    "response_characters": latest.count,
+                                    "safety_hold": didAttemptEditorMutation
+                                        ? "editor_mutation_attempt"
+                                        : "completed_presentation",
+                                    "session_id": sessionID.uuidString.lowercased(),
+                                    "timeout_seconds":
+                                        AppleCourseGenerationRetryPolicy.timeoutSeconds(
+                                            for: inactivityTracker.phase
+                                        ),
+                                ]
+                            )
+                            return
+                        }
+                        LLog.warn(
                             "AppleCourseAgent",
-                            "generation watchdog left active attempt running",
+                            "cancelling unresolved mutation-free generation attempt",
                             fields: [
                                 "attempt": attemptNumber,
-                                "did_attempt_editor_mutation": didAttemptEditorMutation,
-                                "did_present_course_plan": didPresentCoursePlan,
-                                "response_characters": latest.count,
+                                "planning_profile": toolMode == .planning
+                                    ? planningProfile.rawValue
+                                    : "none",
                                 "session_id": sessionID.uuidString.lowercased(),
+                                "phase": inactivityTracker.phase.logValue,
+                                "timeout_phase": inactivityTracker.phase.logValue,
+                                "timeout_seconds":
+                                    AppleCourseGenerationRetryPolicy.timeoutSeconds(
+                                        for: inactivityTracker.phase
+                                    ),
                             ]
                         )
+                        generationTask.cancel()
                         return
                     }
-                    LLog.warn(
-                        "AppleCourseAgent",
-                        "cancelling unresolved mutation-free generation attempt",
-                        fields: [
-                            "attempt": attemptNumber,
-                            "session_id": sessionID.uuidString.lowercased(),
-                            "timeout_seconds": 90,
-                        ]
-                    )
-                    generationTask.cancel()
                 }
                 defer { watchdogTask.cancel() }
                 try await generationTask.value
                 if generationTask.isCancelled {
                     // PCC's AsyncSequence may finish normally after cancellation instead of
-                    // throwing. Normalize that zero-output completion so the existing
-                    // mutation-safe cancellation retry policy still runs.
+                    // throwing. Normalize that completion so the stricter retry policy can
+                    // distinguish an empty mutation-free attempt from partial or tool-attempted
+                    // turns that must stop without replay.
                     throw CancellationError()
                 }
             }
             @MainActor
-            func prepareMutationFreeCancellationRetry() throws -> Bool {
+            func prepareMutationFreeCancellationRetry() async throws -> Bool {
+                let didAttemptCoursePlan = await planningAttemptGate.hasAttempted()
                 guard AppleCourseGenerationRetryPolicy.canRetryCancellation(
                         retryCount: cancellationRetryCount,
                         taskWasCancelled: Task.isCancelled,
                         latestResponse: latest,
                         didPresentCoursePlan: didPresentCoursePlan,
-                        didAttemptEditorMutation: didAttemptEditorMutation
+                        didAttemptEditorMutation: didAttemptEditorMutation,
+                        didAttemptCoursePlan: didAttemptCoursePlan,
+                        isCoursePlanCallbackInFlight: isPresentingCoursePlan,
+                        allowsAutomaticRetry:
+                            watchdogPolicy.allowsAutomaticCancellationRetry
                       ) else { return false }
                 cancellationRetryCount += 1
                 LLog.warn(
@@ -1024,6 +3793,8 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 )
                 liveSessionStore().sessions[sessionID] = nil
                 didPresentCoursePlan = false
+                isPresentingCoursePlan = false
+                didCompleteCoursePlanPresentation = false
                 didAttemptEditorMutation = false
                 didCompleteEditorMutation = false
                 completedSession = try makeSession(
@@ -1031,44 +3802,54 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     providerID: providerID,
                     workspaceID: workspaceID,
                     toolMode: toolMode,
+                    planningProfile: planningProfile,
+                    planningContract: planningContract,
+                    lessonTarget: lessonTarget,
+                    planningAttemptGate: planningAttemptGate,
+                    lessonValidationRetryGate: lessonValidationRetryGate,
+                    lessonWriteGate: lessonWriteGate,
                     persistedTranscript: state.transcript,
                     compactedSummary: state.compactedSummary,
                     onCoursePlan: trackedOnCoursePlan,
-                    onEditorMutationAttempt: {
-                        didAttemptEditorMutation = true
-                        LLog.info(
-                            "AppleCourseAgent",
-                            "editor mutation tool entered",
-                            fields: ["session_id": sessionID.uuidString.lowercased()]
-                        )
-                    },
-                    onEditorMutationCompletion: {
-                        didCompleteEditorMutation = true
-                        LLog.info(
-                            "AppleCourseAgent",
-                            "editor mutation tool completed",
-                            fields: ["session_id": sessionID.uuidString.lowercased()]
-                        )
-                    }
+                    onEditorMutationAttempt: trackedOnEditorMutationAttempt,
+                    onEditorMutationCompletion: trackedOnEditorMutationCompletion
                 )
                 return true
             }
+            var didAttemptContextOverflowRecovery = false
             @MainActor
             func recoverFromContextOverflow(_ originalError: any Error) async throws {
                 guard
-                    latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                     let transcriptData = state.transcript,
                     let transcript = try? JSONDecoder().decode(
                         Transcript.self,
                         from: transcriptData
-                    ),
-                    transcriptText(session.transcript) == transcriptText(transcript)
+                    )
                 else {
-                    // A partial response or transcript change may include an
-                    // already-executed side effect. Never replay the learner's
-                    // turn when mutation safety cannot be proven.
                     throw originalError
                 }
+                let didAttemptCoursePlan = await planningAttemptGate.hasAttempted()
+                let transcriptMatchesBaseline =
+                    transcriptText(completedSession.transcript) == transcriptText(transcript)
+                guard
+                    !didAttemptContextOverflowRecovery,
+                    AppleCourseGenerationRetryPolicy.canReplayContextOverflow(
+                        cancellationRetryCount: cancellationRetryCount,
+                        taskWasCancelled: Task.isCancelled,
+                        latestResponse: latest,
+                        didAttemptCoursePlan: didAttemptCoursePlan,
+                        didPresentCoursePlan: didPresentCoursePlan,
+                        didAttemptEditorMutation: didAttemptEditorMutation,
+                        didCompleteEditorMutation: didCompleteEditorMutation,
+                        transcriptMatchesBaseline: transcriptMatchesBaseline
+                    )
+                else {
+                    // A partial response, any consumed plan attempt, a prior cancellation replay,
+                    // or a transcript change may include an exhausted budget or side effect.
+                    // Never replay the learner's turn when mutation safety cannot be proven.
+                    throw originalError
+                }
+                didAttemptContextOverflowRecovery = true
                 let compactionProvider = state.providerID
                 let summary: String
                 do {
@@ -1094,30 +3875,39 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 state.transcript = nil
                 liveSessionStore().sessions[sessionID] = nil
                 try saveState(state, sessionID: sessionID, workspaceID: workspaceID)
+                if
+                    providerID == CourseAgentProvider.appleOnDevice,
+                    toolMode == .planning
+                {
+                    let replayProfile = try await selectPlanningProfile(
+                        workspaceID: workspaceID,
+                        transcript: nil,
+                        compactedSummary: summary,
+                        prompt: prompt,
+                        requirements: planningRequirements,
+                        candidateProfiles: [planningProfile],
+                        onCoursePlan: trackedOnCoursePlan
+                    )
+                    guard replayProfile == planningProfile else {
+                        throw originalError
+                    }
+                }
                 completedSession = try makeSession(
                     sessionID: sessionID,
                     providerID: providerID,
                     workspaceID: workspaceID,
                     toolMode: toolMode,
+                    planningProfile: planningProfile,
+                    planningContract: planningContract,
+                    lessonTarget: lessonTarget,
+                    planningAttemptGate: planningAttemptGate,
+                    lessonValidationRetryGate: lessonValidationRetryGate,
+                    lessonWriteGate: lessonWriteGate,
                     persistedTranscript: nil,
                     compactedSummary: summary,
                     onCoursePlan: trackedOnCoursePlan,
-                    onEditorMutationAttempt: {
-                        didAttemptEditorMutation = true
-                        LLog.info(
-                            "AppleCourseAgent",
-                            "editor mutation tool entered",
-                            fields: ["session_id": sessionID.uuidString.lowercased()]
-                        )
-                    },
-                    onEditorMutationCompletion: {
-                        didCompleteEditorMutation = true
-                        LLog.info(
-                            "AppleCourseAgent",
-                            "editor mutation tool completed",
-                            fields: ["session_id": sessionID.uuidString.lowercased()]
-                        )
-                    }
+                    onEditorMutationAttempt: trackedOnEditorMutationAttempt,
+                    onEditorMutationCompletion: trackedOnEditorMutationCompletion
                 )
                 latest = ""
                 try await consumeWithMutationFreeTimeout(
@@ -1150,10 +3940,10 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                                     "task_cancelled": Task.isCancelled,
                                 ]
                             )
-                            if (error is CancellationError
-                                || error is LanguageModelSession.GenerationError),
-                               try prepareMutationFreeCancellationRetry() {
-                                continue
+                            if AppleCourseGenerationErrorRoutingPolicy.route(error)
+                                == .contextOverflow {
+                                try await recoverFromContextOverflow(error)
+                                break
                             }
                             if #available(iOS 27.0, *),
                                let modelError = error as? LanguageModelError,
@@ -1162,6 +3952,11 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                                     AppleCourseAgentError.toolFailed(context.debugDescription)
                                 )
                                 break
+                            }
+                            if AppleCourseGenerationErrorRoutingPolicy.route(error)
+                                == .cancellationRetry,
+                               try await prepareMutationFreeCancellationRetry() {
+                                continue
                             }
                             throw error
                         }
@@ -1175,9 +3970,14 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                             )
                             break
                         } catch {
-                            if (error is CancellationError
-                                || error is LanguageModelSession.GenerationError),
-                               try prepareMutationFreeCancellationRetry() {
+                            if AppleCourseGenerationErrorRoutingPolicy.route(error)
+                                == .contextOverflow {
+                                try await recoverFromContextOverflow(error)
+                                break
+                            }
+                            if AppleCourseGenerationErrorRoutingPolicy.route(error)
+                                == .cancellationRetry,
+                               try await prepareMutationFreeCancellationRetry() {
                                 continue
                             }
                             throw error
@@ -1190,6 +3990,10 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     }
                     try await recoverFromContextOverflow(error)
                 }
+                try AppleCoursePlanningAttemptPolicy.requirePresentedPlanAfterAttempt(
+                    didAttemptCoursePlan: await planningAttemptGate.hasAttempted(),
+                    didPresentCoursePlan: didPresentCoursePlan
+                )
                 state.providerID = providerID
                 state.transcript = try JSONEncoder().encode(completedSession.transcript)
                 if !latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1217,6 +4021,8 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     error: error,
                     fields: [
                         "did_attempt_editor_mutation": didAttemptEditorMutation,
+                        "did_complete_course_plan_presentation":
+                            didCompleteCoursePlanPresentation,
                         "did_present_course_plan": didPresentCoursePlan,
                         "error_type": String(reflecting: type(of: error)),
                         "response_characters": latest.count,
@@ -1244,6 +4050,26 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                         fields: ["session_id": sessionID.uuidString.lowercased()]
                     )
                     return
+                }
+                if didCompleteCoursePlanPresentation {
+                    let confirmation = "The course plan is ready for review."
+                    if latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        state.messages.append(.init(role: .agent, text: confirmation))
+                        onPartialResponse(confirmation)
+                        try? saveState(state, sessionID: sessionID, workspaceID: workspaceID)
+                    }
+                    LLog.info(
+                        "AppleCourseAgent",
+                        "accepted completed plan presentation after post-tool generation error",
+                        fields: ["session_id": sessionID.uuidString.lowercased()]
+                    )
+                    return
+                }
+                if let rejection = await planningAttemptGate.recordedRejection() {
+                    // Foundation Models can wrap a thrown tool error in a later token-generation
+                    // failure while attempting an acknowledgement. The claimed attempt remains
+                    // authoritative: surface the deterministic recovery copy and never replay.
+                    throw AppleCourseAgentError.toolFailed(rejection.userMessage)
                 }
                 if let toolError = error as? LanguageModelSession.ToolCallError {
                     if let courseError = toolError.underlyingError as? AppleCourseAgentError {
@@ -1281,14 +4107,16 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             liveSessionStore().sessions[sessionID] = nil
         }
 #endif
-        try? FileManager.default.removeItem(
-            at: stateURL(sessionID: sessionID, workspaceID: workspaceID)
-        )
+        let url = stateURL(sessionID: sessionID, workspaceID: workspaceID)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private struct PersistedState: Codable {
         var providerID: String
         var toolMode: AppleCourseToolMode?
+        var planningProfile: AppleCoursePlanningProfile?
+        var planningShapeFingerprint: String?
         var transcript: Data?
         var compactedSummary: String?
         var messages: [AppleCourseAgentStoredMessage]
@@ -1305,11 +4133,10 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         workspaceID: String
     ) throws {
         let url = stateURL(sessionID: sessionID, workspaceID: workspaceID)
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        try AppleCourseStateFilePersistence.write(
+            JSONEncoder().encode(state),
+            to: url
         )
-        try JSONEncoder().encode(state).write(to: url, options: .atomic)
     }
 
     private func stateURL(sessionID: UUID, workspaceID: String) -> URL {
@@ -1346,16 +4173,29 @@ private extension SystemAppleCourseAgentRuntime {
         providerID: String,
         workspaceID: String,
         toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile = .full,
+        planningContract: AppleCoursePlanningSchemaContract,
+        lessonTarget: PreparedCourseLessonTarget?,
+        planningAttemptGate: AppleCoursePlanningAttemptGate,
+        lessonValidationRetryGate: AppleCourseLessonValidationRetryGate,
+        lessonWriteGate: AppleCourseLessonWriteGate,
         persistedTranscript: Data?,
         compactedSummary: String?,
-        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void,
         onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void = {},
         onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) throws -> LanguageModelSession {
+        let planningIdentity = AppleCoursePlanningSessionIdentity.current(
+            toolMode: toolMode,
+            planningProfile: planningProfile,
+            planningContract: planningContract
+        )
         if let cached = liveSessionStore().sessions[sessionID],
            cached.workspaceID == workspaceID,
            cached.providerID == providerID,
-           cached.toolMode == toolMode {
+           cached.toolMode == toolMode,
+           cached.planningIdentity == planningIdentity,
+           cached.lessonTarget == lessonTarget {
             cached.callbacks.rebind(
                 onCoursePlan: onCoursePlan,
                 onEditorMutationAttempt: onEditorMutationAttempt,
@@ -1381,6 +4221,12 @@ private extension SystemAppleCourseAgentRuntime {
             providerID: providerID,
             workspaceID: workspaceID,
             mode: toolMode,
+            planningProfile: planningProfile,
+            planningContract: planningContract,
+            lessonTarget: lessonTarget,
+            planningAttemptGate: planningAttemptGate,
+            lessonValidationRetryGate: lessonValidationRetryGate,
+            lessonWriteGate: lessonWriteGate,
             onCoursePlan: { plan in
                 try await callbacks.presentCoursePlan(plan)
             },
@@ -1396,8 +4242,11 @@ private extension SystemAppleCourseAgentRuntime {
         }
         let instructions = Self.instructions(
             providerID: providerID,
+            workspaceID: workspaceID,
             compactedSummary: compactedSummary,
-            toolMode: toolMode
+            toolMode: toolMode,
+            planningProfile: planningProfile,
+            planningContract: planningContract
         )
         let session: LanguageModelSession
         if providerID == CourseAgentProvider.applePrivateCloud {
@@ -1442,8 +4291,13 @@ private extension SystemAppleCourseAgentRuntime {
             workspaceID: workspaceID,
             providerID: providerID,
             toolMode: toolMode,
+            planningIdentity: planningIdentity,
+            lessonTarget: lessonTarget,
             session: session,
-            callbacks: callbacks
+            callbacks: callbacks,
+            planningAttemptGate: planningAttemptGate,
+            lessonValidationRetryGate: lessonValidationRetryGate,
+            lessonWriteGate: lessonWriteGate
         )
         LLog.info(
             "AppleCourseAgent",
@@ -1451,11 +4305,211 @@ private extension SystemAppleCourseAgentRuntime {
             fields: [
                 "has_persisted_transcript": transcript != nil,
                 "provider": providerID,
+                "planning_profile": planningIdentity?.profile.rawValue ?? "none",
+                "planning_shape_fingerprint": planningIdentity?.shapeFingerprint ?? "none",
                 "session_id": sessionID.uuidString.lowercased(),
                 "tool_mode": toolMode.rawValue,
             ]
         )
         return session
+    }
+
+    func existingLessonValidationRetryGate(
+        sessionID: UUID,
+        providerID: String,
+        workspaceID: String,
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile = .full,
+        planningShapeFingerprint: String,
+        lessonTarget: PreparedCourseLessonTarget?
+    ) -> AppleCourseLessonValidationRetryGate? {
+        let requestedPlanningIdentity = AppleCoursePlanningSessionIdentity.current(
+            toolMode: toolMode,
+            planningProfile: planningProfile,
+            planningShapeFingerprint: planningShapeFingerprint
+        )
+        guard let cached = liveSessionStore().sessions[sessionID],
+              cached.workspaceID == workspaceID,
+              cached.providerID == providerID,
+              cached.toolMode == toolMode,
+              cached.planningIdentity == requestedPlanningIdentity,
+              cached.lessonTarget == lessonTarget else {
+            return nil
+        }
+        return cached.lessonValidationRetryGate
+    }
+
+    func existingPlanningAttemptGate(
+        sessionID: UUID,
+        providerID: String,
+        workspaceID: String,
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile = .full,
+        planningShapeFingerprint: String,
+        lessonTarget: PreparedCourseLessonTarget?
+    ) -> AppleCoursePlanningAttemptGate? {
+        let requestedPlanningIdentity = AppleCoursePlanningSessionIdentity.current(
+            toolMode: toolMode,
+            planningProfile: planningProfile,
+            planningShapeFingerprint: planningShapeFingerprint
+        )
+        guard let cached = liveSessionStore().sessions[sessionID],
+              cached.workspaceID == workspaceID,
+              cached.providerID == providerID,
+              cached.toolMode == toolMode,
+              cached.planningIdentity == requestedPlanningIdentity,
+              cached.lessonTarget == lessonTarget else {
+            return nil
+        }
+        return cached.planningAttemptGate
+    }
+
+    func existingLessonWriteGate(
+        sessionID: UUID,
+        providerID: String,
+        workspaceID: String,
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile = .full,
+        planningShapeFingerprint: String,
+        lessonTarget: PreparedCourseLessonTarget?
+    ) -> AppleCourseLessonWriteGate? {
+        let requestedPlanningIdentity = AppleCoursePlanningSessionIdentity.current(
+            toolMode: toolMode,
+            planningProfile: planningProfile,
+            planningShapeFingerprint: planningShapeFingerprint
+        )
+        guard let cached = liveSessionStore().sessions[sessionID],
+              cached.workspaceID == workspaceID,
+              cached.providerID == providerID,
+              cached.toolMode == toolMode,
+              cached.planningIdentity == requestedPlanningIdentity,
+              cached.lessonTarget == lessonTarget else {
+            return nil
+        }
+        return cached.lessonWriteGate
+    }
+
+    func selectPlanningProfile(
+        workspaceID: String,
+        transcript: Transcript?,
+        compactedSummary: String?,
+        prompt: String,
+        requirements: AppleCoursePlanningRequirements,
+        candidateProfiles: [AppleCoursePlanningProfile] =
+            AppleCoursePlanningProfile.selectionOrder,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
+    ) async throws -> AppleCoursePlanningProfile {
+        guard #available(iOS 26.4, *) else {
+            throw AppleCourseAgentError.toolFailed(
+                "Apple On-Device planning requires iOS 26.4 or later for exact context budgeting."
+            )
+        }
+        let supportedProfiles = candidateProfiles.filter { $0.supports(requirements) }
+        guard !supportedProfiles.isEmpty else {
+            throw AppleCourseAgentError.toolFailed(
+                """
+                This requested plan exceeds Apple On-Device’s bounded course-plan shape. Use \
+                Apple Private Cloud Compute, or request at most 8 chapters and 48 total pages.
+                """
+            )
+        }
+
+        do {
+            let model = SystemLanguageModel.default
+            let transcriptTokens: Int? = if let transcript {
+                try await model.tokenCount(for: transcript)
+            } else {
+                nil
+            }
+            var measurements: [AppleCoursePlanningProfileMeasurement] = []
+            for profile in supportedProfiles {
+                let planningContract = requirements.schemaContract(for: profile)
+                let lessonValidationRetryGate = AppleCourseLessonValidationRetryGate()
+                let tools = try AppleCourseToolFactory.tools(
+                    providerID: CourseAgentProvider.appleOnDevice,
+                    workspaceID: workspaceID,
+                    mode: .planning,
+                    planningProfile: profile,
+                    planningContract: planningContract,
+                    lessonValidationRetryGate: lessonValidationRetryGate,
+                    onCoursePlan: onCoursePlan
+                )
+                let instructionTokens: Int
+                if let transcriptTokens {
+                    instructionTokens = transcriptTokens
+                } else {
+                    instructionTokens = try await model.tokenCount(
+                        for: Instructions(
+                            Self.instructions(
+                                providerID: CourseAgentProvider.appleOnDevice,
+                                workspaceID: workspaceID,
+                                compactedSummary: compactedSummary,
+                                toolMode: .planning,
+                                planningProfile: profile,
+                                planningContract: planningContract
+                            )
+                        )
+                    )
+                }
+                let toolTokens = try await model.tokenCount(for: tools)
+                let promptTokens = try await model.tokenCount(
+                    for: Self.runtimePrompt(
+                        for: prompt,
+                        providerID: CourseAgentProvider.appleOnDevice,
+                        toolMode: .planning,
+                        planningProfile: profile,
+                        planningContract: planningContract
+                    )
+                )
+                let measurement = AppleCoursePlanningProfileMeasurement(
+                    profile: profile,
+                    contextSize: model.contextSize,
+                    instructionTokens: instructionTokens,
+                    toolTokens: toolTokens,
+                    promptTokens: promptTokens
+                )
+                measurements.append(measurement)
+                LLog.info(
+                    "AppleCourseAgent",
+                    "measured planning profile",
+                    fields: [
+                        "context_size": measurement.contextSize,
+                        "instruction_or_transcript_tokens": measurement.instructionTokens,
+                        "maximum_chapters": profile.maximumChapters,
+                        "maximum_learning_nodes": profile.maximumLearningNodes,
+                        "maximum_response_tokens": profile.responseTokenCap,
+                        "post_response_headroom_tokens":
+                            measurement.postResponseHeadroomTokens,
+                        "profile": profile.rawValue,
+                        "planning_shape_fingerprint": planningContract.fingerprint,
+                        "prompt_tokens": measurement.promptTokens,
+                        "tool_tokens": measurement.toolTokens,
+                    ]
+                )
+            }
+            guard let selected = AppleCoursePlanningProfileSelectionPolicy.select(
+                requirements: requirements,
+                measurements: measurements
+            ) else {
+                throw AppleCourseAgentError.toolFailed(
+                    """
+                    This planning turn cannot fit Apple On-Device’s safe context budget without \
+                    truncating the supported plan. Shorten the request or use Apple Private Cloud \
+                    Compute.
+                    """
+                )
+            }
+            return selected.profile
+        } catch let error as AppleCourseAgentError {
+            throw error
+        } catch {
+            throw AppleCourseAgentError.toolFailed(
+                """
+                Learnfold could not measure Apple On-Device’s safe planning budget. Try again, or \
+                use Apple Private Cloud Compute.
+                """
+            )
+        }
     }
 
     func validateInitialTurnFits(
@@ -1464,10 +4518,11 @@ private extension SystemAppleCourseAgentRuntime {
         compactedSummary: String?,
         prompt: String,
         toolMode: AppleCourseToolMode,
-        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
     ) async throws {
         guard
             providerID == CourseAgentProvider.appleOnDevice,
+            toolMode != .planning,
             #available(iOS 26.4, *)
         else {
             return
@@ -1475,16 +4530,19 @@ private extension SystemAppleCourseAgentRuntime {
 
         do {
             let model = SystemLanguageModel.default
+            let lessonValidationRetryGate = AppleCourseLessonValidationRetryGate()
             let tools = try AppleCourseToolFactory.tools(
                 providerID: providerID,
                 workspaceID: workspaceID,
                 mode: toolMode,
+                lessonValidationRetryGate: lessonValidationRetryGate,
                 onCoursePlan: onCoursePlan
             )
             let instructionTokens = try await model.tokenCount(
                 for: Instructions(
                     Self.instructions(
                         providerID: providerID,
+                        workspaceID: workspaceID,
                         compactedSummary: compactedSummary,
                         toolMode: toolMode
                     )
@@ -1502,16 +4560,33 @@ private extension SystemAppleCourseAgentRuntime {
             // useful response or a plan tool call and fail with actionable
             // copy instead of exposing the framework's overflow error.
             let budget = AppleCourseContextBudget.forProvider(providerID)
-            guard
-                instructionTokens + toolTokens + promptTokens
-                    < model.contextSize
-                        - budget.responseReserveTokens
-                        - budget.toolOutputReserveTokens
-            else {
+            let usedTokens = instructionTokens + toolTokens + promptTokens
+            let reservedTokens = budget.responseReserveTokens
+                + budget.toolOutputReserveTokens
+            LLog.info(
+                "AppleCourseAgent",
+                "initial context token budget",
+                fields: [
+                    "context_size": model.contextSize,
+                    "instruction_tokens": instructionTokens,
+                    "prompt_tokens": promptTokens,
+                    "reserved_tokens": reservedTokens,
+                    "tool_tokens": toolTokens,
+                    "used_tokens": usedTokens,
+                ]
+            )
+            let fits = AppleCoursePlanningSchemaPolicy.fitsOnDeviceContext(
+                contextSize: model.contextSize,
+                instructionTokens: instructionTokens,
+                toolTokens: toolTokens,
+                promptTokens: promptTokens,
+                reservedTokens: reservedTokens
+            )
+            guard fits else {
                 throw AppleCourseAgentError.toolFailed(
                     """
-                    This first request is too long for Apple On-Device’s context window. Shorten \
-                    it or start this course with Apple Private Cloud Compute.
+                    This request cannot fit Apple On-Device’s safe context budget. Shorten it or \
+                    start this course with Apple Private Cloud Compute.
                     """
                 )
             }
@@ -1586,6 +4661,11 @@ private extension SystemAppleCourseAgentRuntime {
         incomingPrompt: String,
         budget: AppleCourseContextBudget
     ) async -> Bool {
+        // Planning owns a separate exact-token profile-selection path. Returning true here is a
+        // conservative safety boundary for any future accidental caller; this helper must never
+        // reconstruct an implicit full planning schema or response cap.
+        guard toolMode != .planning else { return true }
+
         let contextSize: Int
         if providerID == CourseAgentProvider.applePrivateCloud {
 #if LEARNFOLD_PRIVATE_CLOUD_COMPUTE_SDK
@@ -1606,10 +4686,12 @@ private extension SystemAppleCourseAgentRuntime {
            #available(iOS 26.4, *) {
             do {
                 let model = SystemLanguageModel.default
+                let lessonValidationRetryGate = AppleCourseLessonValidationRetryGate()
                 let tools = try AppleCourseToolFactory.tools(
                     providerID: providerID,
                     workspaceID: workspaceID,
                     mode: toolMode,
+                    lessonValidationRetryGate: lessonValidationRetryGate,
                     onCoursePlan: { _ in }
                 )
                 let transcriptTokens = try await model.tokenCount(for: transcript)
@@ -1653,26 +4735,38 @@ private extension SystemAppleCourseAgentRuntime {
 
     static func instructions(
         providerID _: String,
+        workspaceID: String? = nil,
         compactedSummary: String?,
-        toolMode: AppleCourseToolMode
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile = .full,
+        planningContract: AppleCoursePlanningSchemaContract? = nil
     ) -> String {
+        if toolMode == .planning {
+            return AppleCoursePlanningPromptPolicy.instructions(
+                for: planningProfile,
+                contract: planningContract,
+                compactedSummary: compactedSummary,
+                protectedOutline: workspaceID.flatMap(durableCourseState)
+            )
+        }
+
         let toolInstructions: String
         switch toolMode {
         case .planning:
-            toolInstructions = """
-            When ready, call present_course_plan with every typed plan field. Do not describe the \
-            plan in chat. Wait for learner approval before creating course content.
-            """
+            preconditionFailure("Planning instructions return before this switch.")
         case .editing:
             toolInstructions = """
             The learner approved the current plan. Use learnfold_generate_lesson exactly once for \
             initial lesson generation, or learnfold_append_lesson_section exactly once for a \
-            requested addition. Learnfold resolves and fetches the current page internally.
+            requested addition. Only if Learnfold rejects runnable code before any write may you \
+            correct it and call learnfold_generate_lesson exactly once more. Learnfold resolves and \
+            fetches the current page internally.
             """
         case .generatingLesson:
             toolInstructions = """
             The learner approved the current plan. Use learnfold_generate_lesson exactly once. \
-            Learnfold resolves and saves the pending lesson internally.
+            Only if Learnfold rejects runnable code before any write may you correct it and call \
+            exactly once more. Learnfold resolves and saves the pending lesson internally.
             """
         case .appendingLesson:
             toolInstructions = """
@@ -1683,7 +4777,9 @@ private extension SystemAppleCourseAgentRuntime {
             toolInstructions = """
             Use present_course_plan for typed plan proposals. After approval, use \
             learnfold_generate_lesson or learnfold_append_lesson_section exactly once for each \
-            requested lesson write. Never edit before learner approval.
+            requested lesson write. Only if Learnfold rejects runnable code before any write may \
+            you correct it and call learnfold_generate_lesson exactly once more. Never edit before \
+            learner approval.
             """
         }
         let baseInstructions = """
@@ -1746,26 +4842,31 @@ private extension SystemAppleCourseAgentRuntime {
             .appendingPathComponent("Apps", isDirectory: true)
             .appendingPathComponent("Courses", isDirectory: true)
             .appendingPathComponent(workspaceID, isDirectory: true)
-        let filenames = [
-            AppleCourseApprovalPolicy.presentedPlanFilename,
-            AppleCourseApprovalPolicy.approvedPlanFilename,
-        ]
-        let entries = filenames.compactMap { filename -> String? in
-            guard
-                let data = try? Data(
-                    contentsOf: AppleCourseApprovalPolicy.protectedPlanURL(
-                        courseDirectory: courseDirectory,
-                        filename: filename
-                    )
-                ),
-                let plan = try? JSONDecoder().decode(CourseBrief.self, from: data)
-            else {
-                return nil
-            }
-            return """
-            \(filename): plan_id=\(plan.planID), revision=\(plan.revision), \
-            title=\(plan.title), chapters=\(plan.chapters.count)
-            """
+        let presented = AppleCourseApprovalPolicy.presentedPlan(
+            courseDirectory: courseDirectory
+        )
+        let approved = AppleCourseApprovalPolicy.approvedPlan(
+            courseDirectory: courseDirectory
+        )
+        let protectedPlans: [(String, CourseBrief)]
+        if let presented, let approved, presented == approved {
+            protectedPlans = [(
+                "\(AppleCourseApprovalPolicy.presentedPlanFilename)+"
+                    + AppleCourseApprovalPolicy.approvedPlanFilename,
+                presented,
+            )]
+        } else {
+            protectedPlans = [
+                presented.map { (AppleCourseApprovalPolicy.presentedPlanFilename, $0) },
+                approved.map { (AppleCourseApprovalPolicy.approvedPlanFilename, $0) },
+            ].compactMap { $0 }
+        }
+
+        let entries = protectedPlans.map { filename, plan in
+            AppleCourseDurableStatePolicy.renderProtectedPlan(
+                filename: filename,
+                plan: plan
+            )
         }
         return entries.isEmpty ? nil : entries.joined(separator: "\n")
     }
@@ -1859,8 +4960,9 @@ private extension SystemAppleCourseAgentRuntime {
         learner; otherwise choose 3 to 8 focused chapters. Never write course pages before the \
         learner approves that plan. After approval, use the native-editor tools for all course \
         content. Fetch immediately before updating a page and always use its latest \
-        expected_revision. Generate the full course hierarchy but initially write complete learning \
-        content only for Chapter 1. \(courseHierarchyInstructions) For a selected-passage question, \
+        expected_revision. Learnfold creates the full approved hierarchy and names the exact initial \
+        pending page in its approval instruction. Generate only that page in the approval turn; do \
+        not generate its siblings or recreate the hierarchy. \(courseHierarchyInstructions) For a selected-passage question, \
         autonomously choose the \
         smallest sufficient response: answer only in chat for a short-lived clarification; add or \
         revise a focused section on the referenced page when it durably improves that lesson; or \
@@ -1874,16 +4976,17 @@ private extension SystemAppleCourseAgentRuntime {
     static func runtimePrompt(
         for learnerPrompt: String,
         providerID _: String,
-        toolMode: AppleCourseToolMode
+        toolMode: AppleCourseToolMode,
+        planningProfile: AppleCoursePlanningProfile = .full,
+        planningContract: AppleCoursePlanningSchemaContract? = nil
     ) -> String {
         switch toolMode {
         case .planning:
-            return """
-            \(learnerPrompt)
-
-            If ready to propose or revise the plan, call present_course_plan. Otherwise answer \
-            normally.
-            """
+            return AppleCoursePlanningPromptPolicy.runtimePrompt(
+                for: learnerPrompt,
+                profile: planningProfile,
+                contract: planningContract
+            )
         case .editing:
             return learnerPrompt
         case .generatingLesson, .appendingLesson:
@@ -1899,12 +5002,17 @@ private extension SystemAppleCourseAgentRuntime {
 }
 
 @available(iOS 26.0, *)
-private actor AppleCourseLessonWriteGate {
+actor AppleCourseLessonWriteGate {
     private var completed: [String: String] = [:]
     private var inFlight: [String: Task<String, Error>] = [:]
 
+    func beginTurn() {
+        completed.removeAll()
+    }
+
     func perform(
         key: String,
+        shouldCache: @escaping @Sendable (String) -> Bool,
         operation: @escaping @Sendable () async throws -> String
     ) async throws -> String {
         if let result = completed[key] {
@@ -1918,7 +5026,9 @@ private actor AppleCourseLessonWriteGate {
         do {
             let result = try await task.value
             inFlight[key] = nil
-            completed[key] = result
+            if shouldCache(result) {
+                completed[key] = result
+            }
             return result
         } catch {
             inFlight[key] = nil
@@ -1927,121 +5037,404 @@ private actor AppleCourseLessonWriteGate {
     }
 }
 
+enum AppleCourseLessonToolResultPolicy {
+    static func isAccepted(_ result: String) -> Bool {
+        guard let object = (try? JSONSerialization.jsonObject(
+            with: Data(result.utf8)
+        )) as? [String: Any] else {
+            return false
+        }
+        return object["accepted"] as? Bool == true
+    }
+}
+
 @available(iOS 26.0, *)
-private enum AppleCourseToolFactory {
+struct AppleCourseLessonWriteBoundary {
+    let writeGate: AppleCourseLessonWriteGate
+
+    init(writeGate: AppleCourseLessonWriteGate = AppleCourseLessonWriteGate()) {
+        self.writeGate = writeGate
+    }
+
+    func invoke(
+        key: String,
+        onMutationAttempt: @escaping @MainActor @Sendable () -> Void,
+        onMutationCompletion: @escaping @MainActor @Sendable () -> Void,
+        write: @escaping @Sendable () async throws -> String
+    ) async throws -> String {
+        try await writeGate.perform(
+            key: key,
+            shouldCache: { AppleCourseLessonToolResultPolicy.isAccepted($0) }
+        ) {
+            await onMutationAttempt()
+            let result = try await write()
+            if AppleCourseLessonToolResultPolicy.isAccepted(result) {
+                await onMutationCompletion()
+            }
+            return result
+        }
+    }
+}
+
+@available(iOS 26.0, *)
+struct AppleCourseLessonValidationBoundary {
+    let validationRetryGate: AppleCourseLessonValidationRetryGate
+    let writeGate: AppleCourseLessonWriteGate
+
+    init(
+        validationRetryGate: AppleCourseLessonValidationRetryGate,
+        writeGate: AppleCourseLessonWriteGate = AppleCourseLessonWriteGate()
+    ) {
+        self.validationRetryGate = validationRetryGate
+        self.writeGate = writeGate
+    }
+
+    func invoke(
+        content: AppleCourseGeneratedLessonContent,
+        binding: AppleCourseLessonValidationBinding,
+        targetKey: String,
+        onMutationAttempt: @escaping @MainActor @Sendable () -> Void,
+        onMutationCompletion: @escaping @MainActor @Sendable () -> Void,
+        write: @escaping @Sendable (AppleCourseLessonValidationContext) async throws -> String
+    ) async throws -> String {
+        let context: AppleCourseLessonValidationContext
+        switch binding {
+        case .bound(let boundContext):
+            context = boundContext
+        case .rejected(let issue):
+            return try rejection(
+                "\(issue) No course content was changed. Start a fresh request from the current approved course."
+            )
+        }
+        if let issue = AppleCourseGeneratedLessonValidator.issue(
+            in: content,
+            exampleKind: context.exampleKind,
+            semanticRequirement: context.semanticRequirement
+        ) {
+            switch await validationRetryGate.recordFailure(for: targetKey) {
+            case .retry:
+                let correction: String
+                if context.semanticRequirement == .declaresSwiftActor {
+                    correction = "The corrected snippet must include a real declaration using `actor TypeName { ... }`; `struct Actor` or an actor mention in prose, comments, strings, or a regex is not sufficient."
+                } else {
+                    correction = "The corrected snippet must be structurally self-contained and declare every custom type it uses."
+                }
+                return try rejection(
+                    """
+                    The runnable Swift example was rejected before any course content was changed: \
+                    \(issue). Correct the example and call learnfold_generate_lesson exactly once \
+                    more. \(correction)
+                    """
+                )
+            case .stop:
+                throw AppleCourseAgentError.toolFailed(
+                    """
+                    The on-device model could not produce a structurally self-contained Swift \
+                    example after one correction. No course content was changed. Try generating \
+                    the lesson again.
+                    """
+                )
+            }
+        }
+
+        guard await validationRetryGate.acceptValid(for: targetKey) else {
+            throw AppleCourseAgentError.toolFailed(
+                """
+                This learner turn already exhausted its Swift correction attempt. No course \
+                content was changed. Start a new lesson-generation turn to try again.
+                """
+            )
+        }
+        return try await writeGate.perform(
+            key: "generate|\(targetKey)",
+            shouldCache: { AppleCourseLessonToolResultPolicy.isAccepted($0) }
+        ) {
+            await onMutationAttempt()
+            let result = try await write(context)
+            if AppleCourseLessonToolResultPolicy.isAccepted(result) {
+                await onMutationCompletion()
+                _ = await validationRetryGate.acceptValid(for: targetKey)
+            }
+            return result
+        }
+    }
+
+    private func rejection(_ message: String) throws -> String {
+        let payload: [String: Any] = [
+            "accepted": false,
+            "message": message,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+enum AppleCourseToolSpecificationPolicy {
+    private static let fullPresentCoursePlanDescription = """
+    Present one complete structure_version 2 plan. New plans use revision 1; a revision reuses \
+    plan_id and unchanged node IDs. chapters is ordered; each chapter owns its ordered children. \
+    Nesting defines parentage and order; never emit parent_id, order, or duplicate roots. IDs are \
+    unique and stable. deliverables are learner outcomes. Do not print the plan or write lessons \
+    before approval.
+    """
+
+    static var presentCoursePlanDescription: String {
+        presentCoursePlanDescription(profile: .full)
+    }
+
+    static func presentCoursePlanDescription(
+        profile: AppleCoursePlanningProfile,
+        contract suppliedContract: AppleCoursePlanningSchemaContract? = nil
+    ) -> String {
+        let contract = suppliedContract
+            ?? AppleCoursePlanningSchemaContract(profile: profile)
+        let shapeDescription: String
+        if let exactTotalNodes = contract.exactTotalNodes {
+            shapeDescription = """
+            Return exactly \(exactTotalNodes) total pages; do not drop or reparent nodes.
+            """
+        } else if contract.minimumTotalNodes > 2 {
+            shapeDescription = """
+            Return at least \(contract.minimumTotalNodes) and at most \
+            \(contract.maximumTotalNodes) total pages.
+            """
+        } else {
+            shapeDescription = """
+            Never exceed \(contract.maximumTotalNodes) total pages.
+            """
+        }
+        return "\(shapeDescription) \(fullPresentCoursePlanDescription)"
+    }
+}
+
+@available(iOS 26.0, *)
+enum AppleCourseToolFactory {
     static func tools(
         providerID _: String,
         workspaceID: String,
         mode: AppleCourseToolMode,
-        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void,
+        planningProfile: AppleCoursePlanningProfile = .full,
+        planningContract suppliedPlanningContract: AppleCoursePlanningSchemaContract? = nil,
+        lessonTarget: PreparedCourseLessonTarget? = nil,
+        planningAttemptGate: AppleCoursePlanningAttemptGate = AppleCoursePlanningAttemptGate(),
+        lessonValidationRetryGate: AppleCourseLessonValidationRetryGate,
+        lessonWriteGate: AppleCourseLessonWriteGate = AppleCourseLessonWriteGate(),
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void,
         onEditorMutationAttempt: @escaping @MainActor @Sendable () -> Void = {},
         onEditorMutationCompletion: @escaping @MainActor @Sendable () -> Void = {}
     ) throws -> [any Tool] {
-        let planSpec = try presentCoursePlanSpec()
-        let lessonWriteGate = AppleCourseLessonWriteGate()
+        let planningContract = suppliedPlanningContract
+            ?? AppleCoursePlanningSchemaContract(profile: planningProfile)
+        guard planningContract.profile == planningProfile else {
+            throw AppleCourseAgentError.toolFailed(
+                "Learnfold could not construct a consistent Apple On-Device planning shape."
+            )
+        }
+        let planSpec = try presentCoursePlanSpec(
+            profile: planningProfile,
+            contract: planningContract
+        )
+        let lessonValidationBoundary = AppleCourseLessonValidationBoundary(
+            validationRetryGate: lessonValidationRetryGate,
+            writeGate: lessonWriteGate
+        )
         var tools: [any Tool] = []
-        if mode == .planning || mode == .full {
+        if mode.exposesPlanningTool {
             tools.append(try AppleDynamicCourseTool(spec: planSpec) { generatedJSON in
-                let brief: CourseBrief
-                do {
-                    brief = try JSONDecoder().decode(
-                        CourseBrief.self,
-                        from: Data(generatedJSON.utf8)
-                    )
-                } catch {
-                    return try rejection(
-                        """
-                        The generated plan did not match the tool schema. Call \
-                        present_course_plan again with every typed plan field. Do not print the \
-                        plan in chat.
-                        """
-                    )
-                }
-                return try await present(
-                    brief,
-                    retryToolName: CourseAgentTools.presentPlan,
+                try await invokeCoursePlan(
+                    generatedJSON: generatedJSON,
+                    workspaceID: workspaceID,
+                    profile: planningProfile,
+                    contract: planningContract,
+                    planningAttemptGate: planningAttemptGate,
                     onCoursePlan: onCoursePlan
                 )
             })
         }
         if mode == .editing || mode == .generatingLesson || mode == .full {
-            tools.append(try AppleDynamicCourseTool(spec: try generateLessonSpec()) { generatedJSON in
+            let schemaExampleKind = AppleCourseApprovalPolicy.approvedPlan(
+                courseDirectory: courseDirectory(workspaceID: workspaceID)
+            ).map { brief in
+                CourseLessonExamplePolicy.kind(for: brief)
+            } ?? .topicDemonstration
+            tools.append(try AppleDynamicCourseTool(
+                spec: try generateLessonSpec(exampleKind: schemaExampleKind)
+            ) { generatedJSON in
                 let generated = try JSONDecoder().decode(
-                    GeneratedLesson.self,
+                    AppleCourseGeneratedLessonContent.self,
                     from: Data(generatedJSON.utf8)
                 )
-                await onEditorMutationAttempt()
-                return try await lessonWriteGate.perform(key: "generate") {
-                    let validatedSwiftCode =
-                        AppleCourseGeneratedLessonValidator.validatedSwiftCode(
-                            generated.swiftCode
-                        )
-                    let result = try await executeLessonWrite(
+                let target = try resolvedLessonTarget(
+                    workspaceID: workspaceID,
+                    boundTarget: lessonTarget
+                )
+                let binding = AppleCourseLessonSemanticRequirementPolicy.binding(
+                    approvedPlan: AppleCourseApprovalPolicy.approvedPlan(
+                        courseDirectory: courseDirectory(workspaceID: workspaceID)
+                    ),
+                    target: target
+                )
+                let validationKey = lessonValidationKey(target: target)
+                return try await lessonValidationBoundary.invoke(
+                    content: generated,
+                    binding: binding,
+                    targetKey: validationKey,
+                    onMutationAttempt: onEditorMutationAttempt,
+                    onMutationCompletion: onEditorMutationCompletion
+                ) { validationContext in
+                    try await executeLessonWrite(
                         write: LessonWrite(
-                            markdown: """
-                            ## Explanation
-
-                            \(generated.explanation)
-
-                            ## Swift example
-
-                            ```swift
-                            \(validatedSwiftCode)
-                            ```
-
-                            ## Exercise
-
-                            \(generated.exercise)
-                            """,
+                            markdown: AppleCourseLessonContentPolicy.markdown(
+                                content: generated,
+                                exampleKind: validationContext.exampleKind
+                            ),
                             mode: "replace",
                             markGenerated: true
                         ),
-                        workspaceID: workspaceID
+                        workspaceID: workspaceID,
+                        target: target,
+                        requiresExactTarget: lessonTarget != nil
                     )
-                    await onEditorMutationCompletion()
-                    return result
                 }
             })
         }
         if mode == .editing || mode == .appendingLesson || mode == .full {
             tools.append(try AppleDynamicCourseTool(spec: try appendLessonSectionSpec()) {
                 generatedJSON in
-                await onEditorMutationAttempt()
-                return try await lessonWriteGate.perform(key: "append") {
-                    let generated = try JSONDecoder().decode(
-                        GeneratedLessonSection.self,
-                        from: Data(generatedJSON.utf8)
-                    )
-                    let result = try await executeLessonWrite(
-                        write: LessonWrite(
-                            markdown: """
-                            ## \(generated.heading)
-
-                            \(generated.body)
-                            """,
-                            mode: "append",
-                            markGenerated: false
-                        ),
-                        workspaceID: workspaceID
-                    )
-                    await onEditorMutationCompletion()
-                    return result
-                }
+                let generated = try JSONDecoder().decode(
+                    GeneratedLessonSection.self,
+                    from: Data(generatedJSON.utf8)
+                )
+                let target = try resolvedLessonTarget(
+                    workspaceID: workspaceID,
+                    boundTarget: lessonTarget
+                )
+                return try await appendLessonSection(
+                    heading: generated.heading,
+                    body: generated.body,
+                    workspaceID: workspaceID,
+                    target: target,
+                    requiresExactTarget: lessonTarget != nil,
+                    writeGate: lessonWriteGate,
+                    onMutationAttempt: onEditorMutationAttempt,
+                    onMutationCompletion: onEditorMutationCompletion
+                )
             })
         }
         return tools
     }
 
-    private struct GeneratedLesson: Decodable {
-        let explanation: String
-        let swiftCode: String
-        let exercise: String
-
-        enum CodingKeys: String, CodingKey {
-            case explanation
-            case swiftCode = "swift_code"
-            case exercise
+    static func invokeCoursePlan(
+        generatedJSON: String,
+        workspaceID: String,
+        profile: AppleCoursePlanningProfile,
+        contract: AppleCoursePlanningSchemaContract,
+        planningAttemptGate: AppleCoursePlanningAttemptGate,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
+    ) async throws -> String {
+        guard await planningAttemptGate.claimAttempt() else {
+            let rejection = await planningAttemptGate.recordRejection(
+                stage: .repeatedAttempt,
+                diagnosticReason: AppleCoursePlanningAttemptPolicy.repeatedAttemptMessage
+            )
+            logRejectedTopology(
+                nil,
+                stage: rejection.stage,
+                profile: profile
+            )
+            throw AppleCourseAgentError.toolFailed(rejection.userMessage)
         }
+
+        let grouped: AppleCourseGroupedPlan
+        do {
+            grouped = try JSONDecoder().decode(
+                AppleCourseGroupedPlan.self,
+                from: Data(generatedJSON.utf8)
+            )
+        } catch {
+            let rejection = await planningAttemptGate.recordRejection(
+                stage: .decode,
+                diagnosticReason: error.localizedDescription
+            )
+            logRejectedTopology(nil, stage: rejection.stage, profile: profile)
+            throw AppleCourseAgentError.toolFailed(rejection.userMessage)
+        }
+        if let issue = profile.issue(in: grouped) {
+            let rejection = await planningAttemptGate.recordRejection(
+                stage: .profile,
+                diagnosticReason: issue
+            )
+            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile)
+            throw AppleCourseAgentError.toolFailed(rejection.userMessage)
+        }
+
+        let brief: CourseBrief
+        do {
+            brief = try AppleCourseGroupedPlanProjection.project(
+                grouped,
+                contract: contract
+            )
+        } catch {
+            let rejection = await planningAttemptGate.recordRejection(
+                stage: .projection,
+                diagnosticReason: error.localizedDescription
+            )
+            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile)
+            throw AppleCourseAgentError.toolFailed(rejection.userMessage)
+        }
+
+        do {
+            let result = try await present(
+                brief,
+                workspaceID: workspaceID,
+                onCoursePlan: onCoursePlan
+            )
+            logAcceptedTopology(grouped.topology, profile: profile)
+            return result
+        } catch let error as AppleCoursePlanTransitionError {
+            let rejection = await planningAttemptGate.recordRejection(
+                stage: .transition,
+                diagnosticReason: error.localizedDescription
+            )
+            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile)
+            throw AppleCourseAgentError.toolFailed(rejection.userMessage)
+        }
+    }
+
+    private static func logRejectedTopology(
+        _ topology: AppleCourseGroupedTopology?,
+        stage: AppleCoursePlanningRejectionStage,
+        profile: AppleCoursePlanningProfile
+    ) {
+        var fields = topology?.redactedLogFields ?? [
+            "topology_root_count": -1,
+            "topology_total_node_count": -1,
+            "topology_role_counts": "unavailable",
+            "topology_invalid_role_count": -1,
+            "topology_child_count_histogram": "unavailable",
+            "topology_maximum_direct_child_count": -1,
+        ]
+        fields["planning_profile"] = profile.rawValue
+        fields["rejection_stage"] = stage.rawValue
+        LLog.warn(
+            "AppleCourseAgent",
+            "course plan rejected before presentation",
+            fields: fields
+        )
+    }
+
+    private static func logAcceptedTopology(
+        _ topology: AppleCourseGroupedTopology,
+        profile: AppleCoursePlanningProfile
+    ) {
+        var fields = topology.redactedLogFields
+        fields["planning_profile"] = profile.rawValue
+        fields["rejection_stage"] = "none"
+        LLog.info(
+            "AppleCourseAgent",
+            "course plan topology accepted",
+            fields: fields
+        )
     }
 
     private struct GeneratedLessonSection: Decodable {
@@ -2055,9 +5448,44 @@ private enum AppleCourseToolFactory {
         let markGenerated: Bool
     }
 
+    static func appendLessonSection(
+        heading: String,
+        body: String,
+        workspaceID: String,
+        target: PreparedCourseLessonTarget,
+        requiresExactTarget: Bool,
+        writeGate: AppleCourseLessonWriteGate,
+        onMutationAttempt: @escaping @MainActor @Sendable () -> Void,
+        onMutationCompletion: @escaping @MainActor @Sendable () -> Void
+    ) async throws -> String {
+        let boundary = AppleCourseLessonWriteBoundary(writeGate: writeGate)
+        return try await boundary.invoke(
+            key: "append|\(lessonValidationKey(target: target))",
+            onMutationAttempt: onMutationAttempt,
+            onMutationCompletion: onMutationCompletion
+        ) {
+            try await executeLessonWrite(
+                write: LessonWrite(
+                    markdown: """
+                    ## \(heading)
+
+                    \(body)
+                    """,
+                    mode: "append",
+                    markGenerated: false
+                ),
+                workspaceID: workspaceID,
+                target: target,
+                requiresExactTarget: requiresExactTarget
+            )
+        }
+    }
+
     private static func executeLessonWrite(
         write: LessonWrite,
-        workspaceID: String
+        workspaceID: String,
+        target: PreparedCourseLessonTarget,
+        requiresExactTarget: Bool
     ) async throws -> String {
         guard AppleCourseApprovalPolicy.isLatestPlanApproved(
             courseDirectory: courseDirectory(workspaceID: workspaceID)
@@ -2066,11 +5494,6 @@ private enum AppleCourseToolFactory {
                 "Course changes are locked until the learner approves the latest plan. Do not retry."
             )
         }
-        let targetURL = courseDirectory(workspaceID: workspaceID)
-            .appendingPathComponent(".course", isDirectory: true)
-            .appendingPathComponent(AppleCourseApprovalPolicy.lessonTargetFilename)
-        let targetData = try Data(contentsOf: targetURL)
-        let target = try JSONDecoder().decode(PreparedCourseLessonTarget.self, from: targetData)
         let fetchResult = try await executeRawEditorAction(
             operation: "native-editor-fetch",
             arguments: ["id": target.pageID],
@@ -2080,6 +5503,16 @@ private enum AppleCourseToolFactory {
             throw AppleCourseAgentError.toolFailed(
                 "Learnfold could not fetch the current lesson revision."
             )
+        }
+        if requiresExactTarget {
+            guard fetchResult.pageID == target.pageID,
+                  fetchResult.courseNodeID == target.nodeID,
+                  target.courseRole == nil || fetchResult.courseRole == target.courseRole,
+                  expectedRevision == target.revision else {
+                return try rejection(
+                    "The selected course page changed or no longer matches the approved lesson. No course content was changed. Start a fresh request from the current selection."
+                )
+            }
         }
         let contentArguments: [String: Any]
         switch write.mode {
@@ -2117,13 +5550,20 @@ private enum AppleCourseToolFactory {
                 "The native editor omitted the updated lesson revision."
             )
         }
+        guard write.markGenerated else {
+            return try accepted(
+                """
+                Learnfold saved the lesson section successfully. Result: \(contentResult.text). Do \
+                not call another lesson-writing tool in this turn. Reply once with a brief \
+                confirmation.
+                """
+            )
+        }
         var properties: [String: Any] = [
             "course_node_id": target.nodeID,
             "course_role": target.courseRole ?? "lesson",
         ]
-        if write.markGenerated {
-            properties["generation_status"] = "generated"
-        }
+        properties["generation_status"] = "generated"
         let finalResult = try await executeRawEditorAction(
             operation: "native-editor-update-page",
             arguments: [
@@ -2151,6 +5591,9 @@ private enum AppleCourseToolFactory {
         let text: String
         let isError: Bool
         let revision: Int64?
+        let pageID: String?
+        let courseNodeID: String?
+        let courseRole: String?
     }
 
     private static func executeRawEditorAction(
@@ -2171,7 +5614,15 @@ private enum AppleCourseToolFactory {
         let text = String(decoding: data, as: UTF8.self)
         let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         let revision = (object?["revision"] as? NSNumber)?.int64Value
-        return RawEditorResult(text: text, isError: result.isError, revision: revision)
+        let courseMetadata = object?["course_metadata"] as? [String: Any]
+        return RawEditorResult(
+            text: text,
+            isError: result.isError,
+            revision: revision,
+            pageID: object?["id"] as? String,
+            courseNodeID: courseMetadata?["node_id"] as? String,
+            courseRole: courseMetadata?["role"] as? String
+        )
     }
 
     private static func execute(
@@ -2228,18 +5679,14 @@ private enum AppleCourseToolFactory {
 
     private static func present(
         _ brief: CourseBrief,
-        retryToolName: String,
-        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
+        workspaceID: String,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
     ) async throws -> String {
-        if let issue = AppleCoursePlanValidator.issue(in: brief) {
-            return try rejection(
-                """
-                The plan was not shown because \(issue). Correct the plan and call \
-                \(retryToolName) again. Do not print the plan in chat.
-                """
-            )
-        }
-        try await onCoursePlan(brief)
+        try await AppleCoursePlanPresentationBoundary.present(
+            brief,
+            courseDirectory: courseDirectory(workspaceID: workspaceID),
+            onCoursePlan: onCoursePlan
+        )
         return try accepted(
             """
             The plan was presented successfully and is now waiting for learner approval. Do not \
@@ -2258,53 +5705,43 @@ private enum AppleCourseToolFactory {
         return String(decoding: data, as: UTF8.self)
     }
 
-    private static func presentCoursePlanSpec() throws -> AppDynamicToolSpec {
+    private static func presentCoursePlanSpec(
+        profile: AppleCoursePlanningProfile,
+        contract: AppleCoursePlanningSchemaContract
+    ) throws -> AppDynamicToolSpec {
         let source = try CourseAgentTools.dynamicToolSpec()
         guard
             let plan = try JSONSerialization.jsonObject(
                 with: Data(source.inputSchemaJson.utf8)
-            ) as? [String: Any],
-            var properties = plan["properties"] as? [String: Any],
-            var chapters = properties["chapters"] as? [String: Any]
+            ) as? [String: Any]
         else {
             throw AppleCourseAgentError.toolFailed(
                 "Learnfold could not construct the Apple On-Device course tool schema."
             )
         }
-        chapters["minItems"] = 1
-        chapters["maxItems"] = 8
-        chapters["description"] = """
-        Use exactly the chapter count requested by the learner; otherwise create 3 to 8 focused \
-        chapters. Never add placeholder chapters.
-        """
-        if
-            var chapter = chapters["items"] as? [String: Any],
-            var chapterProperties = chapter["properties"] as? [String: Any],
-            var deliverables = chapterProperties["deliverables"] as? [String: Any]
-        {
-            deliverables["minItems"] = 1
-            deliverables["maxItems"] = 6
-            chapterProperties["deliverables"] = deliverables
-            chapter["properties"] = chapterProperties
-            chapters["items"] = chapter
-        }
-        properties["chapters"] = chapters
-        var root = plan
-        root["properties"] = properties
-        let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+        let compactRoot = try AppleCoursePlanningSchemaPolicy.planningInputSchema(
+            from: plan,
+            profile: profile,
+            contract: contract
+        )
+        let data = try JSONSerialization.data(
+            withJSONObject: compactRoot,
+            options: [.sortedKeys]
+        )
         return AppDynamicToolSpec(
             name: source.name,
-            description: """
-            Present the complete typed course plan in Learnfold's approval card. Use exactly the \
-            requested chapter count, fill every field, do not print the plan in chat, and wait \
-            for learner approval before calling learnfold_editor_action.
-            """,
+            description: AppleCourseToolSpecificationPolicy.presentCoursePlanDescription(
+                profile: profile,
+                contract: contract
+            ),
             inputSchemaJson: String(decoding: data, as: UTF8.self),
             deferLoading: false
         )
     }
 
-    private static func generateLessonSpec() throws -> AppDynamicToolSpec {
+    private static func generateLessonSpec(
+        exampleKind: CourseLessonExampleKind
+    ) throws -> AppDynamicToolSpec {
         let root: [String: Any] = [
             "type": "object",
             "additionalProperties": false,
@@ -2313,9 +5750,12 @@ private enum AppleCourseToolFactory {
                     "type": "string",
                     "description": "Concise beginner explanation of the lesson concept.",
                 ],
-                "swift_code": [
+                "example": [
                     "type": "string",
-                    "description": "Small compiling Swift example without Markdown fences.",
+                    "minLength": 1,
+                    "description": AppleCourseLessonContentPolicy.exampleSchemaDescription(
+                        for: exampleKind
+                    ),
                 ],
                 "exercise": [
                     "type": "string",
@@ -2324,7 +5764,7 @@ private enum AppleCourseToolFactory {
             ],
             "required": [
                 "explanation",
-                "swift_code",
+                "example",
                 "exercise",
             ],
         ]
@@ -2333,7 +5773,8 @@ private enum AppleCourseToolFactory {
             name: "learnfold_generate_lesson",
             description: """
             Generate the approved current lesson. Learnfold formats and saves the fields through \
-            its revision-safe native editor. Call exactly once.
+            its revision-safe native editor. Call once. Only when Learnfold rejects a runnable \
+            example before writing may you correct it and call exactly once more.
             """,
             inputSchemaJson: String(decoding: data, as: UTF8.self),
             deferLoading: false
@@ -2387,6 +5828,26 @@ private enum AppleCourseToolFactory {
             .appendingPathComponent("Courses", isDirectory: true)
             .appendingPathComponent(workspaceID, isDirectory: true)
     }
+
+    private static func resolvedLessonTarget(
+        workspaceID: String,
+        boundTarget: PreparedCourseLessonTarget?
+    ) throws -> PreparedCourseLessonTarget {
+        if let boundTarget {
+            return boundTarget
+        }
+        let targetURL = courseDirectory(workspaceID: workspaceID)
+            .appendingPathComponent(".course", isDirectory: true)
+            .appendingPathComponent(AppleCourseApprovalPolicy.lessonTargetFilename)
+        return try JSONDecoder().decode(
+            PreparedCourseLessonTarget.self,
+            from: Data(contentsOf: targetURL)
+        )
+    }
+
+    private static func lessonValidationKey(target: PreparedCourseLessonTarget) -> String {
+        return "\(target.nodeID)|\(target.pageID)|\(target.revision)"
+    }
 }
 
 @available(iOS 26.0, *)
@@ -2407,7 +5868,6 @@ private struct AppleDynamicCourseTool: Tool {
         name = spec.name.replacingOccurrences(of: "-", with: "_")
         description = spec.description
         parameters = try Self.generationSchema(
-            name: spec.name,
             schemaJSON: spec.inputSchemaJson
         )
         self.handler = handler
@@ -2417,22 +5877,137 @@ private struct AppleDynamicCourseTool: Tool {
         try await handler(arguments.jsonString)
     }
 
-    private static func generationSchema(name: String, schemaJSON: String) throws -> GenerationSchema {
+    private static func generationSchema(schemaJSON: String) throws -> GenerationSchema {
         let object = try JSONSerialization.jsonObject(with: Data(schemaJSON.utf8))
         guard let schema = object as? [String: Any] else {
             throw CocoaError(.coderInvalidValue)
         }
-        let root = try dynamicSchema(name: name.replacingOccurrences(of: "-", with: "_"), schema: schema)
-        return try GenerationSchema(root: root, dependencies: [])
+        var objectSchemaCounts: [String: Int] = [:]
+        var objectSchemasBySignature: [String: [String: Any]] = [:]
+        try collectObjectSchemas(
+            in: schema,
+            counts: &objectSchemaCounts,
+            schemasBySignature: &objectSchemasBySignature
+        )
+        let repeatedSignatures = objectSchemaCounts
+            .filter { $0.value > 1 }
+            .map(\.key)
+            .sorted()
+        let referenceNames = Dictionary(uniqueKeysWithValues:
+            repeatedSignatures.enumerated().map { index, signature in
+                (signature, "d\(index)")
+            }
+        )
+        var nextSchemaID = 0
+        let dependencies = try repeatedSignatures.map { signature in
+            guard
+                let dependencySchema = objectSchemasBySignature[signature],
+                let dependencyName = referenceNames[signature]
+            else {
+                throw CocoaError(.coderInvalidValue)
+            }
+            return try dynamicSchema(
+                schema: dependencySchema,
+                nextSchemaID: &nextSchemaID,
+                referenceNames: referenceNames,
+                definingSignature: signature,
+                forcedName: dependencyName
+            )
+        }
+        let root = try dynamicSchema(
+            schema: schema,
+            nextSchemaID: &nextSchemaID,
+            referenceNames: referenceNames
+        )
+        return try GenerationSchema(root: root, dependencies: dependencies)
+    }
+
+    private static func collectObjectSchemas(
+        in schema: [String: Any],
+        counts: inout [String: Int],
+        schemasBySignature: inout [String: [String: Any]]
+    ) throws {
+        if schema["type"] as? String == "object" {
+            let signature = try schemaSignature(schema)
+            counts[signature, default: 0] += 1
+            schemasBySignature[signature] = schema
+        }
+        if let properties = schema["properties"] as? [String: [String: Any]] {
+            for child in properties.values {
+                try collectObjectSchemas(
+                    in: child,
+                    counts: &counts,
+                    schemasBySignature: &schemasBySignature
+                )
+            }
+        }
+        if let item = schema["items"] as? [String: Any] {
+            try collectObjectSchemas(
+                in: item,
+                counts: &counts,
+                schemasBySignature: &schemasBySignature
+            )
+        }
+        if let choices = schema["anyOf"] as? [[String: Any]] {
+            for choice in choices {
+                try collectObjectSchemas(
+                    in: choice,
+                    counts: &counts,
+                    schemasBySignature: &schemasBySignature
+                )
+            }
+        }
+    }
+
+    private static func schemaSignature(_ schema: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(
+            withJSONObject: schema,
+            options: [.sortedKeys]
+        )
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func dynamicSchema(
-        name: String,
-        schema: [String: Any]
+        schema: [String: Any],
+        nextSchemaID: inout Int,
+        referenceNames: [String: String],
+        definingSignature: String? = nil,
+        forcedName: String? = nil
     ) throws -> DynamicGenerationSchema {
+        if schema["type"] as? String == "object" {
+            let signature = try schemaSignature(schema)
+            if signature != definingSignature,
+               let referenceName = referenceNames[signature] {
+                return DynamicGenerationSchema(referenceTo: referenceName)
+            }
+        }
+        let generatedSchemaName = "s\(nextSchemaID)"
+        nextSchemaID += 1
+        let schemaName = forcedName ?? generatedSchemaName
+        if let rawChoices = schema["anyOf"] as? [Any] {
+            let choices = try rawChoices.map { choice -> DynamicGenerationSchema in
+                guard let choiceSchema = choice as? [String: Any] else {
+                    throw CocoaError(.coderInvalidValue)
+                }
+                return try dynamicSchema(
+                    schema: choiceSchema,
+                    nextSchemaID: &nextSchemaID,
+                    referenceNames: referenceNames,
+                    definingSignature: definingSignature
+                )
+            }
+            guard !choices.isEmpty else {
+                throw CocoaError(.coderInvalidValue)
+            }
+            return DynamicGenerationSchema(
+                name: "\(schemaName)u",
+                description: schema["description"] as? String,
+                anyOf: choices
+            )
+        }
         if let choices = schema["enum"] as? [String] {
             return DynamicGenerationSchema(
-                name: "\(name)_choice",
+                name: "\(schemaName)c",
                 description: schema["description"] as? String,
                 anyOf: choices
             )
@@ -2442,7 +6017,7 @@ private struct AppleDynamicCourseTool: Tool {
             let properties = schema["properties"] as? [String: [String: Any]] ?? [:]
             let required = Set(schema["required"] as? [String] ?? [])
             return DynamicGenerationSchema(
-                name: name,
+                name: schemaName,
                 description: schema["description"] as? String,
                 properties: try AppleCourseGenerationSchemaOrdering
                     .orderedKeys(in: properties)
@@ -2450,7 +6025,12 @@ private struct AppleDynamicCourseTool: Tool {
                     DynamicGenerationSchema.Property(
                         name: key,
                         description: properties[key]?["description"] as? String,
-                        schema: try dynamicSchema(name: "\(name)_\(key)", schema: properties[key] ?? [:]),
+                        schema: try dynamicSchema(
+                            schema: properties[key] ?? [:],
+                            nextSchemaID: &nextSchemaID,
+                            referenceNames: referenceNames,
+                            definingSignature: definingSignature
+                        ),
                         isOptional: !required.contains(key)
                     )
                 }
@@ -2458,7 +6038,12 @@ private struct AppleDynamicCourseTool: Tool {
         case "array":
             let item = schema["items"] as? [String: Any] ?? ["type": "string"]
             return DynamicGenerationSchema(
-                arrayOf: try dynamicSchema(name: "\(name)_item", schema: item),
+                arrayOf: try dynamicSchema(
+                    schema: item,
+                    nextSchemaID: &nextSchemaID,
+                    referenceNames: referenceNames,
+                    definingSignature: definingSignature
+                ),
                 minimumElements: schema["minItems"] as? Int,
                 maximumElements: schema["maxItems"] as? Int
             )

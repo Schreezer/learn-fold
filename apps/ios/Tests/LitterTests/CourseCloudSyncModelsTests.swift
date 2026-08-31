@@ -4,6 +4,27 @@ import XCTest
 @testable import Litter
 
 final class CourseCloudSyncModelsTests: XCTestCase {
+    func testCourseCloudRuntimeCapabilityMatchesBuildTarget() {
+        #if targetEnvironment(simulator)
+        XCTAssertFalse(CourseCloudEntitlement.isRuntimeCloudKitAvailable)
+        #else
+        XCTAssertTrue(CourseCloudEntitlement.isRuntimeCloudKitAvailable)
+        #endif
+    }
+
+    func testCourseCloudSimulatorStartupStopsBeforeCloudKitConstruction() async throws {
+        #if targetEnvironment(simulator)
+        let engine = CourseCloudSyncEngine()
+
+        await engine.startIfAvailable()
+
+        let availability = await engine.availability
+        XCTAssertEqual(availability, .missingEntitlement)
+        #else
+        throw XCTSkip("This regression only verifies the Simulator CloudKit guard.")
+        #endif
+    }
+
     func testDottedVectorDistinguishesCausalityFromConcurrency() {
         var first = CourseSyncVersionVector()
         let firstDot = first.nextDot(replicaID: "iphone")

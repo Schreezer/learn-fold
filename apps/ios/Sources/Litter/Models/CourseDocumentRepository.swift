@@ -15,6 +15,39 @@ private enum CourseDocumentRecoveryError: LocalizedError {
     }
 }
 
+#if DEBUG
+enum CourseDocumentDebugFlushError: LocalizedError {
+    case simulatedFailure
+
+    var errorDescription: String? {
+        "Simulated course-page save failure. Your changes are still pending."
+    }
+}
+
+private enum CourseDocumentDebugFixtureError: LocalizedError {
+    case databaseMustBeTemporary
+    case fixtureRootMustMatchRunToken
+    case databaseMustBeInsideFixtureRoot
+    case persistedDatabaseMissing
+    case persistedWorkspaceMissing
+
+    var errorDescription: String? {
+        switch self {
+        case .databaseMustBeTemporary:
+            "Debug course fixtures must use an explicit directory inside the process temporary root."
+        case .fixtureRootMustMatchRunToken:
+            "The debug course fixture root did not match its canonical per-run token."
+        case .databaseMustBeInsideFixtureRoot:
+            "The debug course database must be contained by its exact per-run fixture root."
+        case .persistedDatabaseMissing:
+            "The persisted debug course database was missing; reopening must not create or reseed it."
+        case .persistedWorkspaceMissing:
+            "The persisted debug course database did not contain a course workspace; reopening must not seed a replacement."
+        }
+    }
+}
+#endif
+
 struct CourseDocumentChange: Sendable {
     let pageID: String?
     let sequence: Int
@@ -87,6 +120,7 @@ actor CourseDocumentRepository {
     private let courseRoot: URL
     private let pendingEditsURL: URL
     private let autosaveDelay: Duration
+    private let schedulesCloudSync: Bool
     private var pendingUserEdits: [String: PendingUserEdit] = [:]
     private var pendingSaveTask: Task<Void, Never>?
     private var activeFlush: ActiveFlush?
@@ -95,6 +129,10 @@ actor CourseDocumentRepository {
     private var asyncTaskMonitors: [String: Task<Void, Never>] = [:]
     private var continuations: [UUID: AsyncStream<CourseDocumentChange>.Continuation] = [:]
     private var changeSequence = 0
+#if DEBUG
+    private var debugFlushFailures: [Duration] = []
+    private var debugSuccessfulFlushDelays: [Duration] = []
+#endif
 
     private init(
         workspaceID: String,
@@ -102,6 +140,7 @@ actor CourseDocumentRepository {
         courseRoot: URL,
         pendingEditsURL: URL,
         autosaveDelay: Duration,
+        schedulesCloudSync: Bool,
         recoveredUserEdits: [String: PendingUserEdit]
     ) {
         self.workspaceID = workspaceID
@@ -109,6 +148,7 @@ actor CourseDocumentRepository {
         self.courseRoot = courseRoot
         self.pendingEditsURL = pendingEditsURL
         self.autosaveDelay = autosaveDelay
+        self.schedulesCloudSync = schedulesCloudSync
         pendingUserEdits = recoveredUserEdits
     }
 
@@ -144,6 +184,7 @@ actor CourseDocumentRepository {
             courseRoot: courseRoot,
             pendingEditsURL: pendingEditsURL,
             autosaveDelay: autosaveDelay,
+            schedulesCloudSync: true,
             recoveredUserEdits: recoveredUserEdits
         )
         if !recoveredUserEdits.isEmpty {
@@ -156,6 +197,122 @@ actor CourseDocumentRepository {
         }
         return repository
     }
+
+#if DEBUG
+    /// Opens a deterministic, caller-supplied workspace for Debug-only UI
+    /// checkpoints. The boundary is intentionally temporary-directory-only so
+    /// a fixture can never seed or replace a learner's real course database.
+    static func openDebugFixture(
+        workspaceID: String,
+        databaseURL: URL,
+        fixtureRootURL: URL,
+        runToken: String,
+        workspace: PageWorkspace,
+        autosaveDelay: Duration = .seconds(60)
+    ) async throws -> CourseDocumentRepository {
+        let resolvedDatabaseURL = try validateDebugFixtureBoundary(
+            databaseURL: databaseURL,
+            fixtureRootURL: fixtureRootURL,
+            runToken: runToken
+        )
+
+        try workspace.validate()
+        try FileManager.default.createDirectory(
+            at: resolvedDatabaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let service = try await NativeEditorMCPService.open(
+            databaseURL: resolvedDatabaseURL,
+            seedWorkspace: workspace
+        )
+        let pendingEditsURL = resolvedDatabaseURL.deletingLastPathComponent()
+            .appendingPathComponent("pending-user-edits.json")
+        return CourseDocumentRepository(
+            workspaceID: workspaceID,
+            service: service,
+            courseRoot: resolvedDatabaseURL.deletingLastPathComponent().deletingLastPathComponent(),
+            pendingEditsURL: pendingEditsURL,
+            autosaveDelay: autosaveDelay,
+            schedulesCloudSync: false,
+            recoveredUserEdits: try loadPendingUserEdits(from: pendingEditsURL)
+        )
+    }
+
+    /// Recreates the Debug-only repository around an existing SQLite database.
+    /// This path fails before `NativeEditorMCPService.open` when persistence is
+    /// absent, preventing its normal empty-database fallback from manufacturing
+    /// a replacement workspace during a relaunch checkpoint.
+    static func reopenDebugFixture(
+        workspaceID: String,
+        databaseURL: URL,
+        fixtureRootURL: URL,
+        runToken: String,
+        autosaveDelay: Duration = .seconds(60)
+    ) async throws -> CourseDocumentRepository {
+        let resolvedDatabaseURL = try validateDebugFixtureBoundary(
+            databaseURL: databaseURL,
+            fixtureRootURL: fixtureRootURL,
+            runToken: runToken
+        )
+        guard FileManager.default.fileExists(atPath: resolvedDatabaseURL.path) else {
+            throw CourseDocumentDebugFixtureError.persistedDatabaseMissing
+        }
+
+        let preflightStore = try SQLiteLibraryStore(url: resolvedDatabaseURL)
+        guard let persisted = try await preflightStore.load() else {
+            throw CourseDocumentDebugFixtureError.persistedWorkspaceMissing
+        }
+        try persisted.workspace.validate()
+
+        let service = try await NativeEditorMCPService.open(
+            databaseURL: resolvedDatabaseURL,
+            seedWorkspace: nil
+        )
+        let pendingEditsURL = resolvedDatabaseURL.deletingLastPathComponent()
+            .appendingPathComponent("pending-user-edits.json")
+        return CourseDocumentRepository(
+            workspaceID: workspaceID,
+            service: service,
+            courseRoot: resolvedDatabaseURL.deletingLastPathComponent().deletingLastPathComponent(),
+            pendingEditsURL: pendingEditsURL,
+            autosaveDelay: autosaveDelay,
+            schedulesCloudSync: false,
+            recoveredUserEdits: try loadPendingUserEdits(from: pendingEditsURL)
+        )
+    }
+
+    private static func validateDebugFixtureBoundary(
+        databaseURL: URL,
+        fixtureRootURL: URL,
+        runToken: String
+    ) throws -> URL {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let resolvedFixtureRoot = fixtureRootURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let fixtureBase = resolvedFixtureRoot.deletingLastPathComponent()
+        guard fixtureBase.deletingLastPathComponent().path == temporaryRoot.path else {
+            throw CourseDocumentDebugFixtureError.databaseMustBeTemporary
+        }
+        guard resolvedFixtureRoot.lastPathComponent == runToken,
+              UUID(uuidString: runToken)?.uuidString.lowercased() == runToken else {
+            throw CourseDocumentDebugFixtureError.fixtureRootMustMatchRunToken
+        }
+
+        let resolvedDatabaseURL = databaseURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let fixturePrefix = resolvedFixtureRoot.path.hasSuffix("/")
+            ? resolvedFixtureRoot.path
+            : resolvedFixtureRoot.path + "/"
+        guard resolvedDatabaseURL.path.hasPrefix(fixturePrefix) else {
+            throw CourseDocumentDebugFixtureError.databaseMustBeInsideFixtureRoot
+        }
+        return resolvedDatabaseURL
+    }
+#endif
 
     func rootPageSnapshot() async throws -> NativeEditorPageSnapshot {
         try await flushPendingUserEdits()
@@ -170,6 +327,49 @@ actor CourseDocumentRepository {
     func workspaceSnapshot() async throws -> PageWorkspace {
         try await flushPendingUserEdits()
         return try await service.workspaceSnapshot()
+    }
+
+    func workspaceSnapshotWithGeneration() async throws -> NativeEditorWorkspaceSnapshot {
+        try await flushPendingUserEdits()
+        return try await service.workspaceSnapshotWithGeneration()
+    }
+
+    /// Installs a fully staged, approved course workspace in one SQLite CAS.
+    /// A concurrent editor, native tool, or cloud writer advances the shared
+    /// generation and makes this call fail without exposing any staged pages.
+    func replaceApprovedWorkspace(
+        _ replacement: PageWorkspace,
+        expectedGeneration: Int64
+    ) async throws {
+        try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(
+            workspaceID: workspaceID
+        ) {
+            try await self.replaceApprovedWorkspaceWhileHoldingSecurityGate(
+                replacement,
+                expectedGeneration: expectedGeneration
+            )
+        }
+    }
+
+    /// The workspace gate remains held while this actor performs the commit,
+    /// publishes its replacement, and queues CloudKit reconciliation.
+    private func replaceApprovedWorkspaceWhileHoldingSecurityGate(
+        _ replacement: PageWorkspace,
+        expectedGeneration: Int64
+    ) async throws {
+        try await flushPendingUserEdits()
+        guard AppleCourseApprovalPolicy.isLatestPlanApproved(courseDirectory: courseRoot) else {
+            throw AppleCourseAgentError.toolFailed(
+                "The latest presented course plan has not been approved. Wait for explicit learner approval before changing native pages."
+            )
+        }
+        try await service.replaceWorkspace(
+            replacement,
+            expectedGeneration: expectedGeneration
+        )
+        latestSnapshots.removeAll()
+        publish(pageID: nil, replacesDocument: true)
+        scheduleCloudSync()
     }
 
     func exportSyncSnapshot(
@@ -208,62 +408,73 @@ actor CourseDocumentRepository {
             throw CourseCloudSyncRepositoryError.workspaceMismatch
         }
         try await flushPendingUserEdits()
-        let localSnapshot = try CourseSyncWorkspaceSnapshot(
-            workspaceID: workspaceID,
-            workspace: try await service.workspaceSnapshot(),
-            generationID: "local-comparison"
-        )
-
-        if localSnapshot.checksum == remoteSnapshot.checksum {
-            return CourseSyncRemoteApplyResult(
-                changedPageIDs: [],
-                resultingChecksum: localSnapshot.checksum
+        for attempt in 0..<4 {
+            let versionedWorkspace = try await service.workspaceSnapshotWithGeneration()
+            let localSnapshot = try CourseSyncWorkspaceSnapshot(
+                workspaceID: workspaceID,
+                workspace: versionedWorkspace.workspace,
+                generationID: "local-comparison"
             )
-        }
-        if remoteSnapshot.checksum == baseSnapshot.checksum {
-            return CourseSyncRemoteApplyResult(
-                changedPageIDs: [],
-                resultingChecksum: localSnapshot.checksum
-            )
-        }
 
-        let merged: PageWorkspace
-        if localSnapshot.checksum == baseSnapshot.checksum {
-            merged = try remoteSnapshot.validatedWorkspace()
-        } else {
-            merged = try CourseSyncWorkspaceMerger.merge(
-                base: baseSnapshot,
-                local: localSnapshot,
-                remote: remoteSnapshot
-            )
-        }
-
-        try await service.replaceWorkspace(merged)
-        latestSnapshots.removeAll()
-        let mergedChecksums = Dictionary(
-            uniqueKeysWithValues: try merged.pages.values.map {
-                ($0.id, try CourseSyncPageDocument($0).checksum)
+            if localSnapshot.checksum == remoteSnapshot.checksum {
+                return CourseSyncRemoteApplyResult(
+                    changedPageIDs: [],
+                    resultingChecksum: localSnapshot.checksum
+                )
             }
-        )
-        let changedPageIDs = Set(localSnapshot.pages.map(\.id))
-            .union(remoteSnapshot.pages.map(\.id))
-            .filter { pageID in
-                localSnapshot.pages.first(where: { $0.id == pageID })?.checksum
-                    != mergedChecksums[pageID]
+            if remoteSnapshot.checksum == baseSnapshot.checksum {
+                return CourseSyncRemoteApplyResult(
+                    changedPageIDs: [],
+                    resultingChecksum: localSnapshot.checksum
+                )
             }
-            .sorted()
-        publish(pageID: nil, replacesDocument: true)
-        let result = try CourseSyncWorkspaceSnapshot(
-            workspaceID: workspaceID,
-            workspace: merged,
-            generationID: remoteSnapshot.manifest.generationID,
-            previousGenerationID: remoteSnapshot.manifest.previousGenerationID,
-            version: localSnapshot.manifest.version.merged(with: remoteSnapshot.manifest.version)
-        )
-        return CourseSyncRemoteApplyResult(
-            changedPageIDs: changedPageIDs,
-            resultingChecksum: result.checksum
-        )
+
+            let merged: PageWorkspace
+            if localSnapshot.checksum == baseSnapshot.checksum {
+                merged = try remoteSnapshot.validatedWorkspace()
+            } else {
+                merged = try CourseSyncWorkspaceMerger.merge(
+                    base: baseSnapshot,
+                    local: localSnapshot,
+                    remote: remoteSnapshot
+                )
+            }
+
+            do {
+                try await service.replaceWorkspace(
+                    merged,
+                    expectedGeneration: versionedWorkspace.generation
+                )
+            } catch LibraryStoreError.workspaceGenerationConflict where attempt < 3 {
+                continue
+            }
+            latestSnapshots.removeAll()
+            let mergedChecksums = Dictionary(
+                uniqueKeysWithValues: try merged.pages.values.map {
+                    ($0.id, try CourseSyncPageDocument($0).checksum)
+                }
+            )
+            let changedPageIDs = Set(localSnapshot.pages.map(\.id))
+                .union(remoteSnapshot.pages.map(\.id))
+                .filter { pageID in
+                    localSnapshot.pages.first(where: { $0.id == pageID })?.checksum
+                        != mergedChecksums[pageID]
+                }
+                .sorted()
+            publish(pageID: nil, replacesDocument: true)
+            let result = try CourseSyncWorkspaceSnapshot(
+                workspaceID: workspaceID,
+                workspace: merged,
+                generationID: remoteSnapshot.manifest.generationID,
+                previousGenerationID: remoteSnapshot.manifest.previousGenerationID,
+                version: localSnapshot.manifest.version.merged(with: remoteSnapshot.manifest.version)
+            )
+            return CourseSyncRemoteApplyResult(
+                changedPageIDs: changedPageIDs,
+                resultingChecksum: result.checksum
+            )
+        }
+        throw CourseCloudSyncRepositoryError.localWorkspaceChanged
     }
 
     /// Replaces a workspace only when the caller proves the local content is
@@ -276,21 +487,33 @@ actor CourseDocumentRepository {
             throw CourseCloudSyncRepositoryError.workspaceMismatch
         }
         try await flushPendingUserEdits()
+        let versionedWorkspace = try await service.workspaceSnapshotWithGeneration()
         let localSnapshot = try CourseSyncWorkspaceSnapshot(
             workspaceID: workspaceID,
-            workspace: try await service.workspaceSnapshot(),
+            workspace: versionedWorkspace.workspace,
             generationID: "materialization-check"
         )
         guard localSnapshot.checksum == expectedLocalChecksum else {
             throw CourseCloudSyncRepositoryError.localWorkspaceChanged
         }
-        try await service.replaceWorkspace(try remoteSnapshot.validatedWorkspace())
+        do {
+            try await service.replaceWorkspace(
+                try remoteSnapshot.validatedWorkspace(),
+                expectedGeneration: versionedWorkspace.generation
+            )
+        } catch LibraryStoreError.workspaceGenerationConflict {
+            throw CourseCloudSyncRepositoryError.localWorkspaceChanged
+        }
         latestSnapshots.removeAll()
         publish(pageID: nil, replacesDocument: true)
     }
 
     func outline() async throws -> CourseDocumentOutline {
         let workspace = try await workspaceSnapshot()
+        return try Self.outline(from: workspace)
+    }
+
+    static func outline(from workspace: PageWorkspace) throws -> CourseDocumentOutline {
         guard let root = workspace.page(id: workspace.rootPageID) else {
             throw NativeEditorMCPError.pageNotFound(workspace.rootPageID)
         }
@@ -381,7 +604,37 @@ actor CourseDocumentRepository {
         return snapshots
     }
 
+#if DEBUG
+    /// Queues deterministic, single-use failures before a pending batch is
+    /// removed. Tests and the Debug-only editor harness use this to prove that
+    /// retrying flushes the original draft instead of staging a duplicate.
+    func debugFailNextFlushes(_ count: Int = 1, delay: Duration = .zero) {
+        guard count > 0 else { return }
+        debugFlushFailures.append(contentsOf: repeatElement(delay, count: count))
+    }
+
+    /// Delays the next real successful save while it remains inside the
+    /// repository flush operation. This keeps the model's genuine `.saving`
+    /// transition observable without replacing product state in the view.
+    func debugDelayNextSuccessfulFlush(_ delay: Duration) {
+        guard delay != .zero else { return }
+        debugSuccessfulFlushDelays.append(delay)
+    }
+#endif
+
     private func savePendingBatch() async throws -> [NativeEditorPageSnapshot] {
+#if DEBUG
+        if !debugFlushFailures.isEmpty {
+            let delay = debugFlushFailures.removeFirst()
+            if delay != .zero {
+                try await Task.sleep(for: delay)
+            }
+            throw CourseDocumentDebugFlushError.simulatedFailure
+        }
+        if !debugSuccessfulFlushDelays.isEmpty {
+            try await Task.sleep(for: debugSuccessfulFlushDelays.removeFirst())
+        }
+#endif
         let batch = pendingUserEdits
         pendingUserEdits.removeAll()
         var unsaved = batch
@@ -451,14 +704,19 @@ actor CourseDocumentRepository {
                     pageID: pageID,
                     expectedRevision: expectedRevision ?? 0
                 )
-            } catch NativeEditorMCPError.revisionConflict {
-                let remote = record(try await service.pageSnapshot(id: pageID))
-                candidate = CourseDocumentThreeWayMerger.merge(
-                    base: baseDocument ?? remote.document,
-                    local: candidate,
-                    remote: remote.document
-                )
-                expectedRevision = remote.revision
+            } catch let error as NativeEditorMCPError {
+                switch error {
+                case .revisionConflict, .workspaceGenerationConflict:
+                    let remote = record(try await service.pageSnapshot(id: pageID))
+                    candidate = CourseDocumentThreeWayMerger.merge(
+                        base: baseDocument ?? remote.document,
+                        local: candidate,
+                        remote: remote.document
+                    )
+                    expectedRevision = remote.revision
+                default:
+                    throw error
+                }
             }
         }
 
@@ -639,7 +897,7 @@ actor CourseDocumentRepository {
         try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(
             workspaceID: workspaceID
         ) {
-            try writePresentedPlan(plan)
+            try await self.writePresentedPlan(plan)
         }
     }
 
@@ -647,24 +905,28 @@ actor CourseDocumentRepository {
         try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(
             workspaceID: workspaceID
         ) {
-            let presentedURL = AppleCourseApprovalPolicy.protectedPlanURL(
-                courseDirectory: courseRoot,
-                filename: AppleCourseApprovalPolicy.presentedPlanFilename
-            )
-            if FileManager.default.fileExists(atPath: presentedURL.path) {
-                let current = try JSONDecoder().decode(
-                    CourseBrief.self,
-                    from: Data(contentsOf: presentedURL)
-                )
-                guard current == plan else {
-                    throw AppleCourseAgentError.toolFailed(
-                        "A different course plan is already being reviewed. Learnfold preserved it and did not replay the older Hermes presentation."
-                    )
-                }
-                return
-            }
-            try writePresentedPlan(plan)
+            try await self.presentPlanForRecoveryWhileHoldingSecurityGate(plan)
         }
+    }
+
+    private func presentPlanForRecoveryWhileHoldingSecurityGate(_ plan: CourseBrief) throws {
+        let presentedURL = AppleCourseApprovalPolicy.protectedPlanURL(
+            courseDirectory: courseRoot,
+            filename: AppleCourseApprovalPolicy.presentedPlanFilename
+        )
+        if FileManager.default.fileExists(atPath: presentedURL.path) {
+            let current = try JSONDecoder().decode(
+                CourseBrief.self,
+                from: Data(contentsOf: presentedURL)
+            )
+            guard current == plan else {
+                throw AppleCourseAgentError.toolFailed(
+                    "A different course plan is already being reviewed. Learnfold preserved it and did not replay the older Hermes presentation."
+                )
+            }
+            return
+        }
+        try writePresentedPlan(plan)
     }
 
     private func writePresentedPlan(_ plan: CourseBrief) throws {
@@ -699,47 +961,51 @@ actor CourseDocumentRepository {
         try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(
             workspaceID: workspaceID
         ) {
-            let protectedPresentedURL = AppleCourseApprovalPolicy.protectedPlanURL(
-                courseDirectory: courseRoot,
-                filename: AppleCourseApprovalPolicy.presentedPlanFilename
-            )
-            // Remote Codex validates and returns dynamic-tool arguments on its
-            // server. If the app was suspended before its completed call could
-            // be mirrored locally, the learner's explicit Approve tap is the
-            // first authoritative phone-side boundary.
-            if !FileManager.default.fileExists(atPath: protectedPresentedURL.path) {
-                try writePresentedPlan(plan)
-            }
-            let presented = try JSONDecoder().decode(
-                CourseBrief.self,
-                from: Data(contentsOf: protectedPresentedURL)
-            )
-            guard presented == plan else {
-                throw AppleCourseAgentError.toolFailed(
-                    "The plan changed before approval was committed. Review the latest revision and approve it explicitly."
-                )
-            }
-            let data = try JSONEncoder.courseFileEncoder.encode(presented)
-            let metadataDirectory = courseRoot.appendingPathComponent(".course", isDirectory: true)
-            try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
-            // Write the learner-visible mirror first. Only the final protected
-            // write commits authorization, so a storage failure cannot grant it.
-            try data.write(
-                to: metadataDirectory.appendingPathComponent(
-                    AppleCourseApprovalPolicy.approvedPlanFilename
-                ),
-                options: .atomic
-            )
-            let protectedApprovedURL = AppleCourseApprovalPolicy.protectedPlanURL(
-                courseDirectory: courseRoot,
-                filename: AppleCourseApprovalPolicy.approvedPlanFilename
-            )
-            try FileManager.default.createDirectory(
-                at: protectedApprovedURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try data.write(to: protectedApprovedURL, options: .atomic)
+            try await self.approvePlanWhileHoldingSecurityGate(plan)
         }
+    }
+
+    private func approvePlanWhileHoldingSecurityGate(_ plan: CourseBrief) throws {
+        let protectedPresentedURL = AppleCourseApprovalPolicy.protectedPlanURL(
+            courseDirectory: courseRoot,
+            filename: AppleCourseApprovalPolicy.presentedPlanFilename
+        )
+        // Remote Codex validates and returns dynamic-tool arguments on its
+        // server. If the app was suspended before its completed call could
+        // be mirrored locally, the learner's explicit Approve tap is the
+        // first authoritative phone-side boundary.
+        if !FileManager.default.fileExists(atPath: protectedPresentedURL.path) {
+            try writePresentedPlan(plan)
+        }
+        let presented = try JSONDecoder().decode(
+            CourseBrief.self,
+            from: Data(contentsOf: protectedPresentedURL)
+        )
+        guard presented == plan else {
+            throw AppleCourseAgentError.toolFailed(
+                "The plan changed before approval was committed. Review the latest revision and approve it explicitly."
+            )
+        }
+        let data = try JSONEncoder.courseFileEncoder.encode(presented)
+        let metadataDirectory = courseRoot.appendingPathComponent(".course", isDirectory: true)
+        try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
+        // Write the learner-visible mirror first. Only the final protected
+        // write commits authorization, so a storage failure cannot grant it.
+        try data.write(
+            to: metadataDirectory.appendingPathComponent(
+                AppleCourseApprovalPolicy.approvedPlanFilename
+            ),
+            options: .atomic
+        )
+        let protectedApprovedURL = AppleCourseApprovalPolicy.protectedPlanURL(
+            courseDirectory: courseRoot,
+            filename: AppleCourseApprovalPolicy.approvedPlanFilename
+        )
+        try FileManager.default.createDirectory(
+            at: protectedApprovedURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: protectedApprovedURL, options: .atomic)
     }
 
     private static func planNotApprovedResult() -> NativeEditorMCPToolResult {
@@ -768,6 +1034,7 @@ actor CourseDocumentRepository {
     }
 
     private func scheduleCloudSync() {
+        guard schedulesCloudSync else { return }
         Task {
             await CourseCloudSyncEngine.shared.queueRepositoryChangesIfNeeded(repository: self)
         }
@@ -894,7 +1161,7 @@ actor CourseDocumentRepository {
         }
     }
 
-    private func pageNode(_ page: PageRecord, workspace: PageWorkspace) -> CourseLearningNode {
+    private static func pageNode(_ page: PageRecord, workspace: PageWorkspace) -> CourseLearningNode {
         let children = workspace.children(of: page.id).map { pageNode($0, workspace: workspace) }
         let role = page.document.root.data["course_role"]?.stringValue
         let isLeafPage = role.map {
@@ -930,6 +1197,7 @@ actor CourseDocumentRepository {
             title: page.title,
             kind: kind,
             status: derivedStatus,
+            role: role.flatMap(CourseLearningNode.Role.init(rawValue:)),
             pageID: page.id,
             children: children
         )
@@ -1398,9 +1666,13 @@ private enum LegacyCoursePageImporter {
             .flatMap { document(at: courseRoot.appendingPathComponent($0)) }
             ?? headingDocument(node.title)
         let role: String
-        switch node.kind {
-        case .folder: role = depth == 0 ? "chapter" : "subchapter"
-        case .markdown: role = "lesson"
+        if let explicitRole = node.role {
+            role = explicitRole.rawValue
+        } else {
+            switch node.kind {
+            case .folder: role = depth == 0 ? "chapter" : "subchapter"
+            case .markdown: role = "lesson"
+            }
         }
         guard let page = addPage(
             title: node.title,
@@ -1825,10 +2097,59 @@ final class CourseDocumentToolRouter: PlatformDynamicToolHandler, @unchecked Sen
 @MainActor
 @Observable
 final class CoursePageEditorModel {
+    enum SaveState: Equatable {
+        case idle
+        case saving
+        case saved
+        case failed(String)
+
+        var accessibilityValue: String {
+            switch self {
+            case .idle:
+                "No pending changes"
+            case .saving:
+                "Saving changes"
+            case .saved:
+                "Changes saved"
+            case .failed:
+                "Changes not saved"
+            }
+        }
+
+        var failureMessage: String? {
+            guard case let .failed(message) = self else { return nil }
+            return message
+        }
+
+        var canRetry: Bool {
+            if case .failed = self { return true }
+            return false
+        }
+
+#if DEBUG
+        /// Stable, content-free state used by the product-attached editor
+        /// runtime probe. Keep this separate from the localized accessibility
+        /// copy rendered by the save-status view.
+        var runtimeProbeValue: String {
+            switch self {
+            case .idle:
+                "idle"
+            case .saving:
+                "saving"
+            case .saved:
+                "saved"
+            case .failed:
+                "failed"
+            }
+        }
+#endif
+    }
+
     var title = "Course page"
     var document = BlockDocument.blank()
     var isLoading = true
     var errorMessage: String?
+    var saveState = SaveState.idle
     var pageTitles: [String: String] = [:]
 
     let pageID: String
@@ -1839,6 +2160,7 @@ final class CoursePageEditorModel {
     private var latestEditID: UUID?
     private var latestStagedEditID: UUID?
     private var stagedSaveTask: Task<Void, Never>?
+    private var saveOperationGeneration = 0
     @ObservationIgnored
     nonisolated(unsafe) private var changesTask: Task<Void, Never>?
 
@@ -1865,9 +2187,9 @@ final class CoursePageEditorModel {
             changesTask = Task { [weak self] in
                 for await change in stream {
                     guard !Task.isCancelled else { return }
-                    if change.pageID == nil || change.pageID == pageID {
+                    if change.pageID == nil || change.pageID == self?.pageID {
                         if let errorMessage = change.errorMessage {
-                            self?.errorMessage = errorMessage
+                            self?.recordSaveFailure(errorMessage)
                         } else if let snapshot = change.snapshot {
                             guard let self else { return }
                             let completesLatestEdit = change.sourceEditID != nil
@@ -1886,6 +2208,8 @@ final class CoursePageEditorModel {
                             if completesLatestEdit {
                                 self.latestEditID = nil
                                 self.latestStagedEditID = nil
+                                self.errorMessage = nil
+                                self.saveState = .saved
                             }
                         } else {
                             guard let self else { return }
@@ -1907,6 +2231,8 @@ final class CoursePageEditorModel {
         document = updated
         let editID = UUID()
         latestEditID = editID
+        errorMessage = nil
+        saveState = .saving
         let previous = stagedSaveTask
         let repository = repository
         let pageID = pageID
@@ -1927,7 +2253,8 @@ final class CoursePageEditorModel {
                     sourceEditID: editID
                 )
             } catch {
-                self?.errorMessage = error.localizedDescription
+                guard self?.latestEditID == editID else { return }
+                self?.recordSaveFailure(error.localizedDescription)
             }
             if self?.latestEditID == editID {
                 self?.latestStagedEditID = editID
@@ -1936,27 +2263,51 @@ final class CoursePageEditorModel {
     }
 
     func flush() async {
+        saveOperationGeneration &+= 1
+        let operationGeneration = saveOperationGeneration
+        if latestEditID != nil || saveState.canRetry {
+            errorMessage = nil
+            saveState = .saving
+        }
+
         while true {
+            guard operationGeneration == saveOperationGeneration else { return }
             let targetEditID = latestEditID
             let targetStagingTask = stagedSaveTask
             await targetStagingTask?.value
+            guard operationGeneration == saveOperationGeneration else { return }
             do {
                 let snapshots = try await repository.flushPendingUserEdits()
                 // A newer edit may enter while either await is suspended. Do
                 // not adopt an older snapshot or clear its identity; include
                 // the new staging task in another pass instead.
+                guard operationGeneration == saveOperationGeneration else { return }
                 guard latestEditID == targetEditID else { continue }
                 if let snapshot = snapshots.last(where: { $0.id == pageID }) {
                     apply(snapshot, replacingDocument: true)
                 }
                 latestEditID = nil
                 latestStagedEditID = nil
+                errorMessage = nil
+                if targetEditID != nil || saveState != .idle {
+                    saveState = .saved
+                }
                 return
             } catch {
-                errorMessage = error.localizedDescription
+                guard operationGeneration == saveOperationGeneration else { return }
+                // A later keystroke owns the visible save state. Retry the
+                // repository's requeued batch plus that newer edit in this
+                // operation instead of surfacing the older failure.
+                guard latestEditID == targetEditID else { continue }
+                recordSaveFailure(error.localizedDescription)
                 return
             }
         }
+    }
+
+    func retrySave() async {
+        guard saveState.canRetry else { return }
+        await flush()
     }
 
     private func reload() async {
@@ -1990,7 +2341,25 @@ final class CoursePageEditorModel {
         errorMessage = nil
     }
 
+    private func recordSaveFailure(_ message: String) {
+        errorMessage = message
+        saveState = .failed(message)
+    }
+
     func pageTitle(id: String) -> String? {
         pageTitles[id]
     }
+
+#if DEBUG
+    /// Read-only observability for the Debug runtime evidence layer. These
+    /// values are projections of the real editor state; they do not provide a
+    /// second mutation path or expose learner-authored document content.
+    var runtimeProbeHasPendingEdit: Bool {
+        latestEditID != nil || latestStagedEditID != nil || saveState.canRetry
+    }
+
+    var runtimeProbeConfirmedRevision: Int64? {
+        confirmedRevision
+    }
+#endif
 }

@@ -43,7 +43,7 @@ final class LitterUITests: XCTestCase {
         )
         XCTAssertTrue(privateCloud.exists)
         XCTAssertTrue(privateCloud.isEnabled)
-        XCTAssertEqual(privateCloud.value as? String, "Selected")
+        XCTAssertEqual(privateCloud.value as? String, "available-selected")
 
         let connect = identifiedElement("course-agent-connect", in: app)
         XCTAssertTrue(scrollUntilHittable(connect, in: app))
@@ -95,6 +95,45 @@ final class LitterUITests: XCTestCase {
     }
 
     @MainActor
+    func testCourseAgentSettingsCanDraftCodexWithoutLaunchingOAuth() throws {
+        let app = appleCourseSetupApp(onDeviceAvailable: true, privateCloudAvailable: true)
+        app.launch()
+
+        continuePastIntroIfNeeded(in: app)
+        XCTAssertTrue(
+            app.staticTexts["Choose your course agent"].waitForExistence(timeout: 15)
+        )
+        let connect = identifiedElement("course-agent-connect", in: app)
+        XCTAssertTrue(scrollUntilHittable(connect, in: app))
+        XCTAssertEqual(connect.label, "Connect Apple Private Cloud")
+        connect.tap()
+
+        XCTAssertTrue(app.staticTexts["My Courses"].waitForExistence(timeout: 8))
+        let courseAgentMenu = app.buttons["Course agent menu"]
+        XCTAssertTrue(waitUntilHittable(courseAgentMenu, timeout: 5))
+        courseAgentMenu.tap()
+
+        XCTAssertTrue(app.navigationBars["Course Settings"].waitForExistence(timeout: 5))
+        let codex = identifiedElement("course-settings-agent-codex", in: app)
+        XCTAssertTrue(scrollUntilHittable(codex, in: app))
+        codex.tap()
+
+        let addCustomProvider = app.buttons["Add custom provider"]
+        XCTAssertTrue(
+            scrollUntilHittable(addCustomProvider, in: app),
+            "Selecting Codex should update the local draft without launching OAuth"
+        )
+        addCustomProvider.tap()
+        XCTAssertTrue(app.navigationBars["Custom Provider"].waitForExistence(timeout: 5))
+        let formMarker = identifiedElement("custom-provider-form", in: app)
+        XCTAssertTrue(formMarker.waitForExistence(timeout: 5))
+        XCTAssertEqual(formMarker.elementType, .staticText)
+        XCTAssertEqual(formMarker.label, "Connection")
+        XCTAssertEqual(formMarker.value as? String, "ready")
+        attachScreenshot(named: "Codex custom provider draft before Save", app: app)
+    }
+
+    @MainActor
     func testCourseAgentSetupFallsBackToCodexWhenAppleModelsAreUnavailable() throws {
         let app = appleCourseSetupApp(onDeviceAvailable: false, privateCloudAvailable: false)
         app.launch()
@@ -115,15 +154,25 @@ final class LitterUITests: XCTestCase {
             "course-agent-option-codex",
             in: app
         )
-        XCTAssertFalse(privateCloud.exists)
-        XCTAssertFalse(onDevice.exists)
+        XCTAssertTrue(privateCloud.exists)
+        XCTAssertFalse(privateCloud.isEnabled)
+        XCTAssertEqual(
+            privateCloud.value as? String,
+            "unavailable"
+        )
+        XCTAssertTrue(onDevice.exists)
+        XCTAssertFalse(onDevice.isEnabled)
+        XCTAssertEqual(
+            onDevice.value as? String,
+            "unavailable"
+        )
         XCTAssertTrue(codex.isEnabled)
-        XCTAssertEqual(codex.value as? String, "Selected")
+        XCTAssertEqual(codex.value as? String, "available-selected")
 
         let connect = identifiedElement("course-agent-connect", in: app)
         XCTAssertTrue(scrollUntilHittable(connect, in: app))
         XCTAssertEqual(connect.label, "Connect Codex")
-        attachScreenshot(named: "Codex-only course setup on unsupported device", app: app)
+        attachScreenshot(named: "Codex fallback with unavailable Apple explanations", app: app)
     }
 
     @MainActor
@@ -156,6 +205,476 @@ final class LitterUITests: XCTestCase {
     }
 
     @MainActor
+    func testCourseDraftRecoveryShowsFullPlanAndRestoredComposer() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchArguments.append("--ui-test-course-draft-recovery")
+        app.launch()
+
+        let status = app.staticTexts["courseDraftRecoveryHarness.status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        XCTAssertEqual(status.label, "Plan ready for review · Revision 1 · Not approved")
+        let initialRetryResult = identifiedElement(
+            "courseDraftRecoveryHarness.retryResult",
+            in: app
+        )
+        XCTAssertTrue(initialRetryResult.exists)
+        XCTAssertEqual(initialRetryResult.label, "Retry has not been requested.")
+
+        let composer = identifiedElement("course-chat-composer", in: app)
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        XCTAssertEqual(
+            composer.value as? String,
+            "Please make the laboratory simulations runnable on my Mac."
+        )
+        XCTAssertTrue(app.staticTexts["longevity-research-notes.pdf"].exists)
+        attachScreenshot(named: "Course draft restored composer and plan", app: app)
+
+        let recursiveExplainer = identifiedElement(
+            "course-plan-node-ageing-concept-map",
+            in: app
+        )
+        XCTAssertTrue(scrollUntilHittable(recursiveExplainer, in: app, attempts: 10))
+        XCTAssertEqual(
+            recursiveExplainer.label,
+            "1.1.2, Explainer, Cellular ageing concept map"
+        )
+        let recursiveModule = identifiedElement(
+            "course-plan-node-simulation-project",
+            in: app
+        )
+        XCTAssertTrue(scrollUntilHittable(recursiveModule, in: app, attempts: 10))
+        XCTAssertEqual(
+            recursiveModule.label,
+            "2.1, Module, Runnable simulation project"
+        )
+        attachScreenshot(named: "Course draft recursive hierarchy and roles", app: app)
+
+        let tryAgain = app.buttons["Try Again"]
+        XCTAssertTrue(scrollUntilHittable(tryAgain, in: app, attempts: 10))
+        let sourceDismiss = identifiedElement("xmark.circle.fill", in: app)
+        XCTAssertTrue(sourceDismiss.exists)
+        for _ in 0..<4 where tryAgain.frame.maxY >= sourceDismiss.frame.minY {
+            app.swipeUp()
+        }
+        XCTAssertLessThan(
+            tryAgain.frame.maxY,
+            sourceDismiss.frame.minY,
+            "Try Again remained covered by the restored-source tray"
+        )
+        XCTAssertTrue(
+            identifiedElement("course-recovered-draft-provenance", in: app).exists
+        )
+        XCTAssertTrue(app.buttons["Discard Draft"].exists)
+        XCTAssertTrue(app.staticTexts["Final research protocol with analysis plan"].exists)
+        XCTAssertTrue(
+            app.staticTexts
+                .matching(NSPredicate(format: "label CONTAINS %@", "Message not sent"))
+                .firstMatch
+                .exists
+        )
+        tryAgain.tap()
+        let expectedRetryResult = "Retry requested with restored message and 1 source."
+        let updatedRetryResult = app.staticTexts[expectedRetryResult]
+        XCTAssertTrue(
+            updatedRetryResult.waitForExistence(timeout: 2),
+            "Try Again did not expose a visible retry result"
+        )
+        XCTAssertTrue(updatedRetryResult.isHittable)
+        attachScreenshot(named: "Course draft full plan and retry recovery", app: app)
+    }
+
+    @MainActor
+    func testCourseGenerationControlMaintains44PointHitTargetAtDefaultAndAX3XL() {
+        let requiredHitTarget = 44.0
+        let hitTargetMeasurementEpsilon = 0.000001
+        let variants = [
+            (name: "Default", argument: "--ui-test-dynamic-type-default"),
+            (name: "AX3XL", argument: "--ui-test-dynamic-type-ax3xl"),
+        ]
+
+        for variant in variants {
+            let app = XCUIApplication()
+            app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+            app.launchArguments.append("--ui-test-course-generation-control")
+            app.launchArguments.append(variant.argument)
+            app.launch()
+
+            let title = app.staticTexts["courseGenerationControlHarness.title"]
+            XCTAssertTrue(title.waitForExistence(timeout: 10))
+            let expectedControls = [
+                (
+                    identifier: "generate-course-node-ui-generation-folder",
+                    label: "Generate next in Chapter Cellular ageing: Explainer Cellular ageing concept map"
+                ),
+                (
+                    identifier: "generate-course-node-ui-generation-section",
+                    label: "Generate next in Subchapter Cell repair mechanisms: Explainer Cellular ageing concept map"
+                ),
+                (
+                    identifier: "generate-course-node-ui-generation-leaf",
+                    label: "Generate Explainer Cellular ageing concept map"
+                ),
+            ]
+            var controls: [XCUIElement] = []
+            for expected in expectedControls {
+                let generate = identifiedElement(expected.identifier, in: app)
+                XCTAssertTrue(
+                    waitUntilHittable(generate, timeout: 5),
+                    "\(variant.name) \(expected.identifier) must be actionable"
+                )
+                XCTAssertEqual(generate.label, expected.label)
+                XCTAssertGreaterThanOrEqual(
+                    generate.frame.width + hitTargetMeasurementEpsilon,
+                    requiredHitTarget,
+                    "\(variant.name) Generate control must remain at least 44 points wide"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    generate.frame.height + hitTargetMeasurementEpsilon,
+                    requiredHitTarget,
+                    "\(variant.name) Generate control must remain at least 44 points tall"
+                )
+                controls.append(generate)
+            }
+            XCTAssertEqual(Set(controls.map(\.identifier)).count, expectedControls.count)
+            XCTAssertEqual(Set(controls.map(\.label)).count, expectedControls.count)
+
+            let expectedLearningRows = [
+                (
+                    identifier: "course-learning-node-ui-generation-folder",
+                    label: "1, Chapter, Cellular ageing, Pending generation"
+                ),
+                (
+                    identifier: "course-learning-node-ui-generation-section",
+                    label: "1.1, Subchapter, Cell repair mechanisms, Pending generation"
+                ),
+                (
+                    identifier: "course-learning-node-ui-generation-leaf",
+                    label: "1.1.1, Explainer, Cellular ageing concept map, Pending generation"
+                ),
+            ]
+            var learningRows: [XCUIElement] = []
+            for expected in expectedLearningRows {
+                let row = identifiedElement(expected.identifier, in: app)
+                XCTAssertTrue(row.waitForExistence(timeout: 5))
+                XCTAssertEqual(row.label, expected.label)
+                learningRows.append(row)
+            }
+            XCTAssertEqual(
+                Set(learningRows.map(\.identifier)).count,
+                expectedLearningRows.count
+            )
+            XCTAssertEqual(Set(learningRows.map(\.label)).count, expectedLearningRows.count)
+
+            controls[0].tap()
+            let requestedNode = identifiedElement(
+                "courseGenerationControlHarness.lastRequestedNodeID",
+                in: app
+            )
+            XCTAssertTrue(
+                waitUntil(timeout: 2) {
+                    requestedNode.label == "ui-generation-folder"
+                },
+                "\(variant.name) ancestor Generate next action did not reach its source node"
+            )
+
+            let rootPageRow = identifiedElement(
+                "course-page-row-ui-generation-folder",
+                in: app
+            )
+            XCTAssertTrue(scrollUntilHittable(rootPageRow, in: app, attempts: 8))
+            XCTAssertEqual(
+                rootPageRow.label,
+                "1, Chapter, Cellular ageing, Pending generation"
+            )
+            let rootDisclosure = identifiedElement(
+                "course-page-expand-ui-generation-folder",
+                in: app
+            )
+            XCTAssertTrue(scrollUntilHittable(rootDisclosure, in: app, attempts: 8))
+            XCTAssertEqual(
+                rootDisclosure.label,
+                "Collapse 1, Chapter, Cellular ageing"
+            )
+            XCTAssertGreaterThanOrEqual(
+                rootDisclosure.frame.width + hitTargetMeasurementEpsilon,
+                requiredHitTarget,
+                "\(variant.name) root disclosure must remain at least 44 points wide"
+            )
+            XCTAssertGreaterThanOrEqual(
+                rootDisclosure.frame.height + hitTargetMeasurementEpsilon,
+                requiredHitTarget,
+                "\(variant.name) root disclosure must remain at least 44 points tall"
+            )
+
+            let sectionPageRow = identifiedElement(
+                "course-page-row-ui-generation-section",
+                in: app
+            )
+            XCTAssertTrue(scrollUntilHittable(sectionPageRow, in: app, attempts: 4))
+            XCTAssertEqual(
+                sectionPageRow.label,
+                "1.1, Subchapter, Cell repair mechanisms, Pending generation"
+            )
+            let sectionDisclosure = identifiedElement(
+                "course-page-expand-ui-generation-section",
+                in: app
+            )
+            XCTAssertTrue(scrollUntilHittable(sectionDisclosure, in: app, attempts: 4))
+            XCTAssertEqual(
+                sectionDisclosure.label,
+                "Expand 1.1, Subchapter, Cell repair mechanisms"
+            )
+            XCTAssertGreaterThanOrEqual(
+                sectionDisclosure.frame.width + hitTargetMeasurementEpsilon,
+                requiredHitTarget,
+                "\(variant.name) section disclosure must remain at least 44 points wide"
+            )
+            XCTAssertGreaterThanOrEqual(
+                sectionDisclosure.frame.height + hitTargetMeasurementEpsilon,
+                requiredHitTarget,
+                "\(variant.name) section disclosure must remain at least 44 points tall"
+            )
+
+            sectionDisclosure.tap()
+            let leafPageRow = identifiedElement(
+                "course-page-row-ui-generation-leaf",
+                in: app
+            )
+            XCTAssertTrue(scrollUntilHittable(leafPageRow, in: app, attempts: 4))
+            XCTAssertEqual(
+                leafPageRow.label,
+                "1.1.1, Explainer, Cellular ageing concept map, Pending generation"
+            )
+            let pageRows = [rootPageRow, sectionPageRow, leafPageRow]
+            XCTAssertEqual(Set(pageRows.map(\.identifier)).count, pageRows.count)
+            XCTAssertEqual(Set(pageRows.map(\.label)).count, pageRows.count)
+
+            leafPageRow.tap()
+            let openedPage = identifiedElement(
+                "courseGenerationControlHarness.lastOpenedPageID",
+                in: app
+            )
+            XCTAssertTrue(
+                waitUntil(timeout: 2) {
+                    openedPage.label == "ui-generation-leaf-page"
+                },
+                "\(variant.name) page row action did not open its unique page"
+            )
+            attachScreenshot(
+                named: "Course generation control \(variant.name)",
+                app: app
+            )
+            app.terminate()
+        }
+    }
+
+    @MainActor
+    func testCourseGenerationControlDisablesEveryUnresolvedAcceptedRecoveryState() {
+        let cases = [
+            (
+                argument: "--ui-test-generation-recovery-acceptance-unknown",
+                state: "acceptanceUnknown"
+            ),
+            (
+                argument: "--ui-test-generation-recovery-accepted-reply-incomplete",
+                state: "acceptedReplyIncomplete"
+            ),
+        ]
+
+        for recoveryCase in cases {
+            let app = XCUIApplication()
+            app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+            app.launchArguments.append("--ui-test-course-generation-control")
+            app.launchArguments.append(recoveryCase.argument)
+            app.launch()
+
+            XCTAssertTrue(
+                app.staticTexts["courseGenerationControlHarness.title"]
+                    .waitForExistence(timeout: 10)
+            )
+            let state = identifiedElement(
+                "courseGenerationControlHarness.submissionRecoveryState",
+                in: app
+            )
+            XCTAssertTrue(state.waitForExistence(timeout: 5))
+            XCTAssertEqual(state.label, recoveryCase.state)
+
+            let generate = identifiedElement(
+                "generate-course-node-ui-generation-folder",
+                in: app
+            )
+            XCTAssertTrue(generate.waitForExistence(timeout: 5))
+            XCTAssertFalse(
+                generate.isEnabled,
+                "\(recoveryCase.state) must disable the visible Generate control"
+            )
+            XCTAssertEqual(
+                identifiedElement(
+                    "courseGenerationControlHarness.lastRequestedNodeID",
+                    in: app
+                ).label,
+                "none"
+            )
+            attachScreenshot(
+                named: "Course generation blocked \(recoveryCase.state)",
+                app: app
+            )
+            app.terminate()
+        }
+    }
+
+    @MainActor
+    func testCourseStructureAndSamePageEditorRetryReloadVisibleContent() {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchArguments.append("--ui-test-course-retry")
+        app.launch()
+
+        XCTAssertTrue(
+            app.staticTexts["courseRetryHarness.title"].waitForExistence(timeout: 10)
+        )
+
+        let structureRetry = identifiedElement("course-structure-retry", in: app)
+        XCTAssertTrue(waitUntilHittable(structureRetry, timeout: 5))
+        XCTAssertEqual(
+            identifiedElement("course-structure-error-message", in: app).label,
+            "Source files: Simulated source-file failure\nCourse pages: Simulated course-page failure"
+        )
+        XCTAssertEqual(
+            identifiedElement("courseRetryHarness.workspaceAttempts", in: app).label,
+            "1"
+        )
+        XCTAssertEqual(
+            identifiedElement("courseRetryHarness.documentAttempts", in: app).label,
+            "1"
+        )
+        structureRetry.tap()
+
+        let workspaceStatus = identifiedElement("courseRetryHarness.workspaceStatus", in: app)
+        let documentStatus = identifiedElement("courseRetryHarness.documentStatus", in: app)
+        XCTAssertTrue(workspaceStatus.waitForExistence(timeout: 5))
+        XCTAssertTrue(documentStatus.waitForExistence(timeout: 5))
+        XCTAssertEqual(workspaceStatus.label, "Source files ready")
+        XCTAssertEqual(documentStatus.label, "Course pages ready")
+        XCTAssertEqual(
+            identifiedElement("courseRetryHarness.workspaceAttempts", in: app).label,
+            "2"
+        )
+        XCTAssertEqual(
+            identifiedElement("courseRetryHarness.documentAttempts", in: app).label,
+            "2"
+        )
+
+        let editorRetry = identifiedElement("course-page-retry-retry-page", in: app)
+        XCTAssertTrue(scrollUntilHittable(editorRetry, in: app, attempts: 6))
+        XCTAssertEqual(
+            identifiedElement("courseRetryHarness.editorAttempts", in: app).label,
+            "1"
+        )
+        editorRetry.tap()
+
+        let freshContent = identifiedElement("courseRetryHarness.editorContent", in: app)
+        XCTAssertTrue(freshContent.waitForExistence(timeout: 5))
+        XCTAssertEqual(freshContent.label, "Fresh same-page content")
+        XCTAssertEqual(
+            identifiedElement("courseRetryHarness.editorAttempts", in: app).label,
+            "2"
+        )
+        XCTAssertTrue(
+            waitUntil(timeout: 5) {
+                identifiedElement(
+                    "courseRetryHarness.staleCompletionRejected",
+                    in: app
+                ).label == "yes"
+            },
+            "The late completion from the first same-page load was not rejected."
+        )
+        XCTAssertFalse(app.staticTexts["Stale same-page content"].exists)
+    }
+
+    @MainActor
+    func testCoursePageSaveFailureRetryKeepsDraftAndReportsSaved() {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchArguments.append("--ui-test-course-save-recovery")
+        app.launch()
+
+        let failedStatus = identifiedElement("course-page-save-status", in: app)
+        XCTAssertTrue(
+            failedStatus.waitForExistence(timeout: 15),
+            "The deterministic failed-save state did not appear."
+        )
+        XCTAssertEqual(failedStatus.label, "Changes not saved")
+
+        let pageTitle = app.staticTexts["Save recovery evidence"]
+        XCTAssertTrue(pageTitle.exists)
+        XCTAssertTrue(app.staticTexts["Editable course page"].exists)
+        XCTAssertTrue(
+            elementContainingText("First pending recovery edit", in: app)
+                .waitForExistence(timeout: 5)
+        )
+        XCTAssertTrue(
+            elementContainingText("Second pending recovery edit", in: app)
+                .waitForExistence(timeout: 5)
+        )
+
+        let failureMessage = identifiedElement("course-page-save-error", in: app)
+        XCTAssertTrue(failureMessage.exists)
+        XCTAssertFalse(failureMessage.label.isEmpty)
+        let retry = identifiedElement("course-page-save-retry", in: app)
+        XCTAssertTrue(waitUntilHittable(retry, timeout: 5))
+        XCTAssertEqual(retry.label, "Retry save")
+        XCTAssertLessThanOrEqual(
+            retry.frame.maxY,
+            pageTitle.frame.minY,
+            "The failed-save recovery card must participate in layout above the editor title."
+        )
+        attachScreenshot(named: "LF-50 failed save preserves editable draft", app: app)
+        attachHierarchy(named: "LF-50 failed save hierarchy", app: app)
+
+        retry.tap()
+
+        let savingStatus = identifiedElement("course-page-save-status", in: app)
+        let observedSaving = waitUntil(timeout: 0.75, poll: 0.02) {
+            savingStatus.label == "Saving changes…"
+                || savingStatus.value as? String == "Saving changes"
+        }
+        if observedSaving {
+            attachScreenshot(named: "LF-50 retry saving", app: app)
+            attachHierarchy(named: "LF-50 retry saving hierarchy", app: app)
+        }
+        let savingObservation = XCTAttachment(
+            string: observedSaving
+                ? "The transient Saving changes state was observed."
+                : "The retry completed before XCUITest could sample the transient Saving changes state."
+        )
+        savingObservation.name = "LF-50 Saving observation"
+        savingObservation.lifetime = .keepAlways
+        add(savingObservation)
+
+        XCTAssertTrue(
+            waitUntil(timeout: 8) {
+                let status = identifiedElement("course-page-save-status", in: app)
+                return status.value as? String == "Changes saved"
+            },
+            "Retry did not reach the visible saved state."
+        )
+        XCTAssertFalse(identifiedElement("course-page-save-retry", in: app).exists)
+        let savedStatus = identifiedElement("course-page-save-status", in: app)
+        XCTAssertTrue(savedStatus.exists)
+        XCTAssertLessThanOrEqual(
+            savedStatus.frame.maxY,
+            pageTitle.frame.minY,
+            "The saved-status row must participate in layout above the editor title."
+        )
+        XCTAssertTrue(elementContainingText("First pending recovery edit", in: app).exists)
+        XCTAssertTrue(elementContainingText("Second pending recovery edit", in: app).exists)
+        attachScreenshot(named: "LF-50 retry saved exact pending draft", app: app)
+        attachHierarchy(named: "LF-50 retry saved hierarchy", app: app)
+    }
+
+    @MainActor
     func testConversationDisplaySettingsRowsAreReachable() throws {
         let app = conversationDisplayHarnessApp()
         app.launch()
@@ -172,10 +691,44 @@ final class LitterUITests: XCTestCase {
         )
         settingsButton.tap()
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["Conversation"].waitForExistence(timeout: 5))
+        let notifications = identifiedElement("settings.notifications.row", in: app)
+        XCTAssertTrue(notifications.waitForExistence(timeout: 5))
+        XCTAssertTrue(
+            ["Checking…", "Not Enabled", "Denied", "Enabled", "Unavailable"]
+                .contains(notifications.value as? String ?? "")
+        )
+        XCTAssertTrue(findStaticText("Conversation", in: app))
         XCTAssertTrue(app.staticTexts["Internal Thinking"].exists)
         XCTAssertTrue(app.staticTexts["Commands"].exists)
         XCTAssertTrue(findStaticText("Tools", in: app))
+    }
+
+    @MainActor
+    func testCourseHomeOpensAppSettingsWithoutRequestingNotificationPermission() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["SNAPPY_SKIP_AGENT_SETUP"] = "1"
+        app.launch()
+
+        XCTAssertTrue(app.staticTexts["My Courses"].waitForExistence(timeout: 10))
+        let appSettings = identifiedElement("course-home-app-settings", in: app)
+        XCTAssertTrue(waitUntilHittable(appSettings, timeout: 5))
+        appSettings.tap()
+
+        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
+        XCTAssertTrue(
+            identifiedElement("settings.notifications.row", in: app)
+                .waitForExistence(timeout: 5)
+        )
+        XCTAssertFalse(app.navigationBars["Course Settings"].exists)
+        XCTAssertEqual(
+            app.alerts.matching(
+                NSPredicate(format: "label CONTAINS[c] %@", "notification")
+            ).count,
+            0,
+            "Opening App Settings must only inspect notification status, never request permission."
+        )
+        attachScreenshot(named: "Course Home App Settings without notification prompt", app: app)
     }
 
     @MainActor
@@ -308,6 +861,7 @@ final class LitterUITests: XCTestCase {
         snapshot("05ReturnedToSessions")
     }
 
+    @MainActor
     private func presentDiscovery(in app: XCUIApplication) -> Bool {
         if isDiscoveryVisible(in: app) {
             return true
@@ -328,6 +882,7 @@ final class LitterUITests: XCTestCase {
         return waitForDiscoveryVisible(in: app, timeout: 5)
     }
 
+    @MainActor
     private func waitForDiscoveryServers(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         let codexRows = codexDiscoveryRows(in: app)
         let sshRows = sshDiscoveryRows(in: app)
@@ -338,6 +893,7 @@ final class LitterUITests: XCTestCase {
         }
     }
 
+    @MainActor
     private func waitForDiscoveryListToPopulate(
         in app: XCUIApplication,
         timeout: TimeInterval,
@@ -362,6 +918,7 @@ final class LitterUITests: XCTestCase {
         }
     }
 
+    @MainActor
     private func selectPreferredDiscoveryServer(in app: XCUIApplication, preferredHostFragment: String) -> Bool {
         let discoveryList = identifiedElement("discovery.list", in: app)
         guard discoveryList.waitForExistence(timeout: 8) else { return false }
@@ -391,6 +948,7 @@ final class LitterUITests: XCTestCase {
         return false
     }
 
+    @MainActor
     private func tapPreferredDiscoveryRow(in app: XCUIApplication, hostFragment: String) -> Bool {
         let normalized = hostFragment
             .lowercased()
@@ -410,6 +968,7 @@ final class LitterUITests: XCTestCase {
         return true
     }
 
+    @MainActor
     private func tapPreferredHostText(in app: XCUIApplication, hostFragment: String) -> Bool {
         let hostTexts = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", hostFragment))
         let first = hostTexts.firstMatch
@@ -418,20 +977,24 @@ final class LitterUITests: XCTestCase {
         return true
     }
 
+    @MainActor
     private func waitForDiscoveryVisible(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         waitUntil(timeout: timeout) { isDiscoveryVisible(in: app) }
     }
 
+    @MainActor
     private func waitForDiscoveryDismissed(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         let discoveryList = identifiedElement("discovery.list", in: app)
         return waitUntil(timeout: timeout) { !discoveryList.exists || !discoveryList.isHittable }
     }
 
+    @MainActor
     private func isDiscoveryVisible(in app: XCUIApplication) -> Bool {
         let discoveryList = identifiedElement("discovery.list", in: app)
         return discoveryList.exists && discoveryList.isHittable
     }
 
+    @MainActor
     private func waitForHomeContentReady(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         let connectedServerRow = app.descendants(matching: .any).matching(identifier: "home.connectedServerRow")
         let connectButton = app.buttons["Connect Server"]
@@ -441,6 +1004,7 @@ final class LitterUITests: XCTestCase {
         }
     }
 
+    @MainActor
     private func openFirstConnectedServer(in app: XCUIApplication) -> Bool {
         let rows = app.descendants(matching: .any).matching(identifier: "home.connectedServerRow")
         let firstRow = rows.firstMatch
@@ -449,6 +1013,7 @@ final class LitterUITests: XCTestCase {
         return true
     }
 
+    @MainActor
     private func waitForSessionsScreen(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         let sessionsContainer = identifiedElement("sessions.container", in: app)
         return waitUntil(timeout: timeout) {
@@ -456,11 +1021,13 @@ final class LitterUITests: XCTestCase {
         }
     }
 
+    @MainActor
     private func waitForAnySession(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         let rows = app.descendants(matching: .any).matching(identifier: "sessions.sessionRow")
         return waitUntil(timeout: timeout) { rows.firstMatch.exists }
     }
 
+    @MainActor
     private func selectFirstSession(in app: XCUIApplication) -> Bool {
         let sessionsContainer = identifiedElement("sessions.container", in: app)
         let rowQuery = app.descendants(matching: .any).matching(identifier: "sessions.sessionRow")
@@ -496,6 +1063,7 @@ final class LitterUITests: XCTestCase {
         return false
     }
 
+    @MainActor
     private func waitForConversationLoaded(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         let backButton = app.buttons["header.homeButton"]
         let sessionsContainer = identifiedElement("sessions.container", in: app)
@@ -504,7 +1072,12 @@ final class LitterUITests: XCTestCase {
         }
     }
 
-    private func waitUntil(timeout: TimeInterval, poll: TimeInterval = 0.2, condition: () -> Bool) -> Bool {
+    @MainActor
+    private func waitUntil(
+        timeout: TimeInterval,
+        poll: TimeInterval = 0.2,
+        condition: @MainActor () -> Bool
+    ) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if condition() {
@@ -515,16 +1088,19 @@ final class LitterUITests: XCTestCase {
         return condition()
     }
 
+    @MainActor
     private func identifiedElement(_ identifier: String, in app: XCUIApplication) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
     }
 
+    @MainActor
     private func elementLabeled(_ label: String, in app: XCUIApplication) -> XCUIElement {
         app.descendants(matching: .any)
             .matching(NSPredicate(format: "label == %@", label))
             .firstMatch
     }
 
+    @MainActor
     private func scrollUntilHittable(
         _ element: XCUIElement,
         in app: XCUIApplication,
@@ -539,6 +1115,7 @@ final class LitterUITests: XCTestCase {
         return element.exists && element.isHittable
     }
 
+    @MainActor
     private func attachScreenshot(named name: String, app: XCUIApplication) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
@@ -546,10 +1123,33 @@ final class LitterUITests: XCTestCase {
         add(attachment)
     }
 
+    @MainActor
+    private func attachHierarchy(named name: String, app: XCUIApplication) {
+        let attachment = XCTAttachment(string: app.debugDescription)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor
+    private func elementContainingText(_ text: String, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(
+                NSPredicate(
+                    format: "label CONTAINS %@ OR value CONTAINS %@",
+                    text,
+                    text
+                )
+            )
+            .firstMatch
+    }
+
+    @MainActor
     private func codexDiscoveryRows(in app: XCUIApplication) -> XCUIElementQuery {
         app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "discovery.server.codex."))
     }
 
+    @MainActor
     private func sshDiscoveryRows(in app: XCUIApplication) -> XCUIElementQuery {
         app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "discovery.server.ssh."))
     }
@@ -569,6 +1169,7 @@ final class LitterUITests: XCTestCase {
         return app
     }
 
+    @MainActor
     private func appleCourseSetupApp(
         onDeviceAvailable: Bool,
         privateCloudAvailable: Bool
@@ -582,6 +1183,7 @@ final class LitterUITests: XCTestCase {
         return app
     }
 
+    @MainActor
     private func continuePastIntroIfNeeded(in app: XCUIApplication) {
         let continueButton = app.buttons["learnfold-intro-continue"]
         if continueButton.waitForExistence(timeout: 4),
@@ -590,6 +1192,7 @@ final class LitterUITests: XCTestCase {
         }
     }
 
+    @MainActor
     private func waitUntilHittable(
         _ element: XCUIElement,
         timeout: TimeInterval
@@ -601,6 +1204,7 @@ final class LitterUITests: XCTestCase {
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
+    @MainActor
     private func findStaticText(_ label: String, in app: XCUIApplication) -> Bool {
         let text = app.staticTexts[label]
         if text.exists {

@@ -167,7 +167,8 @@ enum HermesPairingPendingStoreError: LocalizedError {
     }
 }
 
-final class HermesPairingPendingKeychainStore: HermesPairingPendingStoring {
+/// Keychain calls are synchronous and the instance has no mutable state.
+final class HermesPairingPendingKeychainStore: HermesPairingPendingStoring, @unchecked Sendable {
     static let shared = HermesPairingPendingKeychainStore()
 
     private let service: String
@@ -267,6 +268,68 @@ struct HermesPairingClaimResult: Equatable, Sendable {
     let payload: String
 }
 
+/// Debug-only, non-live checkpoints for the Learnfold Link pairing views.
+/// These values never name a real host and never carry a usable credential.
+enum HermesLinkCheckpointScenario: String, CaseIterable {
+    case initial, copied, creating, waiting, paused, retrying, expired, renewed
+    case review, confirmation, claiming, finishing
+    case scanner, cameraDenied = "camera-denied", parseError = "parse-error", validReview = "valid-review"
+
+    static let argument = "--ui-test-hermes-link-checkpoint"
+
+    static func current(arguments: [String] = ProcessInfo.processInfo.arguments) -> Self? {
+        if case let .scenario(scenario) = HermesLinkCheckpointConfiguration.parse(arguments: arguments) {
+            return scenario
+        }
+        return nil
+    }
+}
+
+/// A checkpoint is opt-in twice: XCTest must set the test environment and the
+/// process must supply exactly one complete checkpoint argument pair.  Any
+/// malformed request stays visibly non-live rather than falling through to the
+/// production broker.
+enum HermesLinkCheckpointConfiguration: Equatable {
+    case disabled
+    case scenario(HermesLinkCheckpointScenario)
+    case invalid
+
+    static func parse(
+        arguments: [String] = ProcessInfo.processInfo.arguments,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Self {
+        let occurrences = arguments.enumerated().filter { $0.element == HermesLinkCheckpointScenario.argument }
+        let hasCheckpointShapedToken = arguments.contains {
+            $0.hasPrefix("--ui-test-hermes-link") || HermesLinkCheckpointScenario(rawValue: $0) != nil
+        }
+        guard hasCheckpointShapedToken else { return .disabled }
+        guard environment["LEARNFOLD_UI_TESTING"] == "1", occurrences.count == 1,
+              let index = occurrences.first?.offset, index + 1 < arguments.count,
+              HermesLinkCheckpointScenario(rawValue: arguments[index + 1]) != nil
+        else { return .invalid }
+        // A scenario may only be expressed as the single value following the flag.
+        guard arguments.count == 3,
+              index == 1,
+              arguments.filter({ HermesLinkCheckpointScenario(rawValue: $0) != nil }).count == 1,
+              arguments[index + 1] != HermesLinkCheckpointScenario.argument
+        else { return .invalid }
+        return .scenario(HermesLinkCheckpointScenario(rawValue: arguments[index + 1])!)
+    }
+}
+
+actor HermesLinkCheckpointNoopBroker: HermesPairingBrokerServing {
+    func createRequest(installationId: String) async throws -> HermesPairingRequest { throw CancellationError() }
+    func status(for pairing: HermesPairingRequest) async throws -> HermesPairingStatus { throw CancellationError() }
+    func claim(_ pairing: HermesPairingRequest) async throws -> String { throw CancellationError() }
+    func cancel(_ pairing: HermesPairingRequest) async {}
+}
+
+final class HermesLinkCheckpointNoopStore: HermesPairingPendingStoring {
+    func load() throws -> HermesPairingRequest? { nil }
+    func save(_ request: HermesPairingRequest) throws {}
+    func clear() throws {}
+}
+
 enum HermesPairingConnectionCommitPolicy {
     static let credentialPersistenceFailureMessage =
         "The host connected, but Learnfold could not save its credential securely. Try Connect again."
@@ -291,15 +354,35 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
         case claimed
     }
 
+    private enum ClearReason {
+        case cancelled
+        case completed
+        case expired
+
+        var requiresNewSetupPrompt: Bool {
+            switch self {
+            case .expired:
+                true
+            case .cancelled, .completed:
+                false
+            }
+        }
+    }
+
     @Published private(set) var request: HermesPairingRequest?
     @Published private(set) var readyHost: HermesPairingStatus.Host?
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var statusMessage = "Create a secure request, then paste the prompt into Hermes."
     @Published private(set) var errorMessage: String?
     @Published private(set) var isCreating = false
+    @Published private(set) var requiresNewSetupPrompt = false
 
     var canReviewReadyPairing: Bool {
-        request != nil && readyHost != nil && phase != .claiming
+        request != nil && readyHost != nil && phase == .ready
+    }
+
+    var shouldCopyNewSetupPrompt: Bool {
+        requiresNewSetupPrompt
     }
 
     private let broker: any HermesPairingBrokerServing
@@ -311,6 +394,8 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
     private var creationID: UUID?
     private var shouldPoll = true
 
+    private let checkpointScenario: HermesLinkCheckpointScenario?
+
     init(
         broker: any HermesPairingBrokerServing = HermesPairingBrokerClient.shared,
         store: any HermesPairingPendingStoring = HermesPairingPendingKeychainStore.shared,
@@ -318,16 +403,85 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
         now: @escaping () -> Date = Date.init,
         sleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
             try await Task.sleep(for: duration)
-        }
+        },
+        checkpointScenario: HermesLinkCheckpointScenario? = nil,
+        checkpointIsolated: Bool = false
     ) {
         self.broker = broker
         self.store = store
         self.retryPolicy = retryPolicy
         self.now = now
         self.sleep = sleep
+        self.checkpointScenario = checkpointScenario
+        self.checkpointIsolated = checkpointIsolated
+        #if DEBUG
+        installCheckpointIfNeeded()
+        #endif
     }
 
+    var debugCheckpointScenario: HermesLinkCheckpointScenario? { checkpointScenario }
+    private let checkpointIsolated: Bool
+
+    #if DEBUG
+    private func installCheckpointIfNeeded() {
+        guard let checkpointScenario else { return }
+        let request = HermesPairingRequest(
+            requestId: "REDACTED-REQUEST",
+            submitURL: URL(string: "https://example.invalid/redacted")!,
+            claimToken: "REDACTED",
+            expiresAt: now().addingTimeInterval(600)
+        )
+        let host = HermesPairingStatus.Host(name: "Redacted Test Host", nodeId: "REDACTED-NODE")
+        switch checkpointScenario {
+        case .initial:
+            return
+        case .expired:
+            requiresNewSetupPrompt = true
+            statusMessage = "This request expired. Copy a new setup prompt to try again."
+            errorMessage = "Redacted fixture expiration"
+        case .creating:
+            isCreating = true
+            statusMessage = "Creating a secure request…"
+        case .waiting, .copied, .renewed:
+            self.request = request
+            phase = .polling
+            statusMessage = checkpointScenario == .renewed ? "New secure request created. Waiting for Hermes…" : "Waiting for Hermes…"
+        case .paused:
+            self.request = request
+            phase = .paused
+            statusMessage = "Pairing paused while Learnfold is in the background."
+        case .retrying:
+            self.request = request
+            phase = .polling
+            statusMessage = "Network interrupted. Retrying this same request…"
+            errorMessage = "Redacted fixture network interruption"
+        case .review, .confirmation:
+            self.request = request
+            readyHost = host
+            phase = .ready
+            statusMessage = "Hermes sent the pairing securely."
+        case .validReview:
+            statusMessage = "Redacted QR/paste pairing preview."
+        case .scanner, .cameraDenied, .parseError:
+            statusMessage = "Redacted QR/paste pairing preview."
+        case .claiming:
+            self.request = request
+            readyHost = host
+            phase = .claiming
+            statusMessage = "Claiming the one-time credential…"
+        case .finishing:
+            self.request = request
+            readyHost = host
+            phase = .claimed
+            statusMessage = "Pairing received. Finishing the connection…"
+        }
+    }
+    #endif
+
     func restoreAndResume() {
+        #if DEBUG
+        if checkpointIsolated { return }
+        #endif
         guard request == nil else {
             resume()
             return
@@ -338,6 +492,7 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
                 request = saved
                 _ = clearIfCurrent(
                     requestID: saved.requestId,
+                    reason: .expired,
                     status: "The request expired. Copy a new setup prompt to try again.",
                     failureStatus: "The request expired, but Learnfold could not remove its saved credential. Try again."
                 )
@@ -351,6 +506,22 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
     }
 
     func createRequest(installationId: String) async throws -> HermesPairingRequest {
+        #if DEBUG
+        if checkpointScenario != nil {
+            isCreating = false
+            let fixture = HermesPairingRequest(
+                requestId: "REDACTED-REQUEST",
+                submitURL: URL(string: "https://example.invalid/redacted")!,
+                claimToken: "REDACTED",
+                expiresAt: now().addingTimeInterval(600)
+            )
+            request = fixture
+            requiresNewSetupPrompt = false
+            phase = .polling
+            statusMessage = "Waiting for Hermes…"
+            return fixture
+        }
+        #endif
         let operationID = UUID()
         let previous = request
         creationID = operationID
@@ -395,6 +566,9 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
     }
 
     func pause() {
+        #if DEBUG
+        if checkpointIsolated { return }
+        #endif
         shouldPoll = false
         pollingTask?.cancel()
         pollingTask = nil
@@ -407,11 +581,15 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
     }
 
     func resume() {
+        #if DEBUG
+        if checkpointIsolated { return }
+        #endif
         shouldPoll = true
         guard let request else { return }
         guard request.expiresAt > now() else {
             clearIfCurrent(
                 requestID: request.requestId,
+                reason: .expired,
                 status: "The request expired. Copy a new setup prompt to try again.",
                 failureStatus: "The request expired, but Learnfold could not remove its saved credential. Try again."
             )
@@ -430,12 +608,16 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
     }
 
     func cancel() {
+        #if DEBUG
+        if checkpointIsolated { return }
+        #endif
         let cancelled = request
         creationID = nil
         isCreating = false
         pollingTask?.cancel()
         pollingTask = nil
         _ = clearLocalState(
+            reason: .cancelled,
             status: "Create a secure request, then paste the prompt into Hermes.",
             failureStatus: "The request was cancelled, but Learnfold could not remove its saved credential. Try Cancel again."
         )
@@ -445,10 +627,18 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
     }
 
     func claim() async -> HermesPairingClaimResult? {
+        #if DEBUG
+        if checkpointScenario != nil, let request {
+            phase = .claimed
+            statusMessage = "Pairing received. Finishing the connection…"
+            return HermesPairingClaimResult(requestID: request.requestId, payload: "{\"fixture\":\"REDACTED\"}")
+        }
+        #endif
         guard let pairing = request else { return nil }
         guard pairing.expiresAt > now() else {
             clearIfCurrent(
                 requestID: pairing.requestId,
+                reason: .expired,
                 status: "The request expired. Copy a new setup prompt to try again.",
                 failureStatus: "The request expired, but Learnfold could not remove its saved credential. Try again."
             )
@@ -471,6 +661,7 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
             if Self.isTerminal(error) || pairing.expiresAt <= now() {
                 clearIfCurrent(
                     requestID: pairing.requestId,
+                    reason: .expired,
                     status: "This request expired. Copy a new setup prompt to try again.",
                     failureStatus: "The request expired, but Learnfold could not remove its saved credential. Try again."
                 )
@@ -485,6 +676,9 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
 
     @discardableResult
     func completeConnection(requestID: String?) -> Bool {
+        #if DEBUG
+        if checkpointIsolated { return requestID == request?.requestId }
+        #endif
         guard let requestID, let completed = request, completed.requestId == requestID else {
             return false
         }
@@ -492,6 +686,7 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
         pollingTask = nil
         guard clearIfCurrent(
             requestID: completed.requestId,
+            reason: .completed,
             status: "Connected securely.",
             failureStatus: "Connected, but Learnfold could not clear the saved pairing request. Tap Connect to retry cleanup."
         ) else {
@@ -507,6 +702,7 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
 
     private func install(_ pairing: HermesPairingRequest) {
         request = pairing
+        requiresNewSetupPrompt = false
         readyHost = nil
         errorMessage = nil
         statusMessage = "Waiting for Hermes…"
@@ -529,6 +725,7 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
                 guard pairing.expiresAt > self.now() else {
                     self.clearIfCurrent(
                         requestID: pairing.requestId,
+                        reason: .expired,
                         status: "The request expired. Copy a new setup prompt to try again.",
                         failureStatus: "The request expired, but Learnfold could not remove its saved credential. Try again."
                     )
@@ -552,6 +749,7 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
                     if Self.isTerminal(error) || pairing.expiresAt <= self.now() {
                         self.clearIfCurrent(
                             requestID: pairing.requestId,
+                            reason: .expired,
                             status: "This request expired. Copy a new setup prompt to try again.",
                             failureStatus: "The request expired, but Learnfold could not remove its saved credential. Try again."
                         )
@@ -581,15 +779,25 @@ final class HermesPairingLifecycleCoordinator: ObservableObject {
     @discardableResult
     private func clearIfCurrent(
         requestID: String,
+        reason: ClearReason,
         status: String,
         failureStatus: String
     ) -> Bool {
         guard isCurrent(requestID) else { return false }
-        return clearLocalState(status: status, failureStatus: failureStatus)
+        return clearLocalState(
+            reason: reason,
+            status: status,
+            failureStatus: failureStatus
+        )
     }
 
     @discardableResult
-    private func clearLocalState(status: String, failureStatus: String) -> Bool {
+    private func clearLocalState(
+        reason: ClearReason,
+        status: String,
+        failureStatus: String
+    ) -> Bool {
+        requiresNewSetupPrompt = reason.requiresNewSetupPrompt
         do {
             try store.clear()
         } catch {

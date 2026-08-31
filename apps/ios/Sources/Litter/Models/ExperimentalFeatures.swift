@@ -40,6 +40,7 @@ enum LitterFeature: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 @Observable
 final class ExperimentalFeatures {
     static let shared = ExperimentalFeatures()

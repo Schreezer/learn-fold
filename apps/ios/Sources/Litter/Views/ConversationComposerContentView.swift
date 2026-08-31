@@ -499,13 +499,15 @@ struct GoalCardActions {
     var setBudget: (Int64?) -> Void
     var clear: () -> Void
 
-    static let noop = GoalCardActions(
+    static var noop: GoalCardActions {
+        GoalCardActions(
         togglePause: {},
         markComplete: {},
         setObjective: { _ in },
         setBudget: { _ in },
         clear: {}
-    )
+        )
+    }
 }
 
 private struct ConversationComposerGoalRowView: View {

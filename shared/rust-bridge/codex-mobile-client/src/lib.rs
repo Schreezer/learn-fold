@@ -9,6 +9,8 @@ pub mod ish_exec;
 #[cfg(all(target_os = "ios", not(target_abi = "macabi")))]
 pub mod ish_runtime;
 
+pub mod hosted_agent;
+
 // Always-compiled UniFFI-visible types. The host cdylib that
 // `generate-bindings.sh` feeds to uniffi-bindgen must contain these so the
 // generated Swift/Kotlin has `IshRunResult` / `IshBootstrapError` /

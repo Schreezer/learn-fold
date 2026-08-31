@@ -69,6 +69,17 @@ enum CourseCloudSyncEngineError: LocalizedError {
 enum CourseCloudEntitlement {
     static let containerIdentifier = "iCloud.com.chirag.learnfold"
 
+    /// CloudKit is not available to this course-sync transport in Simulator.
+    /// Keep this compile-time capability separate from the entitlement flag so
+    /// an ordinary simulator launch never constructs a `CKContainer`.
+    static var isRuntimeCloudKitAvailable: Bool {
+        #if targetEnvironment(simulator)
+        false
+        #else
+        true
+        #endif
+    }
+
     static var isEnabled: Bool {
         Bundle.main.object(forInfoDictionaryKey: "LearnfoldCourseCloudSyncEnabled") as? Bool == true
     }
@@ -131,7 +142,8 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
     }
 
     func startIfAvailable() async {
-        guard CourseCloudEntitlement.isEnabled else {
+        guard CourseCloudEntitlement.isRuntimeCloudKitAvailable,
+              CourseCloudEntitlement.isEnabled else {
             availability = .missingEntitlement
             return
         }

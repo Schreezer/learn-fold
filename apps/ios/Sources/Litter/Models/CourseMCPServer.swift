@@ -553,7 +553,10 @@ enum CourseMCPProtocol {
                 return "The field 'chapters[\(chapterIndex)].deliverables[\(deliverableIndex)]' must be a non-empty string."
             }
         }
-        return nil
+        return AppleCoursePlanValidator.issue(
+            in: plan,
+            requiresTypedHierarchy: true
+        )
     }
 
     private static func invalidCoursePlanResult(

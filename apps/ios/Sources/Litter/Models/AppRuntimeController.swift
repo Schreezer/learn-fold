@@ -12,11 +12,28 @@ final class AppRuntimeController {
     @ObservationIgnored private let lifecycle = AppLifecycleController()
     @ObservationIgnored private let liveActivities = TurnLiveActivityController()
     @ObservationIgnored private let reachability = NetworkReachabilityObserver()
+    @ObservationIgnored private let notificationPermissions: AppNotificationPermissionController
     @ObservationIgnored private var continuedTurnBackground: (any ContinuedTurnBackgroundControlling)?
     @ObservationIgnored private var pendingLiveActivitySync = false
     @ObservationIgnored private var lastLiveActivitySyncTime: CFAbsoluteTime = 0
 
+    init(
+        notificationPermissions: AppNotificationPermissionController? = nil
+    ) {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "AppRuntimeController.init"
+        )
+        self.notificationPermissions = notificationPermissions ?? .shared
+    }
+
     func bind(appModel: AppModel, voiceRuntime: VoiceRuntimeController) {
+        guard !LearnfoldStrictHarnessPolicy.isStrictHarnessActive() else {
+            return
+        }
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "AppRuntimeController.bind"
+        )
+        notificationPermissions.runtimeDidBind()
         self.appModel = appModel
         self.voiceRuntime = voiceRuntime
         if #available(iOS 26.0, *), continuedTurnBackground == nil {
@@ -29,7 +46,6 @@ final class AppRuntimeController {
                 }
             )
         }
-        lifecycle.requestNotificationPermissionIfNeeded()
         reachability.bind(appModel: appModel)
         reachability.start()
         loadAndPushAlleycatSecretKey(client: appModel.client)

@@ -14,14 +14,16 @@ public struct DefaultCodeSyntaxHighlighter: CodeSyntaxHighlighter {
 
     public func highlightCode(_ code: String, language: String?) -> AttributedString {
         var attributed = AttributedString(code)
-        attributed.font = .system(.body, design: .monospaced)
+        attributed[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = .system(.body, design: .monospaced)
         return attributed
     }
 }
 
 // MARK: - HighlightrCodeSyntaxHighlighter
 
-public final class HighlightrCodeSyntaxHighlighter: CodeSyntaxHighlighter {
+/// Highlightr itself is not Sendable, but every access to its mutable state is
+/// serialized by `lock`; the instance is therefore safe to share.
+public final class HighlightrCodeSyntaxHighlighter: CodeSyntaxHighlighter, @unchecked Sendable {
     private var currentTheme: String
     private let lock = NSLock()
     private var _highlightr: Highlightr?
@@ -76,7 +78,7 @@ public final class HighlightrCodeSyntaxHighlighter: CodeSyntaxHighlighter {
         }
 
         var attributed = AttributedString(code)
-        attributed.font = .system(.body, design: .monospaced)
+        attributed[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = .system(.body, design: .monospaced)
         return attributed
     }
 
@@ -119,7 +121,11 @@ extension HighlightrCodeSyntaxHighlighter {
 // MARK: - Environment Key
 
 private struct CodeSyntaxHighlighterKey: EnvironmentKey {
-    static let defaultValue: any CodeSyntaxHighlighter = HighlightrCodeSyntaxHighlighter()
+    // A computed default avoids retaining a non-Sendable existential in
+    // nonisolated static storage. SwiftUI owns this value on the view path.
+    static var defaultValue: any CodeSyntaxHighlighter {
+        HighlightrCodeSyntaxHighlighter()
+    }
 }
 
 extension EnvironmentValues {

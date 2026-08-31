@@ -252,6 +252,7 @@ struct HomeDashboardView: View {
                 set: { if !$0 { renameServerTarget = nil } }
             )) {
                 TextField("Server name", text: $renameServerText)
+                    .accessibilityIdentifier("lf15-rename-server-field")
                 Button("Cancel", role: .cancel) { renameServerTarget = nil }
                 Button("Save") {
                     if let server = renameServerTarget {
@@ -1749,8 +1750,10 @@ private struct SessionPulsingDots: View {
         }
         .onAppear {
             Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    phase = (phase + 1) % 3
+                Task { @MainActor in
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        phase = (phase + 1) % 3
+                    }
                 }
             }
         }

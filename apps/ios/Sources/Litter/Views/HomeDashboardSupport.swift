@@ -309,7 +309,7 @@ enum HomeDashboardSupport {
             // when present so the entry survives if codex is renamed
             // server-side; fall back to the literal "codex" id
             // otherwise (cold start before first probe).
-            let fallback = AgentRuntimeMetadataProvider.all?()
+            let fallback = AgentRuntimeMetadataProvider.allMetadata()
                 .first(where: { $0.capabilities?.usesDirectCodexPort == true })?
                 .name
                 ?? "codex"

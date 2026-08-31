@@ -371,7 +371,7 @@ private struct RowEntranceModifier: ViewModifier {
     }
 }
 
-struct RowEntranceEffect: ViewModifier, Animatable {
+struct RowEntranceEffect: ViewModifier, @preconcurrency Animatable {
     var progress: CGFloat
     var yOffset: CGFloat
     var minScale: CGFloat
@@ -419,7 +419,7 @@ extension AnyTransition {
     }
 }
 
-private struct ConversationTimelineItemRow: View, Equatable {
+private struct ConversationTimelineItemRow: View, @preconcurrency Equatable {
     private let renderCache = MessageRenderCache.shared
     @Environment(ThemeManager.self) private var themeManager
 
@@ -716,19 +716,19 @@ private struct ConversationTimelineItemRow: View, Equatable {
             var attributed = AttributedString()
 
             var verbText = AttributedString("\(verb) ")
-            verbText.foregroundColor = LitterTheme.textSecondary
+            verbText[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = LitterTheme.textSecondary
             attributed.append(verbText)
 
             var fileText = AttributedString(filename)
-            fileText.foregroundColor = LitterTheme.accent
+            fileText[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = LitterTheme.accent
             attributed.append(fileText)
 
             var additionsText = AttributedString(" +\(additions)")
-            additionsText.foregroundColor = LitterTheme.success
+            additionsText[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = LitterTheme.success
             attributed.append(additionsText)
 
             var deletionsText = AttributedString(" -\(deletions)")
-            deletionsText.foregroundColor = LitterTheme.danger
+            deletionsText[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = LitterTheme.danger
             attributed.append(deletionsText)
 
             return (plainText, attributed)
@@ -740,14 +740,14 @@ private struct ConversationTimelineItemRow: View, Equatable {
 
         let plainText = "Changed \(data.changes.count) files +\(additions) -\(deletions)"
         var attributed = AttributedString("Changed \(data.changes.count) files")
-        attributed.foregroundColor = LitterTheme.textSystem
+        attributed[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = LitterTheme.textSystem
 
         var additionsText = AttributedString(" +\(additions)")
-        additionsText.foregroundColor = LitterTheme.success
+        additionsText[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = LitterTheme.success
         attributed.append(additionsText)
 
         var deletionsText = AttributedString(" -\(deletions)")
-        deletionsText.foregroundColor = LitterTheme.danger
+        deletionsText[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = LitterTheme.danger
         attributed.append(deletionsText)
 
         return (plainText, attributed)

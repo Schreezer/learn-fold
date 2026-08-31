@@ -1,5 +1,13 @@
 import SwiftUI
 
+#if DEBUG
+enum SSHAgentPickerCheckpointState: String {
+    case loading
+    case error
+    case populated
+}
+#endif
+
 struct SSHBridgeAgentContext: Identifiable {
     let id: String
     let server: DiscoveredServer
@@ -7,6 +15,9 @@ struct SSHBridgeAgentContext: Identifiable {
     let host: String
     let availability: [RemoteAgentAvailability]
     let credentials: SSHCredentials
+    #if DEBUG
+    let checkpointRuntimeMetadata: [AppAgentMetadata]
+    #endif
 
     init(
         server: DiscoveredServer,
@@ -21,6 +32,37 @@ struct SSHBridgeAgentContext: Identifiable {
         self.host = host
         self.availability = availability
         self.credentials = credentials
+        #if DEBUG
+        self.checkpointRuntimeMetadata = []
+        #endif
+    }
+
+    #if DEBUG
+    init(
+        server: DiscoveredServer,
+        sessionId: String,
+        host: String,
+        availability: [RemoteAgentAvailability],
+        credentials: SSHCredentials,
+        checkpointRuntimeMetadata: [AppAgentMetadata]
+    ) {
+        self.id = sessionId
+        self.server = server
+        self.sessionId = sessionId
+        self.host = host
+        self.availability = availability
+        self.credentials = credentials
+        self.checkpointRuntimeMetadata = checkpointRuntimeMetadata
+    }
+    #endif
+
+    func isBetaRuntime(_ kind: AgentRuntimeKind) -> Bool {
+        #if DEBUG
+        if let metadata = checkpointRuntimeMetadata.first(where: { $0.name == kind }) {
+            return metadata.presentation?.isBeta ?? true
+        }
+        #endif
+        return kind.isBeta
     }
 }
 
@@ -33,9 +75,25 @@ struct SSHBridgeAgentResult {
     let runtimeKinds: [AgentRuntimeKind]
 }
 
+@MainActor
+enum SSHAgentPickerRuntimeDependencies {
+    case live(appModel: AppModel)
+    case inertCheckpoint
+
+    var appModel: AppModel? {
+        guard case .live(let appModel) = self else { return nil }
+        return appModel
+    }
+
+    var isInertCheckpoint: Bool {
+        if case .inertCheckpoint = self { return true }
+        return false
+    }
+}
+
 struct SSHAgentPickerSheet: View {
     let context: SSHBridgeAgentContext
-    let appModel: AppModel
+    private let runtimeDependencies: SSHAgentPickerRuntimeDependencies
     let onConnected: (SSHBridgeAgentResult) -> Void
     let onUseCodex: () -> Void
     let onCancel: () -> Void
@@ -44,6 +102,9 @@ struct SSHAgentPickerSheet: View {
     @State private var selectedKinds: Set<AgentRuntimeKind>
     @State private var isConnecting = false
     @State private var connectError: String?
+    #if DEBUG
+    @State private var checkpointState: SSHAgentPickerCheckpointState?
+    #endif
 
     init(
         context: SSHBridgeAgentContext,
@@ -53,20 +114,73 @@ struct SSHAgentPickerSheet: View {
         onCancel: @escaping () -> Void
     ) {
         self.context = context
-        self.appModel = appModel
+        self.runtimeDependencies = .live(appModel: appModel)
         self.onConnected = onConnected
         self.onUseCodex = onUseCodex
         self.onCancel = onCancel
         _selectedKinds = State(initialValue: Set(
-            Self.availableBridgeKinds(in: context.availability).filter { !$0.isBeta }
+            Self.availableBridgeKinds(in: context.availability).filter {
+                !context.isBetaRuntime($0)
+            }
         ))
     }
+
+    #if DEBUG
+    init(
+        context: SSHBridgeAgentContext,
+        checkpointState: SSHAgentPickerCheckpointState,
+        onConnected: @escaping (SSHBridgeAgentResult) -> Void,
+        onUseCodex: @escaping () -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self.context = context
+        self.runtimeDependencies = .inertCheckpoint
+        self.onConnected = onConnected
+        self.onUseCodex = onUseCodex
+        self.onCancel = onCancel
+        _selectedKinds = State(initialValue: Set(
+            Self.availableBridgeKinds(in: context.availability).filter {
+                !context.isBetaRuntime($0)
+            }
+        ))
+        _isConnecting = State(initialValue: checkpointState == .loading)
+        _connectError = State(
+            initialValue: checkpointState == .error
+                ? "Remote agents could not be started on the redacted test host."
+                : nil
+        )
+        _checkpointState = State(initialValue: checkpointState)
+    }
+    #endif
 
     var body: some View {
         NavigationStack {
             ZStack {
                 LitterTheme.backgroundGradient.ignoresSafeArea()
                 Form {
+                    #if DEBUG
+                    if let checkpointState {
+                        Section {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("DEBUG CHECKPOINT · NON-LIVE")
+                                    .litterFont(.caption2, weight: .semibold)
+                                    .foregroundColor(.orange)
+                                Text("LF-12 · \(checkpointState.rawValue)")
+                                    .litterFont(.footnote, weight: .semibold)
+                                    .foregroundColor(LitterTheme.textPrimary)
+                            }
+                            Text(checkpointState.rawValue)
+                                .litterFont(.caption, weight: .semibold)
+                                .foregroundColor(LitterTheme.textSecondary)
+                                .accessibilityIdentifier("ssh-agent-picker-status")
+                        } footer: {
+                            Text("Static Debug fixture. SSH and filesystem state roots are disabled.")
+                                .litterFont(.caption2)
+                                .foregroundColor(LitterTheme.textMuted)
+                        }
+                        .listRowBackground(LitterTheme.surface.opacity(0.6))
+                    }
+                    #endif
                     hostSection
                     agentSection
                     connectSection
@@ -75,6 +189,7 @@ struct SSHAgentPickerSheet: View {
                             Text(connectError)
                                 .litterFont(.caption)
                                 .foregroundColor(LitterTheme.danger)
+                                .accessibilityIdentifier("ssh-agent-picker-error")
                         }
                         .listRowBackground(LitterTheme.surface.opacity(0.6))
                     }
@@ -94,6 +209,8 @@ struct SSHAgentPickerSheet: View {
                 }
             }
         }
+        .accessibilityIdentifier("ssh-agent-picker-checkpoint-root")
+        .serverLifecycleStrictHarnessBoundaryIfActive()
     }
 
     private var hostSection: some View {
@@ -133,7 +250,7 @@ struct SSHAgentPickerSheet: View {
                                 Text(runtimeDisplayName(agent.kind))
                                     .litterFont(.subheadline)
                                     .foregroundColor(agent.status == .available ? LitterTheme.textPrimary : LitterTheme.textMuted)
-                                if agent.kind.isBeta {
+                                if context.isBetaRuntime(agent.kind) {
                                     BetaBadge()
                                 }
                             }
@@ -152,6 +269,8 @@ struct SSHAgentPickerSheet: View {
                     }
                 }
                 .disabled(!isBridgeKind(agent.kind) || agent.status != .available || isConnecting)
+                .accessibilityIdentifier("ssh-agent-row-\(agent.kind)")
+                .accessibilityValue(selectedKinds.contains(agent.kind) ? "selected" : "not selected")
             }
         } header: {
             HStack {
@@ -190,6 +309,7 @@ struct SSHAgentPickerSheet: View {
                 }
             }
             .disabled(isConnecting || selectedKinds.isEmpty)
+            .accessibilityIdentifier("ssh-agent-connect")
 
             Button("Use Codex SSH") {
                 onUseCodex()
@@ -198,6 +318,7 @@ struct SSHAgentPickerSheet: View {
             .litterFont(.footnote)
             .foregroundColor(LitterTheme.textSecondary)
             .disabled(isConnecting)
+            .accessibilityIdentifier("ssh-agent-use-codex")
         }
         .listRowBackground(LitterTheme.surface.opacity(0.6))
     }
@@ -207,6 +328,21 @@ struct SSHAgentPickerSheet: View {
     }
 
     private func connect() {
+        #if DEBUG
+        if checkpointState != nil {
+            checkpointState = .loading
+            isConnecting = true
+            connectError = nil
+            return
+        }
+        #endif
+        guard !runtimeDependencies.isInertCheckpoint,
+              let appModel = runtimeDependencies.appModel else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "SSHAgentPickerSheet.inertCheckpoint.connect"
+            )
+            return
+        }
         isConnecting = true
         connectError = nil
         let runtimeKinds = Array(selectedKinds).sorted { runtimeSortRank($0) < runtimeSortRank($1) }

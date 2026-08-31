@@ -1,8 +1,66 @@
 import SwiftUI
 
+enum SSHLoginSubmissionOutcome: Equatable {
+    case accepted
+    case rejected(message: String)
+    case inProgress
+
+    var disposition: SSHLoginSubmissionDisposition {
+        switch self {
+        case .accepted:
+            return SSHLoginSubmissionDisposition(
+                shouldPersistCredentials: true,
+                shouldClearSensitiveInput: true,
+                shouldKeepSheetPresented: false,
+                errorMessage: nil
+            )
+        case .rejected(let message):
+            return SSHLoginSubmissionDisposition(
+                shouldPersistCredentials: false,
+                shouldClearSensitiveInput: false,
+                shouldKeepSheetPresented: true,
+                errorMessage: message
+            )
+        case .inProgress:
+            return SSHLoginSubmissionDisposition(
+                shouldPersistCredentials: false,
+                shouldClearSensitiveInput: false,
+                shouldKeepSheetPresented: true,
+                errorMessage: nil
+            )
+        }
+    }
+}
+
+struct SSHLoginSubmissionDisposition: Equatable {
+    let shouldPersistCredentials: Bool
+    let shouldClearSensitiveInput: Bool
+    let shouldKeepSheetPresented: Bool
+    let errorMessage: String?
+}
+
+enum SSHLoginRuntimeMode: Equatable {
+    case live
+    case inertCheckpoint
+
+    var allowsCredentialStoreAccess: Bool {
+        self == .live
+    }
+}
+
+#if DEBUG
+enum SSHLoginCheckpointState: String {
+    case empty
+    case authError = "auth-error"
+    case submitted
+}
+#endif
+
 struct SSHLoginSheet: View {
     let server: DiscoveredServer
-    let onConnect: (ConnectionTarget) -> Void
+    private let onSubmit: (ConnectionTarget) async -> SSHLoginSubmissionOutcome
+    private let onAccepted: () -> Void
+    private let runtimeMode: SSHLoginRuntimeMode
     private let autoLoadSavedCredentials: Bool
 
     @Environment(\.dismiss) private var dismiss
@@ -18,18 +76,73 @@ struct SSHLoginSheet: View {
     @State private var loadedSavedCredentials = false
     @State private var isConnecting = false
     @State private var errorMessage: String?
+    #if DEBUG
+    @State private var checkpointState: SSHLoginCheckpointState?
+
+    var debugRuntimeMode: SSHLoginRuntimeMode { runtimeMode }
+    var debugAutoLoadsSavedCredentials: Bool { autoLoadSavedCredentials }
+    #endif
 
     init(
         server: DiscoveredServer,
+        runtimeMode: SSHLoginRuntimeMode = .live,
         autoLoadSavedCredentials: Bool = true,
         initialUsername: String = "",
         onConnect: @escaping (ConnectionTarget) -> Void
     ) {
         self.server = server
-        self.onConnect = onConnect
-        self.autoLoadSavedCredentials = autoLoadSavedCredentials
+        self.onSubmit = { target in
+            onConnect(target)
+            return .accepted
+        }
+        self.onAccepted = {}
+        self.runtimeMode = runtimeMode
+        self.autoLoadSavedCredentials =
+            autoLoadSavedCredentials && runtimeMode.allowsCredentialStoreAccess
         _username = State(initialValue: initialUsername)
     }
+
+    init(
+        server: DiscoveredServer,
+        runtimeMode: SSHLoginRuntimeMode = .live,
+        autoLoadSavedCredentials: Bool = true,
+        initialUsername: String = "",
+        onSubmit: @escaping (ConnectionTarget) async -> SSHLoginSubmissionOutcome,
+        onAccepted: @escaping () -> Void
+    ) {
+        self.server = server
+        self.onSubmit = onSubmit
+        self.onAccepted = onAccepted
+        self.runtimeMode = runtimeMode
+        self.autoLoadSavedCredentials =
+            autoLoadSavedCredentials && runtimeMode.allowsCredentialStoreAccess
+        _username = State(initialValue: initialUsername)
+    }
+
+    #if DEBUG
+    init(
+        server: DiscoveredServer,
+        checkpointState: SSHLoginCheckpointState,
+        onSubmit: @escaping (ConnectionTarget) async -> SSHLoginSubmissionOutcome,
+        onAccepted: @escaping () -> Void
+    ) {
+        self.server = server
+        self.onSubmit = onSubmit
+        self.onAccepted = onAccepted
+        self.runtimeMode = .inertCheckpoint
+        self.autoLoadSavedCredentials = false
+        _username = State(initialValue: checkpointState == .empty ? "" : "checkpoint-user")
+        _password = State(initialValue: checkpointState == .empty ? "" : "fixture-only")
+        _rememberCredentials = State(initialValue: false)
+        _isConnecting = State(initialValue: checkpointState == .submitted)
+        _errorMessage = State(
+            initialValue: checkpointState == .authError
+                ? "Authentication failed for the redacted test host."
+                : nil
+        )
+        _checkpointState = State(initialValue: checkpointState)
+    }
+    #endif
 
     private var sshPort: Int {
         Int(server.resolvedSSHPort)
@@ -47,6 +160,33 @@ struct SSHLoginSheet: View {
             ZStack {
                 LitterTheme.backgroundGradient.ignoresSafeArea()
                 Form {
+                    #if DEBUG
+                    if let checkpointState {
+                        Section {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("DEBUG CHECKPOINT · NON-LIVE")
+                                    .litterFont(.caption2, weight: .semibold)
+                                    .foregroundColor(.orange)
+                                Text("LF-11 · \(checkpointState.rawValue)")
+                                    .litterFont(.footnote, weight: .semibold)
+                                    .foregroundColor(LitterTheme.textPrimary)
+                            }
+                            Text(checkpointState.rawValue)
+                                .litterFont(.caption, weight: .semibold)
+                                .foregroundColor(LitterTheme.textSecondary)
+                                .accessibilityIdentifier("ssh-login-status")
+                            Text(password.isEmpty ? "credential empty" : "credential retained")
+                                .litterFont(.caption2)
+                                .foregroundColor(LitterTheme.textMuted)
+                                .accessibilityIdentifier("ssh-login-password-state")
+                        } footer: {
+                            Text("Static Debug fixture. Keychain and SSH are disabled.")
+                                .litterFont(.caption2)
+                                .foregroundColor(LitterTheme.textMuted)
+                        }
+                        .listRowBackground(LitterTheme.surface.opacity(0.6))
+                    }
+                    #endif
                     Section {
                         HStack(spacing: 12) {
                             Image(systemName: "terminal")
@@ -69,6 +209,7 @@ struct SSHLoginSheet: View {
                             .foregroundColor(LitterTheme.textPrimary)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
+                            .accessibilityIdentifier("ssh-login-username")
                     } header: {
                         Text("Username")
                             .foregroundColor(LitterTheme.textSecondary)
@@ -81,6 +222,7 @@ struct SSHLoginSheet: View {
                             Text("SSH Key").tag(true)
                         }
                         .pickerStyle(.segmented)
+                        .accessibilityIdentifier("ssh-login-method")
                         .listRowBackground(LitterTheme.surface.opacity(0.6))
 
                         if useKey {
@@ -160,6 +302,7 @@ struct SSHLoginSheet: View {
                             }
                         }
                         .disabled(isConnecting || username.isEmpty || (!useKey && password.isEmpty) || (useKey && privateKey.isEmpty))
+                        .accessibilityIdentifier("ssh-login-connect")
                     }
                     .listRowBackground(LitterTheme.surface.opacity(0.6))
 
@@ -168,6 +311,7 @@ struct SSHLoginSheet: View {
                             Text(err)
                                 .foregroundColor(.red)
                                 .litterFont(.caption)
+                                .accessibilityIdentifier("ssh-login-error")
                         }
                         .listRowBackground(LitterTheme.surface.opacity(0.6))
                     }
@@ -180,12 +324,17 @@ struct SSHLoginSheet: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") { dismiss() }
                         .foregroundColor(LitterTheme.accent)
+                        .disabled(isConnecting)
                 }
             }
         }
+        .accessibilityIdentifier("ssh-login-checkpoint-root")
+        .serverLifecycleStrictHarnessBoundaryIfActive()
+        .interactiveDismissDisabled(isConnecting)
         .task {
-            guard autoLoadSavedCredentials else { return }
-            loadSavedCredentialsIfNeeded()
+            if autoLoadSavedCredentials {
+                loadSavedCredentialsIfNeeded()
+            }
         }
         .onChange(of: useKey) { _, isUsingKey in
             if isUsingKey {
@@ -210,6 +359,7 @@ struct SSHLoginSheet: View {
             .foregroundColor(LitterTheme.textPrimary)
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled(true)
+            .accessibilityIdentifier("ssh-login-password")
 
             Button {
                 isPasswordVisible.toggle()
@@ -241,34 +391,89 @@ struct SSHLoginSheet: View {
         errorMessage = nil
 
         Task {
-            do {
-                do {
-                    if rememberCredentials {
-                        try SSHCredentialStore.shared.save(
-                            savedCredential(from: credentials),
-                            host: server.hostname,
-                            port: sshPort
-                        )
-                        hasSavedCredentials = true
-                    } else {
-                        try SSHCredentialStore.shared.delete(host: server.hostname, port: sshPort)
-                        hasSavedCredentials = false
-                    }
-                } catch {
-                    NSLog("[SSH_CREDENTIALS] keychain update failed: %@", error.localizedDescription)
-                }
+            let outcome = await onSubmit(
+                .sshThenRemote(host: server.hostname, credentials: credentials)
+            )
+            let disposition = outcome.disposition
 
+            if disposition.shouldPersistCredentials {
+                persistAcceptedCredentials(credentials)
+            }
+            if disposition.shouldClearSensitiveInput {
                 clearSensitiveInput()
+            }
+
+            switch outcome {
+            case .accepted:
                 isConnecting = false
-                onConnect(.sshThenRemote(host: server.hostname, credentials: credentials))
-            } catch {
+                errorMessage = nil
+                onAccepted()
+            case .rejected(let message):
                 isConnecting = false
-                errorMessage = error.localizedDescription
+                errorMessage = message
+                #if DEBUG
+                if checkpointState != nil {
+                    checkpointState = .authError
+                }
+                #endif
+            case .inProgress:
+                errorMessage = nil
+                #if DEBUG
+                if checkpointState != nil {
+                    checkpointState = .submitted
+                }
+                #endif
             }
         }
     }
 
+    private func persistAcceptedCredentials(_ credentials: SSHCredentials) {
+        guard runtimeMode.allowsCredentialStoreAccess else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "SSHLoginSheet.inertCheckpoint.persistCredentials"
+            )
+            return
+        }
+        #if DEBUG
+        guard checkpointState == nil else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "SSHLoginSheet.checkpoint.persistCredentials"
+            )
+            return
+        }
+        #endif
+        do {
+            if rememberCredentials {
+                try SSHCredentialStore.shared.save(
+                    savedCredential(from: credentials),
+                    host: server.hostname,
+                    port: sshPort
+                )
+                hasSavedCredentials = true
+            } else {
+                try SSHCredentialStore.shared.delete(host: server.hostname, port: sshPort)
+                hasSavedCredentials = false
+            }
+        } catch {
+            NSLog("[SSH_CREDENTIALS] keychain update failed: %@", error.localizedDescription)
+        }
+    }
+
     private func loadSavedCredentialsIfNeeded() {
+        guard runtimeMode.allowsCredentialStoreAccess else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "SSHLoginSheet.inertCheckpoint.loadCredentials"
+            )
+            return
+        }
+        #if DEBUG
+        guard checkpointState == nil else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "SSHLoginSheet.checkpoint.loadCredentials"
+            )
+            return
+        }
+        #endif
         guard !loadedSavedCredentials else { return }
         loadedSavedCredentials = true
 
@@ -298,6 +503,20 @@ struct SSHLoginSheet: View {
     }
 
     private func forgetSavedCredentials() {
+        guard runtimeMode.allowsCredentialStoreAccess else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "SSHLoginSheet.inertCheckpoint.deleteCredentials"
+            )
+            return
+        }
+        #if DEBUG
+        guard checkpointState == nil else {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "SSHLoginSheet.checkpoint.deleteCredentials"
+            )
+            return
+        }
+        #endif
         do {
             try SSHCredentialStore.shared.delete(host: server.hostname, port: sshPort)
             hasSavedCredentials = false

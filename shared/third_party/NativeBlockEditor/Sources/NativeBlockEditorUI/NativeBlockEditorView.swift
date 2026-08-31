@@ -275,7 +275,10 @@ public struct NativeBlockEditorView: View {
             } label: {
                 Image(systemName: "ellipsis")
             }
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
             .accessibilityLabel("Document actions")
+            .accessibilityIdentifier("native-editor-document-actions")
         }
     }
 

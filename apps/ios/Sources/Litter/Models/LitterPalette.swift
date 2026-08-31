@@ -12,7 +12,11 @@ enum LitterPalette {
     }
 
     static let appGroupSuite = "group.com.chirag.learnfold"
-    private static let shared = UserDefaults(suiteName: appGroupSuite)
+    // UserDefaults is not Sendable. Resolve the shared-suite handle at the
+    // point of use instead of retaining it in nonisolated static storage.
+    private static var shared: UserDefaults? {
+        UserDefaults(suiteName: appGroupSuite)
+    }
 
     private static func pair(_ key: String, lightFallback: String, darkFallback: String) -> Pair {
         Pair(
@@ -71,4 +75,3 @@ extension LitterPalette.Pair {
         return Color(red: r, green: g, blue: b)
     }
 }
-

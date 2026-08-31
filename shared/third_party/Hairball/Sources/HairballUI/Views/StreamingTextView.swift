@@ -131,7 +131,13 @@ public final class SmoothRevealDriver: ObservableObject {
         }
     }
 
-    deinit { timer?.invalidate() }
+    deinit {
+        // `deinit` is nonisolated in Swift 6, while Timer is main-thread
+        // bound. This instance is main-actor isolated for its whole lifetime.
+        MainActor.assumeIsolated {
+            timer?.invalidate()
+        }
+    }
 }
 
 // MARK: - StreamingTextView

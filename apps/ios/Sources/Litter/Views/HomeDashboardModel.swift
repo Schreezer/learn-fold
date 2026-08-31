@@ -87,11 +87,13 @@ final class HomeDashboardModel {
     }
 
     deinit {
-        if let preferencesObserver {
-            NotificationCenter.default.removeObserver(preferencesObserver)
-        }
-        if let savedServersObserver {
-            NotificationCenter.default.removeObserver(savedServersObserver)
+        MainActor.assumeIsolated {
+            if let preferencesObserver {
+                NotificationCenter.default.removeObserver(preferencesObserver)
+            }
+            if let savedServersObserver {
+                NotificationCenter.default.removeObserver(savedServersObserver)
+            }
         }
     }
 
@@ -310,7 +312,7 @@ final class HomeDashboardModel {
             serverId: key.serverId,
             serverDisplayName: server.displayName,
             agentRuntimeKind: server.agentRuntimes.first(where: \.available)?.kind
-                ?? AgentRuntimeMetadataProvider.all?().first?.name
+                ?? AgentRuntimeMetadataProvider.allMetadata().first?.name
                 ?? "",
             isLocal: server.isLocal,
             sessionTitle: "Loading thread",

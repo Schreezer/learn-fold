@@ -6,20 +6,20 @@ final class HomeDashboardSupportTests: XCTestCase {
     private var savedPinnedKeys: [PinnedThreadKey] = []
     private var savedHiddenKeys: [PinnedThreadKey] = []
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         savedPinnedKeys = SavedThreadsStore.pinnedKeys()
         savedHiddenKeys = SavedThreadsStore.hiddenKeys()
         for key in savedPinnedKeys { SavedThreadsStore.remove(key) }
         for key in savedHiddenKeys { SavedThreadsStore.unhide(key) }
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         for key in SavedThreadsStore.pinnedKeys() { SavedThreadsStore.remove(key) }
         for key in SavedThreadsStore.hiddenKeys() { SavedThreadsStore.unhide(key) }
         for key in savedPinnedKeys.reversed() { SavedThreadsStore.add(key) }
         for key in savedHiddenKeys.reversed() { SavedThreadsStore.hide(key) }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     func testRecentConnectedSessionsFiltersDisconnectedServersAndLimitsToThreeNewest() {

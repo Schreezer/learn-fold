@@ -39,6 +39,22 @@ struct WallpaperConfig: Codable, Equatable {
     var videoDuration: Double?
 }
 
+extension Optional where Wrapped == WallpaperConfig {
+    /// A missing resolved configuration and an explicit "None" selection both
+    /// mean there is no active wallpaper, but only the latter is a selected UI
+    /// value. Keep those states distinct instead of relying on an ambiguous
+    /// optional comparison with `.none`.
+    var containsActiveWallpaper: Bool {
+        guard case let .some(config) = self else { return false }
+        return config.type != WallpaperType.none
+    }
+
+    var explicitlySelectsNoWallpaper: Bool {
+        guard case let .some(config) = self else { return false }
+        return config.type == WallpaperType.none
+    }
+}
+
 enum GranularityKind: String, CaseIterable, Identifiable {
     case character = "Character"
     case chunk8 = "Chunk (8)"
@@ -137,7 +153,7 @@ final class WallpaperManager {
 
     // Legacy compat — some views still check this
     var wallpaperImage: UIImage? { resolvedWallpaperImage }
-    var isWallpaperSet: Bool { resolvedConfig != nil && resolvedConfig?.type != .none }
+    var isWallpaperSet: Bool { resolvedConfig.containsActiveWallpaper }
 
     private init() {
         loadPrefs()
@@ -430,7 +446,7 @@ final class WallpaperManager {
         version += 1
         resolvedConfig = resolveConfig(for: activeThreadKey)
         // Image resolution is deferred to view layer which has themeManager access
-        if resolvedConfig == nil || resolvedConfig?.type == .none {
+        if !resolvedConfig.containsActiveWallpaper {
             resolvedWallpaperImage = nil
         }
     }

@@ -196,22 +196,22 @@ public struct InlineTextRenderer {
 
         case .inlineCode(let code):
             var attr = AttributedString(code)
-            attr.font = theme.inlineCode.font
-            attr.foregroundColor = theme.inlineCode.textColor
-            attr.backgroundColor = theme.inlineCode.backgroundColor
+            attr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = theme.inlineCode.font
+            attr[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = theme.inlineCode.textColor
+            attr[AttributeScopes.SwiftUIAttributes.BackgroundColorAttribute.self] = theme.inlineCode.backgroundColor
             if let baselineOffset = style.baselineOffset {
-                attr.baselineOffset = baselineOffset
+                attr[AttributeScopes.SwiftUIAttributes.BaselineOffsetAttribute.self] = baselineOffset
             }
             return [.attributed(attr)]
 
         case .link(let destination, _, let children):
             var attr = renderAttributedString(children, style: style)
             if let url = URL(string: destination) {
-                attr.link = url
+                attr[AttributeScopes.FoundationAttributes.LinkAttribute.self] = url
             }
-            attr.foregroundColor = theme.link.color
+            attr[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = theme.link.color
             if theme.link.underline {
-                attr.underlineStyle = .single
+                attr[AttributeScopes.SwiftUIAttributes.UnderlineStyleAttribute.self] = .single
             }
             return [.attributed(attr)]
 
@@ -254,8 +254,8 @@ public struct InlineTextRenderer {
         case .citation(let index, let url, let title):
             let display = title ?? url ?? "[\(index)]"
             var attr = AttributedString(display)
-            attr.font = .system(size: theme.citation.fontSize)
-            attr.foregroundColor = theme.citation.textColor
+            attr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = .system(size: theme.citation.fontSize)
+            attr[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = theme.citation.textColor
             return [.attributed(attr)]
 
         case .customInline(_, let content):
@@ -286,31 +286,33 @@ public struct InlineTextRenderer {
 
     private func applyStyle(_ style: InlineStyle, to attrStr: inout AttributedString) {
         if let font = style.font {
-            attrStr.font = font
+            attrStr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = font
         }
         if let fontWeight = style.fontWeight {
-            attrStr.font = (attrStr.font ?? .body).weight(fontWeight)
+            let font = attrStr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] ?? .body
+            attrStr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = font.weight(fontWeight)
         }
         if style.italic {
-            attrStr.font = (attrStr.font ?? .body).italic()
+            let font = attrStr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] ?? .body
+            attrStr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = font.italic()
         }
         if style.strikethrough {
-            attrStr.strikethroughStyle = .single
+            attrStr[AttributeScopes.SwiftUIAttributes.StrikethroughStyleAttribute.self] = .single
         }
         if style.underline {
-            attrStr.underlineStyle = .single
+            attrStr[AttributeScopes.SwiftUIAttributes.UnderlineStyleAttribute.self] = .single
         }
         if let foregroundColor = style.foregroundColor {
-            attrStr.foregroundColor = foregroundColor
+            attrStr[AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = foregroundColor
         }
         if let kern = style.kern {
-            attrStr.kern = kern
+            attrStr[AttributeScopes.SwiftUIAttributes.KerningAttribute.self] = kern
         }
         if let tracking = style.tracking {
-            attrStr.tracking = tracking
+            attrStr[AttributeScopes.SwiftUIAttributes.TrackingAttribute.self] = tracking
         }
         if let baselineOffset = style.baselineOffset {
-            attrStr.baselineOffset = baselineOffset
+            attrStr[AttributeScopes.SwiftUIAttributes.BaselineOffsetAttribute.self] = baselineOffset
         }
     }
 

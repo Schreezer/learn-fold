@@ -1,7 +1,57 @@
 import XCTest
+import UserNotifications
 @testable import Litter
 
 final class AppSnapshotRuntimeTests: XCTestCase {
+    func testRuntimeBindDoesNotRequestNotificationAuthorization() {
+        XCTAssertFalse(AppNotificationPermissionPolicy.requestsOnRuntimeBind)
+    }
+
+    func testNotificationPermissionPresentationMapsAuthorizationStates() {
+        let notDetermined = AppNotificationPermissionPolicy.presentation(for: .notDetermined)
+        XCTAssertEqual(notDetermined.statusText, "Not Enabled")
+        XCTAssertEqual(notDetermined.actionTitle, "Enable Notifications")
+        XCTAssertEqual(notDetermined.action, .requestAuthorization)
+
+        let denied = AppNotificationPermissionPolicy.presentation(for: .denied)
+        XCTAssertEqual(denied.statusText, "Denied")
+        XCTAssertEqual(denied.actionTitle, "Open Settings")
+        XCTAssertEqual(denied.action, .openSettings)
+
+        for status in [
+            UNAuthorizationStatus.authorized,
+            .provisional,
+            .ephemeral
+        ] {
+            let enabled = AppNotificationPermissionPolicy.presentation(for: status)
+            XCTAssertEqual(enabled.statusText, "Enabled")
+            XCTAssertNil(enabled.actionTitle)
+            XCTAssertEqual(enabled.action, .none)
+        }
+
+        let checking = AppNotificationPermissionPolicy.presentation(for: nil)
+        XCTAssertEqual(checking.statusText, "Checking…")
+        XCTAssertEqual(checking.action, .none)
+    }
+
+    @MainActor
+    func testNotificationAuthorizationRequiresExplicitSettingsAction() async {
+        let authorizer = TestAppNotificationAuthorizer(status: .notDetermined)
+        let controller = AppNotificationPermissionController(authorizer: authorizer)
+
+        controller.runtimeDidBind()
+
+        XCTAssertEqual(authorizer.authorizationStatusCallCount, 0)
+        XCTAssertEqual(authorizer.requestAuthorizationCallCount, 0)
+
+        let resultingStatus = await controller.requestFromSettings()
+
+        XCTAssertEqual(resultingStatus, .authorized)
+        XCTAssertEqual(authorizer.authorizationStatusCallCount, 2)
+        XCTAssertEqual(authorizer.requestAuthorizationCallCount, 1)
+        XCTAssertEqual(authorizer.lastRequestedOptions, [.alert, .sound])
+    }
+
     func testThreadHasTrackedTurnWhenThreadHasActiveTurn() {
         let key = ThreadKey(serverId: "srv", threadId: "thread-1")
         let snapshot = makeSnapshot(
@@ -466,5 +516,28 @@ final class AppSnapshotRuntimeTests: XCTestCase {
             olderTurnsCursor: nil,
             initialTurnsLoaded: true
         )
+    }
+}
+
+@MainActor
+private final class TestAppNotificationAuthorizer: AppNotificationAuthorizing {
+    private var status: UNAuthorizationStatus
+    private(set) var authorizationStatusCallCount = 0
+    private(set) var requestAuthorizationCallCount = 0
+    private(set) var lastRequestedOptions: UNAuthorizationOptions?
+
+    init(status: UNAuthorizationStatus) {
+        self.status = status
+    }
+
+    func authorizationStatus() async -> UNAuthorizationStatus {
+        authorizationStatusCallCount += 1
+        return status
+    }
+
+    func requestAuthorization(options: UNAuthorizationOptions) async throws {
+        requestAuthorizationCallCount += 1
+        lastRequestedOptions = options
+        status = .authorized
     }
 }

@@ -157,11 +157,17 @@ public struct AnyImageProvider: ImageProvider {
 // MARK: - Environment Keys
 
 private struct ImageProviderKey: EnvironmentKey {
-    static let defaultValue: AnyImageProvider = AnyImageProvider(DefaultImageProvider())
+    // Environment defaults are consumed by SwiftUI on the view path. Build a
+    // fresh wrapper rather than retaining its non-Sendable closure globally.
+    static var defaultValue: AnyImageProvider {
+        AnyImageProvider(DefaultImageProvider())
+    }
 }
 
 private struct InlineImageProviderKey: EnvironmentKey {
-    static let defaultValue: any InlineImageProvider = DefaultInlineImageProvider()
+    static var defaultValue: any InlineImageProvider {
+        DefaultInlineImageProvider()
+    }
 }
 
 extension EnvironmentValues {

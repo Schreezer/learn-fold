@@ -54,9 +54,11 @@ final class StableSafeAreaInsets {
     }
 
     deinit {
-        let center = NotificationCenter.default
-        for observer in observers {
-            center.removeObserver(observer)
+        MainActor.assumeIsolated {
+            let center = NotificationCenter.default
+            for observer in observers {
+                center.removeObserver(observer)
+            }
         }
     }
 }

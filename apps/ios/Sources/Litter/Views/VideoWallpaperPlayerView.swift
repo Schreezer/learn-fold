@@ -55,6 +55,7 @@ struct VideoWallpaperPlayerView: UIViewRepresentable {
 
     // MARK: - Coordinator
 
+    @MainActor
     final class Coordinator: NSObject {
         var player: AVQueuePlayer?
         var playerLayer: AVPlayerLayer?
@@ -69,7 +70,9 @@ struct VideoWallpaperPlayerView: UIViewRepresentable {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.player?.pause()
+                Task { @MainActor [weak self] in
+                    self?.player?.pause()
+                }
             }
 
             foregroundObserver = NotificationCenter.default.addObserver(
@@ -77,7 +80,9 @@ struct VideoWallpaperPlayerView: UIViewRepresentable {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.player?.play()
+                Task { @MainActor [weak self] in
+                    self?.player?.play()
+                }
             }
         }
 
@@ -97,11 +102,13 @@ struct VideoWallpaperPlayerView: UIViewRepresentable {
         }
 
         deinit {
-            if let bg = backgroundObserver {
-                NotificationCenter.default.removeObserver(bg)
-            }
-            if let fg = foregroundObserver {
-                NotificationCenter.default.removeObserver(fg)
+            MainActor.assumeIsolated {
+                if let bg = backgroundObserver {
+                    NotificationCenter.default.removeObserver(bg)
+                }
+                if let fg = foregroundObserver {
+                    NotificationCenter.default.removeObserver(fg)
+                }
             }
         }
     }

@@ -167,6 +167,15 @@ STAMP_SYNC := $(STAMPS)/sync
 STAMP_BINDINGS_S := $(STAMPS)/bindings-swift
 STAMP_BINDINGS_K := $(STAMPS)/bindings-kotlin
 STAMP_XCGEN := $(STAMPS)/xcgen
+# XcodeGen expands source-directory entries from project.yml into explicit
+# project membership. Directory mtimes change when files or nested directories
+# are added, removed, or renamed, so include every current source/test directory
+# in the stamp inputs. Depending on project.yml alone can otherwise leave newly
+# added tests absent from an apparently up-to-date project.
+IOS_XCGEN_INPUT_DIRS := $(shell find \
+	$(IOS_DIR)/Sources \
+	$(IOS_DIR)/Tests \
+	-type d -print 2>/dev/null)
 
 # Pinned release tag of the prebuilt Alpine rootfs tarball (still hosted
 # on the dnakov/litter-ish releases page). The iSH kernel itself is built
@@ -592,7 +601,7 @@ $(STAMP_BINDINGS_K): $(STAMP_SYNC) $(BOUNDARY_SOURCES) | alleycat-main
 	@touch $@
 
 xcgen: $(STAMP_XCGEN)
-$(STAMP_XCGEN): $(IOS_DIR)/project.yml
+$(STAMP_XCGEN): $(IOS_DIR)/project.yml $(IOS_XCGEN_INPUT_DIRS)
 	@echo "==> Regenerating Xcode project..."
 	@$(IOS_SCRIPTS)/regenerate-project.sh
 	@touch $@

@@ -117,6 +117,41 @@ fn openai_base_url_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn in_process_cli_overrides() -> Vec<(String, codex_config::TomlValue)> {
+    in_process_cli_overrides_for_ios(cfg!(all(target_os = "ios", not(target_abi = "macabi"))))
+}
+
+fn in_process_cli_overrides_for_ios(
+    use_ephemeral_auth_store: bool,
+) -> Vec<(String, codex_config::TomlValue)> {
+    let mut overrides = vec![
+        ("features.goals".to_string(), true.into()),
+        ("features.realtime_conversation".to_string(), true.into()),
+        (
+            "experimental_realtime_ws_model".to_string(),
+            "gpt-realtime-2".to_string().into(),
+        ),
+        ("realtime.version".to_string(), "v2".to_string().into()),
+        (
+            "realtime.type".to_string(),
+            "conversational".to_string().into(),
+        ),
+    ];
+
+    if use_ephemeral_auth_store {
+        overrides.push((
+            "cli_auth_credentials_store".to_string(),
+            "ephemeral".to_string().into(),
+        ));
+    }
+
+    if let Some(base_url) = openai_base_url_from_env() {
+        overrides.push(("openai_base_url".to_string(), base_url.into()));
+    }
+
+    overrides
+}
+
 // ---------------------------------------------------------------------------
 // InProcessConfig
 // ---------------------------------------------------------------------------
@@ -330,12 +365,26 @@ fn prepare_ios_runtime_environment(
     let canonical = codex_home
         .canonicalize()
         .unwrap_or_else(|_| codex_home.to_path_buf());
+    remove_legacy_ios_auth_file(&canonical)?;
     unsafe {
         std::env::set_var("CODEX_HOME", &canonical);
     }
     init_ios_tls_roots(&canonical)?;
 
     Ok(canonical)
+}
+
+#[cfg(any(all(target_os = "ios", not(target_abi = "macabi")), test))]
+fn remove_legacy_ios_auth_file(codex_home: &std::path::Path) -> Result<(), TransportError> {
+    let auth_file = codex_home.join("auth.json");
+    match std::fs::remove_file(&auth_file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(TransportError::ConnectionFailed(format!(
+            "failed to remove legacy Codex auth file {:?}: {error}",
+            auth_file
+        ))),
+    }
 }
 
 #[cfg(any(all(target_os = "ios", not(target_abi = "macabi")), test))]
@@ -618,22 +667,7 @@ impl ServerSession {
             }
         }
 
-        let mut cli_overrides = vec![
-            ("features.goals".to_string(), true.into()),
-            ("features.realtime_conversation".to_string(), true.into()),
-            (
-                "experimental_realtime_ws_model".to_string(),
-                "gpt-realtime-2".to_string().into(),
-            ),
-            ("realtime.version".to_string(), "v2".to_string().into()),
-            (
-                "realtime.type".to_string(),
-                "conversational".to_string().into(),
-            ),
-        ];
-        if let Some(base_url) = openai_base_url_from_env() {
-            cli_overrides.push(("openai_base_url".to_string(), base_url.into()));
-        }
+        let cli_overrides = in_process_cli_overrides();
 
         let mut base_builder = ConfigBuilder::default().cli_overrides(cli_overrides.clone());
         if let Some(ref codex_home) = in_process.codex_home {
@@ -1933,7 +1967,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use async_trait::async_trait;
+    use codex_config::types::{AuthCredentialsStoreMode, AuthKeyringBackendKind};
+    use codex_core::config::ConfigBuilder;
+    use codex_login::login_with_api_key;
     use serde_json::json;
+    use tempfile::tempdir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -2517,12 +2555,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ios_local_overrides_resolve_ephemeral_and_api_key_login_stays_in_memory() {
+        let codex_home = tempdir().expect("temporary CODEX_HOME should be created");
+        let overrides = in_process_cli_overrides_for_ios(true);
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .cli_overrides(overrides)
+            .build()
+            .await
+            .expect("iOS local config should build");
+
+        assert_eq!(
+            config.cli_auth_credentials_store_mode,
+            AuthCredentialsStoreMode::Ephemeral
+        );
+
+        login_with_api_key(
+            codex_home.path(),
+            "sk-ios-ephemeral-auth-canary-never-persist",
+            config.cli_auth_credentials_store_mode,
+            AuthKeyringBackendKind::default(),
+        )
+        .expect("ephemeral API-key login should succeed");
+
+        assert!(
+            !codex_home.path().join("auth.json").exists(),
+            "ephemeral API-key login must not create auth.json"
+        );
+    }
+
     #[test]
-    fn prepare_ios_runtime_environment_sets_codex_home_and_tls_bundle() {
+    fn non_ios_local_overrides_remain_unchanged() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let ios_overrides = in_process_cli_overrides_for_ios(true);
+        let non_ios_overrides = in_process_cli_overrides_for_ios(false);
+        let auth_store_key = "cli_auth_credentials_store";
+
+        assert!(
+            non_ios_overrides
+                .iter()
+                .all(|(key, _)| key != auth_store_key),
+            "non-iOS local config must retain the upstream auth-store default"
+        );
+
+        let ios_without_auth_override = ios_overrides
+            .into_iter()
+            .filter(|(key, _)| key != auth_store_key)
+            .collect::<Vec<_>>();
+        assert_eq!(ios_without_auth_override, non_ios_overrides);
+    }
+
+    #[test]
+    fn prepare_ios_runtime_environment_removes_legacy_auth_and_preserves_other_state() {
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         let original_codex_home = std::env::var_os("CODEX_HOME");
         let original_ssl_cert_file = std::env::var_os("SSL_CERT_FILE");
         let codex_home = unique_temp_path("ios-runtime");
+        let auth_file = codex_home.join("auth.json");
+        let preserved_state = codex_home.join("config.toml");
+
+        std::fs::create_dir_all(&codex_home).expect("temporary CODEX_HOME should be created");
+        std::fs::write(&auth_file, "synthetic-legacy-auth")
+            .expect("synthetic legacy auth should be written");
+        std::fs::write(&preserved_state, "model = 'synthetic-model'")
+            .expect("unrelated Codex state should be written");
 
         unsafe {
             std::env::set_var("CODEX_HOME", &codex_home);
@@ -2542,6 +2640,11 @@ mod tests {
             Some(pem_path.clone().into())
         );
         assert!(pem_path.is_file(), "cacert.pem should be written");
+        assert!(!auth_file.exists(), "legacy auth.json should be removed");
+        assert!(
+            preserved_state.is_file(),
+            "iOS preparation must preserve unrelated Codex state"
+        );
 
         if let Some(value) = original_codex_home {
             unsafe {
@@ -2562,6 +2665,38 @@ mod tests {
                 std::env::remove_var("SSL_CERT_FILE");
             }
         }
+
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn prepare_ios_runtime_environment_fails_closed_when_auth_cannot_be_removed() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let original_codex_home = std::env::var_os("CODEX_HOME");
+        let original_ssl_cert_file = std::env::var_os("SSL_CERT_FILE");
+        let codex_home = unique_temp_path("ios-runtime-auth-removal-failure");
+        let undeletable_auth_path = codex_home.join("auth.json");
+
+        std::fs::create_dir_all(&undeletable_auth_path)
+            .expect("synthetic undeletable auth path should be created");
+        std::fs::write(
+            undeletable_auth_path.join("credential"),
+            "synthetic-legacy-auth",
+        )
+        .expect("synthetic legacy auth should be written");
+
+        let result = prepare_ios_runtime_environment(&codex_home);
+
+        assert!(
+            result.is_err(),
+            "startup must fail while a legacy auth path remains"
+        );
+        assert!(
+            undeletable_auth_path.exists(),
+            "failed removal should not be mistaken for absence"
+        );
+        assert_eq!(std::env::var_os("CODEX_HOME"), original_codex_home);
+        assert_eq!(std::env::var_os("SSL_CERT_FILE"), original_ssl_cert_file);
 
         let _ = std::fs::remove_dir_all(codex_home);
     }

@@ -8,7 +8,7 @@ enum CoachmarkTarget: Hashable {
 }
 
 struct CoachmarkAnchorKey: PreferenceKey {
-    static var defaultValue: [CoachmarkTarget: Anchor<CGRect>] = [:]
+    nonisolated(unsafe) static var defaultValue: [CoachmarkTarget: Anchor<CGRect>] = [:]
     static func reduce(
         value: inout [CoachmarkTarget: Anchor<CGRect>],
         nextValue: () -> [CoachmarkTarget: Anchor<CGRect>]

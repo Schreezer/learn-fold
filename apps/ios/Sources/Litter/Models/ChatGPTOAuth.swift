@@ -68,7 +68,8 @@ enum ChatGPTOAuthError: LocalizedError {
     }
 }
 
-final class ChatGPTOAuthTokenStore {
+/// Keychain calls are synchronous and the instance has no mutable state.
+final class ChatGPTOAuthTokenStore: @unchecked Sendable {
     static let shared = ChatGPTOAuthTokenStore()
 
     private let service = "com.chirag.learnfold.chatgpt.tokens"

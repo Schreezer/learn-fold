@@ -1,0 +1,3 @@
+# Copy to .dev.vars for local development. Never commit real values.
+OPENCODE_API_KEY=replace-with-a-wrangler-secret
+LEARNFOLD_HOSTED_ACCESS_TOKEN=replace-with-an-independent-client-access-token

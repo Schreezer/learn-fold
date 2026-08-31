@@ -1,5 +1,6 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Foundation
+import Synchronization
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -20,7 +21,7 @@ enum AgentAssistedPairing {
 
     Run exactly this one terminal command now. Do not inspect the environment or run \
     preflight commands first:
-    `npx -y learnfold-link@0.3.7 handoff "\(submitURL.absoluteString)"`
+    `npx -y learnfold-link@0.3.10 handoff "\(submitURL.absoluteString)"`
 
     If it exits successfully, reply only "Connected". Otherwise reply only "Setup failed". \
     Do not display a token or pairing JSON, and do not ask me to run a command.
@@ -46,10 +47,10 @@ enum AgentAssistedPairing {
     Securely disable Learnfold connectivity on \(computerName), while keeping Hermes itself running.
 
     Perform the shutdown yourself in your own terminal:
-    1. Run `npx -y learnfold-link@0.3.7 rotate` to invalidate every existing Learnfold pairing.
-    2. Run `npx -y learnfold-link@0.3.7 uninstall` to disable autostart and stop the managed service.
+    1. Run `npx -y learnfold-link@0.3.10 rotate` to invalidate every existing Learnfold pairing.
+    2. Run `npx -y learnfold-link@0.3.10 uninstall` to disable autostart and stop the managed service.
     3. If a Learnfold Link or Alleycat daemon is still running, run \
-    `npx -y learnfold-link@0.3.7 stop`.
+    `npx -y learnfold-link@0.3.10 stop`.
     4. Verify that autostart is disabled and no Learnfold Link or Alleycat daemon remains running.
 
     Do not display the new token. Do not delete Hermes, projects, configuration, or logs. \
@@ -61,13 +62,384 @@ enum AgentAssistedPairing {
     }
 }
 
+enum AgentAssistedPairingPromptLabelPolicy {
+    static func hasActiveRequest(expiresAt: Date?, now: Date) -> Bool {
+        expiresAt.map { $0 > now } ?? false
+    }
+
+    static func title(hasCopiedPrompt: Bool, hasActiveRequest: Bool, needsNewPrompt: Bool = false) -> String {
+        switch (hasCopiedPrompt, hasActiveRequest) {
+        case (true, true):
+            "Prompt Copied — Waiting"
+        case (true, false):
+            "Copy New Setup Prompt"
+        case (false, _):
+            needsNewPrompt ? "Copy New Setup Prompt" : "Copy Setup Prompt"
+        }
+    }
+
+    static func systemImage(hasCopiedPrompt: Bool, hasActiveRequest: Bool) -> String {
+        hasCopiedPrompt && hasActiveRequest ? "checkmark.circle.fill" : "doc.on.doc"
+    }
+}
+
+private struct HermesLinkConnectRequest {
+    let serverId: String
+    let displayName: String
+    let params: AppAlleycatPairPayload
+    let agentName: String
+    let selectedAgentNames: [String]
+    let wire: AppAlleycatAgentWire
+}
+
+private enum HermesLinkStrictCheckpointEffectError: LocalizedError {
+    case blocked(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .blocked(let operation):
+            "Strict Link checkpoint blocked \(operation)."
+        }
+    }
+}
+
+/// The production adapter captures the already-live `AppModel`, but every
+/// bridge/store singleton lookup remains inside the operation that needs it.
+/// The strict adapter is deliberately a set of tripwires: fixture actions must
+/// resolve through render-only state before reaching any of these closures.
+@MainActor
+private struct HermesLinkRuntimeAdapter {
+    let parsePairPayload: (String) throws -> AppAlleycatPairPayload
+    let listAgents: (AppAlleycatPairPayload) async throws -> [AppAlleycatAgentInfo]
+    let connect: (HermesLinkConnectRequest) async throws -> AppAlleycatConnectResult
+    let saveCredential: (String, String) throws -> Void
+    let persistRuntimeSecretIfNeeded: () -> Void
+
+    static func production(appModel: AppModel) -> Self {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "HermesLink.productionRuntimeAdapter"
+        )
+        return Self(
+            parsePairPayload: { json in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.parsePairPayload"
+                )
+                return try RustAlleycatBridge.shared.parsePairPayload(json: json)
+            },
+            listAgents: { params in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.listAgents"
+                )
+                return try await appModel.serverBridge.listAlleycatAgents(params: params)
+            },
+            connect: { request in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.connect"
+                )
+                return try await appModel.serverBridge.connectRemoteOverAlleycat(
+                    serverId: request.serverId,
+                    displayName: request.displayName,
+                    params: request.params,
+                    agentName: request.agentName,
+                    selectedAgentNames: request.selectedAgentNames,
+                    wire: request.wire
+                )
+            },
+            saveCredential: { token, nodeID in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.saveCredential"
+                )
+                try AlleycatCredentialStore.shared.saveToken(token, nodeId: nodeID)
+            },
+            persistRuntimeSecretIfNeeded: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.persistRuntimeSecret"
+                )
+                AppRuntimeController.shared.persistAlleycatSecretKeyIfNeeded()
+            }
+        )
+    }
+
+    #if DEBUG
+    static var strictCheckpoint: Self {
+        Self(
+            parsePairPayload: { _ in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.parsePairPayload"
+                )
+                throw HermesLinkStrictCheckpointEffectError.blocked("pairing parsing")
+            },
+            listAgents: { _ in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.listAgents"
+                )
+                throw HermesLinkStrictCheckpointEffectError.blocked("agent discovery")
+            },
+            connect: { _ in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.connect"
+                )
+                throw HermesLinkStrictCheckpointEffectError.blocked("remote connection")
+            },
+            saveCredential: { _, _ in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.saveCredential"
+                )
+                throw HermesLinkStrictCheckpointEffectError.blocked("credential storage")
+            },
+            persistRuntimeSecretIfNeeded: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.persistRuntimeSecret"
+                )
+            }
+        )
+    }
+    #endif
+}
+
+private enum HermesLinkCameraAuthorization {
+    case authorized
+    case notDetermined
+    case denied
+}
+
+private enum HermesLinkAlertPresentation: Identifiable {
+    case cameraDenied(id: UUID)
+    case hermesReady(
+        id: UUID,
+        host: HermesPairingStatus.Host,
+        isRetry: Bool
+    )
+
+    var id: UUID {
+        switch self {
+        case .cameraDenied(let id), .hermesReady(let id, _, _):
+            id
+        }
+    }
+}
+
+/// Platform effects are closures so constructing a strict checkpoint never
+/// asks UIKit, AVFoundation, pasteboard, or preferences for a live singleton.
+@MainActor
+private struct HermesLinkPlatformAdapter {
+    let now: () -> Date
+    let rendersAsMacApp: () -> Bool
+    let readClipboard: () -> String?
+    let writeExpiringPrompt: (String, Date) -> Void
+    let copyScannerCommand: () -> Void
+    let loadOrCreateInstallationID: () -> String
+    let cameraAuthorization: () -> HermesLinkCameraAuthorization
+    let requestCameraAccess: () async -> Bool
+    let openAppSettings: () -> Void
+
+    static func production() -> Self {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "HermesLink.productionPlatformAdapter"
+        )
+        return Self(
+            now: Date.init,
+            rendersAsMacApp: { LitterPlatform.rendersAsMacApp },
+            readClipboard: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.clipboardRead"
+                )
+                return UIPasteboard.general.string
+            },
+            writeExpiringPrompt: { prompt, expiresAt in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.clipboardWrite"
+                )
+                UIPasteboard.general.setItems(
+                    [[UTType.plainText.identifier: prompt]],
+                    options: [.expirationDate: expiresAt]
+                )
+            },
+            copyScannerCommand: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.clipboardWrite"
+                )
+                UIPasteboard.general.string = "npx learnfold-link"
+            },
+            loadOrCreateInstallationID: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.installationStorage"
+                )
+                let key = "learnfold.pairingInstallationId"
+                if let existing = UserDefaults.standard.string(forKey: key) {
+                    return existing
+                }
+                let generated = UUID().uuidString
+                UserDefaults.standard.set(generated, forKey: key)
+                return generated
+            },
+            cameraAuthorization: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.cameraAuthorization"
+                )
+                switch AVCaptureDevice.authorizationStatus(for: .video) {
+                case .authorized:
+                    return .authorized
+                case .notDetermined:
+                    return .notDetermined
+                case .denied, .restricted:
+                    return .denied
+                @unknown default:
+                    return .denied
+                }
+            },
+            requestCameraAccess: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.cameraRequest"
+                )
+                return await withCheckedContinuation { continuation in
+                    AVCaptureDevice.requestAccess(for: .video) { granted in
+                        continuation.resume(returning: granted)
+                    }
+                }
+            },
+            openAppSettings: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.settingsOpen"
+                )
+                guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                UIApplication.shared.open(url)
+            }
+        )
+    }
+
+    #if DEBUG
+    static var strictCheckpoint: Self {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        return Self(
+            now: { fixedNow },
+            rendersAsMacApp: { false },
+            readClipboard: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.clipboardRead"
+                )
+                return nil
+            },
+            writeExpiringPrompt: { _, _ in
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.clipboardWrite"
+                )
+            },
+            copyScannerCommand: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.clipboardWrite"
+                )
+            },
+            loadOrCreateInstallationID: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.installationStorage"
+                )
+                return "STRICT-CHECKPOINT-BLOCKED"
+            },
+            cameraAuthorization: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.cameraAuthorization"
+                )
+                return .denied
+            },
+            requestCameraAccess: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.cameraRequest"
+                )
+                return false
+            },
+            openAppSettings: {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "HermesLink.settingsOpen"
+                )
+            }
+        )
+    }
+    #endif
+}
+
+#if DEBUG
+private actor HermesLinkStrictCheckpointBroker: HermesPairingBrokerServing {
+    func createRequest(installationId: String) async throws -> HermesPairingRequest {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry("HermesLink.brokerCreate")
+        throw HermesLinkStrictCheckpointEffectError.blocked("broker create")
+    }
+
+    func status(for pairing: HermesPairingRequest) async throws -> HermesPairingStatus {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry("HermesLink.brokerStatus")
+        throw HermesLinkStrictCheckpointEffectError.blocked("broker status")
+    }
+
+    func claim(_ pairing: HermesPairingRequest) async throws -> String {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry("HermesLink.brokerClaim")
+        throw HermesLinkStrictCheckpointEffectError.blocked("broker claim")
+    }
+
+    func cancel(_ pairing: HermesPairingRequest) async {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry("HermesLink.brokerCancel")
+    }
+}
+
+private final class HermesLinkStrictCheckpointStore: HermesPairingPendingStoring {
+    func load() throws -> HermesPairingRequest? {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry("HermesLink.pendingStoreLoad")
+        return nil
+    }
+
+    func save(_ request: HermesPairingRequest) throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry("HermesLink.pendingStoreSave")
+        throw HermesLinkStrictCheckpointEffectError.blocked("pending request save")
+    }
+
+    func clear() throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry("HermesLink.pendingStoreClear")
+    }
+}
+#endif
+
+@MainActor
+private enum HermesLinkPairingCoordinatorFactory {
+    static func production(now: @escaping () -> Date) -> HermesPairingLifecycleCoordinator {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "HermesLink.productionPairingCoordinator"
+        )
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "HermesLink.brokerSingleton"
+        )
+        let broker = HermesPairingBrokerClient.shared
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "HermesLink.pendingStoreSingleton"
+        )
+        let store = HermesPairingPendingKeychainStore.shared
+        return HermesPairingLifecycleCoordinator(
+            broker: broker,
+            store: store,
+            now: now
+        )
+    }
+
+    #if DEBUG
+    static func strictCheckpoint(
+        scenario: HermesLinkCheckpointScenario,
+        now: @escaping () -> Date
+    ) -> HermesPairingLifecycleCoordinator {
+        HermesPairingLifecycleCoordinator(
+            broker: HermesLinkStrictCheckpointBroker(),
+            store: HermesLinkStrictCheckpointStore(),
+            now: now,
+            checkpointScenario: scenario,
+            checkpointIsolated: true
+        )
+    }
+    #endif
+}
+
 struct AlleycatAddServerSheet: View {
-    let appModel: AppModel
     let onConnected: (AlleycatConnectedTarget) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var hermesPairing = HermesPairingLifecycleCoordinator()
+    @StateObject private var hermesPairing: HermesPairingLifecycleCoordinator
     @State private var displayName: String = ""
     @State private var parsedParams: AppAlleycatPairPayload?
     @State private var agents: [AppAlleycatAgentInfo] = []
@@ -78,38 +450,81 @@ struct AlleycatAddServerSheet: View {
     @State private var isConnecting = false
     @State private var connectError: String?
     @State private var showScanner = false
-    @State private var cameraDenied = false
+    @State private var pendingCameraDeniedAlert = false
+    @State private var alertPresentation: HermesLinkAlertPresentation?
     // pasteJSON / showPaste are used by the Mac paste-JSON UI
     // (Catalyst + iOS-on-Mac) and the iOS QR fallback.
     @State private var pasteJSON: String = ""
     @State private var showPaste: Bool = false
     @State private var copiedAgentPrompt = false
-    @State private var showHermesConfirmation = false
     @State private var connectAfterAgentLoad = false
     @State private var pairingRequestIDForParsedParams: String?
+    #if DEBUG
+    @State private var reviewActivationCount = 0
+    #endif
 
-    private let alleycat = RustAlleycatBridge.shared
+    private let runtime: HermesLinkRuntimeAdapter
+    private let platform: HermesLinkPlatformAdapter
+
+    #if DEBUG
+    private let checkpointScenario: HermesLinkCheckpointScenario?
+    #endif
 
     init(
         appModel: AppModel,
         onConnected: @escaping (AlleycatConnectedTarget) -> Void
     ) {
-        self.appModel = appModel
+        let platform = HermesLinkPlatformAdapter.production()
+        self.runtime = HermesLinkRuntimeAdapter.production(appModel: appModel)
+        self.platform = platform
         self.onConnected = onConnected
+        #if DEBUG
+        checkpointScenario = nil
+        #endif
+        _hermesPairing = StateObject(
+            wrappedValue: HermesLinkPairingCoordinatorFactory.production(
+                now: platform.now
+            )
+        )
     }
+
+    #if DEBUG
+    init(checkpointScenario: HermesLinkCheckpointScenario) {
+        let platform = HermesLinkPlatformAdapter.strictCheckpoint
+        self.runtime = .strictCheckpoint
+        self.platform = platform
+        self.onConnected = { _ in
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "HermesLink.checkpointOnConnected"
+            )
+        }
+        self.checkpointScenario = checkpointScenario
+        _hermesPairing = StateObject(
+            wrappedValue: HermesLinkPairingCoordinatorFactory.strictCheckpoint(
+                scenario: checkpointScenario,
+                now: platform.now
+            )
+        )
+    }
+    #endif
 
     var body: some View {
         NavigationStack {
             ZStack {
                 LitterTheme.backgroundGradient.ignoresSafeArea()
                 Form {
+                    #if DEBUG
+                    if let checkpointScenario {
+                        checkpointBoundary(scenario: checkpointScenario)
+                    }
+                    #endif
                     pairingSection
                     if let params = parsedParams {
                         previewSection(params: params)
                         agentSection
                     }
                     if let parseError {
-                        errorSection(parseError, color: LitterTheme.warning)
+                        errorSection(parseError, color: LitterTheme.warning, accessibilityID: "hermes-link-error")
                     }
                     if let agentError {
                         errorSection(agentError, color: LitterTheme.warning)
@@ -120,6 +535,38 @@ struct AlleycatAddServerSheet: View {
                     }
                 }
                 .scrollContentBackground(.hidden)
+
+                #if DEBUG
+                if checkpointScenario != nil {
+                    Text("Hermes review activation")
+                        .font(.system(size: 1))
+                        .foregroundStyle(.clear)
+                        .frame(width: 1, height: 1)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Hermes review activation")
+                        .accessibilityIdentifier("hermes-link-review-activation")
+                        .accessibilityValue(String(reviewActivationCount))
+                        .allowsHitTesting(false)
+                }
+                #endif
+            }
+            .alert(item: $alertPresentation) { presentation in
+                switch presentation {
+                case .cameraDenied:
+                    Alert(
+                        title: Text("Camera Access Needed"),
+                        message: Text("Allow camera access in Settings to scan an Alleycat pairing QR code."),
+                        primaryButton: .default(Text("Open Settings"), action: openAppSettings),
+                        secondaryButton: .cancel(Text("Cancel"))
+                    )
+                case .hermesReady(_, let host, let isRetry):
+                    Alert(
+                        title: Text("Hermes is ready"),
+                        message: Text(hermesConfirmationMessage(host: host, isRetry: isRetry)),
+                        primaryButton: .default(Text("Connect"), action: claimHermesPairingAndConnect),
+                        secondaryButton: .cancel(Text("Not now"))
+                    )
+                }
             }
             .navigationTitle("Add Remote Host")
             .navigationBarTitleDisplayMode(.inline)
@@ -133,11 +580,39 @@ struct AlleycatAddServerSheet: View {
                 }
             }
         }
+        #if DEBUG
+        .accessibilityIdentifier(
+            checkpointScenario.map { "hermes-link-checkpoint-\($0.rawValue)" }
+                ?? "alleycat-add-server-sheet"
+        )
+        #else
+        .accessibilityIdentifier("alleycat-add-server-sheet")
+        #endif
         .onDisappear {
             hermesPairing.pause()
         }
         .task {
             hermesPairing.restoreAndResume()
+            #if DEBUG
+            switch checkpointScenario {
+            case .copied, .renewed:
+                copiedAgentPrompt = true
+            case .scanner:
+                showScanner = true
+            case .cameraDenied:
+                presentCameraDeniedAlert()
+            case .parseError:
+                parseError = "Redacted fixture could not parse the pairing response."
+            case .confirmation:
+                if let host = hermesPairing.readyHost {
+                    presentHermesConfirmation(host: host)
+                }
+            case .validReview:
+                installCheckpointPairingFixture()
+            default:
+                break
+            }
+            #endif
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
@@ -147,15 +622,21 @@ struct AlleycatAddServerSheet: View {
             }
         }
         .onChange(of: hermesPairing.readyHost) { _, host in
-            if host != nil {
-                showHermesConfirmation = true
-            }
+            guard let host else { return }
+            presentHermesConfirmation(host: host)
         }
-        // QR scanner cover + camera-denied alert are applied
-        // unconditionally; on Mac builds (Catalyst + iOS-on-Mac) the
-        // pairing section never triggers `requestCameraAndScan`, so
-        // neither presentation ever fires.
-        .fullScreenCover(isPresented: $showScanner) {
+        #if DEBUG
+        .overlay {
+            strictScannerOverlay
+        }
+        #endif
+        // Production keeps the full-screen camera presentation. Strict roots
+        // render the same scanner chrome in-place so the screenshot-visible
+        // isolation sentinel remains above it and no capture view is created.
+        .fullScreenCover(
+            isPresented: productionScannerPresentation,
+            onDismiss: handleProductionScannerDismissed
+        ) {
             QRScannerScreen(
                 onScan: { scanned in
                     showScanner = false
@@ -165,34 +646,76 @@ struct AlleycatAddServerSheet: View {
                     showScanner = false
                 },
                 onPermissionDenied: {
+                    pendingCameraDeniedAlert = true
                     showScanner = false
-                    cameraDenied = true
-                }
+                },
+                captureEnabled: true,
+                copyCommand: platform.copyScannerCommand,
+                showsNonLiveCheckpointBadge: false
             )
         }
-        .alert(
-            "Camera Access Needed",
-            isPresented: $cameraDenied,
-            actions: {
-                Button("Open Settings") { openAppSettings() }
-                Button("Cancel", role: .cancel) {}
+    }
+
+    private func handleProductionScannerDismissed() {
+        guard pendingCameraDeniedAlert else { return }
+        pendingCameraDeniedAlert = false
+        presentCameraDeniedAlert()
+    }
+
+    private var productionScannerPresentation: Binding<Bool> {
+        Binding(
+            get: {
+                #if DEBUG
+                return checkpointScenario == nil && showScanner
+                #else
+                return showScanner
+                #endif
             },
-            message: {
-                Text("Allow camera access in Settings to scan an Alleycat pairing QR code.")
-            }
-        )
-        .alert(
-            "Hermes is ready",
-            isPresented: $showHermesConfirmation,
-            actions: {
-                Button("Connect") { claimHermesPairingAndConnect() }
-                Button("Not now", role: .cancel) {}
-            },
-            message: {
-                Text(hermesConfirmationMessage)
-            }
+            set: { showScanner = $0 }
         )
     }
+
+    #if DEBUG
+    @ViewBuilder
+    private var strictScannerOverlay: some View {
+        if checkpointScenario != nil, showScanner {
+            QRScannerScreen(
+                onScan: { _ in },
+                onCancel: { showScanner = false },
+                onPermissionDenied: { showScanner = false },
+                captureEnabled: false,
+                copyCommand: {},
+                showsNonLiveCheckpointBadge: true
+            )
+            .transition(.opacity)
+            .zIndex(10)
+        }
+    }
+
+    private func checkpointBoundary(scenario: HermesLinkCheckpointScenario) -> some View {
+        Text("NON-LIVE CHECKPOINT — redacted fixture only")
+            .litterFont(.caption2, weight: .bold)
+            .foregroundColor(LitterTheme.warning)
+            .accessibilityIdentifier("hermes-link-checkpoint-boundary")
+            .accessibilityLabel("NON-LIVE CHECKPOINT — redacted fixture only")
+    }
+
+    private func installCheckpointPairingFixture() {
+        let params = AppAlleycatPairPayload(
+            v: 1, nodeId: "fixture-node", token: "REDACTED", relay: nil, hostName: "Redacted Test Host"
+        )
+        let agent = AppAlleycatAgentInfo(
+            name: "fixture-agent", displayName: "Fixture Agent", runtimeKind: nil,
+            wire: .websocket, available: true, presentation: nil, capabilities: nil
+        )
+        parsedParams = params
+        displayName = "Redacted Test Host"
+        agents = [agent]
+        selectedAgentNames = [agent.name]
+        isLoadingAgents = false
+        pairingRequestIDForParsedParams = hermesPairing.request?.requestId
+    }
+    #endif
 
     private var pairingSection: some View {
         Section {
@@ -201,7 +724,7 @@ struct AlleycatAddServerSheet: View {
             // Mac (Catalyst + iOS-on-Mac) shows paste-JSON only; iOS shows
             // QR scanning first, with paste available as a production fallback
             // for users who already copied the pairing payload.
-            if LitterPlatform.rendersAsMacApp {
+            if platform.rendersAsMacApp() {
                 pasteJSONPairingControls
             } else {
                 qrPairingControls
@@ -215,6 +738,10 @@ struct AlleycatAddServerSheet: View {
 
     @ViewBuilder
     private var agentAssistedPairingControls: some View {
+        let hasActiveRequest = AgentAssistedPairingPromptLabelPolicy.hasActiveRequest(
+            expiresAt: hermesPairing.request?.expiresAt,
+            now: platform.now()
+        )
         VStack(alignment: .leading, spacing: 10) {
             Label("Let Hermes set it up", systemImage: "sparkles")
                 .litterFont(.subheadline, weight: .semibold)
@@ -230,11 +757,18 @@ struct AlleycatAddServerSheet: View {
             } label: {
                 HStack {
                     if hermesPairing.isCreating {
-                        ProgressView().tint(.black)
+                        ProgressView().tint(.black).accessibilityIdentifier("hermes-link-action-spinner")
                     }
                     Label(
-                        copiedAgentPrompt ? "Prompt Copied — Waiting" : "Copy Setup Prompt",
-                        systemImage: copiedAgentPrompt ? "checkmark.circle.fill" : "doc.on.doc"
+                        AgentAssistedPairingPromptLabelPolicy.title(
+                            hasCopiedPrompt: copiedAgentPrompt,
+                            hasActiveRequest: hasActiveRequest,
+                            needsNewPrompt: hermesPairing.shouldCopyNewSetupPrompt
+                        ),
+                        systemImage: AgentAssistedPairingPromptLabelPolicy.systemImage(
+                            hasCopiedPrompt: copiedAgentPrompt,
+                            hasActiveRequest: hasActiveRequest
+                        )
                     )
                     .frame(maxWidth: .infinity)
                 }
@@ -248,18 +782,31 @@ struct AlleycatAddServerSheet: View {
             if hermesPairing.request != nil {
                 HStack(spacing: 8) {
                     if hermesPairing.phase == .polling || hermesPairing.phase == .claiming {
-                        ProgressView().tint(LitterTheme.accent)
+                        ProgressView().tint(LitterTheme.accent).accessibilityIdentifier("hermes-link-status-spinner")
                     }
                     Text(hermesPairing.statusMessage)
                         .litterFont(.caption)
                         .foregroundColor(LitterTheme.textSecondary)
+                        .accessibilityIdentifier("hermes-link-status")
                     Spacer()
                     if hermesPairing.canReviewReadyPairing && !isConnecting && !isLoadingAgents {
-                        Button("Review") {
-                            showHermesConfirmation = true
+                        Button {
+                            #if DEBUG
+                            if checkpointScenario != nil {
+                                reviewActivationCount += 1
+                            }
+                            #endif
+                            guard let host = hermesPairing.readyHost else { return }
+                            presentHermesConfirmation(host: host)
+                        } label: {
+                            Text("Review")
+                                .litterFont(.caption)
+                                .foregroundColor(LitterTheme.accent)
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
                         }
-                        .litterFont(.caption)
-                        .foregroundColor(LitterTheme.accent)
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("hermes-link-review")
                     } else {
                         Button("Cancel") {
                             cancelHermesPairing()
@@ -272,6 +819,7 @@ struct AlleycatAddServerSheet: View {
                 Text(hermesPairing.statusMessage)
                     .litterFont(.caption)
                     .foregroundColor(LitterTheme.textMuted)
+                    .accessibilityIdentifier("hermes-link-status")
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -280,6 +828,7 @@ struct AlleycatAddServerSheet: View {
                     .litterFont(.caption2)
                     .foregroundColor(LitterTheme.warning)
                     .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("hermes-link-error")
             }
 
             Text("No command or credential needs to be copied back. Learnfold will show the computer name and ask before connecting.")
@@ -313,6 +862,7 @@ struct AlleycatAddServerSheet: View {
                     .foregroundColor(LitterTheme.accent)
             }
         }
+        .accessibilityIdentifier("alleycat.scanPairingQR")
 
         DisclosureGroup(
             isExpanded: $showPaste,
@@ -347,10 +897,19 @@ struct AlleycatAddServerSheet: View {
 
         HStack {
             Button("Paste from Clipboard") {
-                if let clipboard = UIPasteboard.general.string {
+                #if DEBUG
+                if checkpointScenario != nil {
+                    pasteJSON = #"{"fixture":"NON-LIVE"}"#
+                } else if let clipboard = platform.readClipboard() {
                     pasteJSON = clipboard
                 }
+                #else
+                if let clipboard = platform.readClipboard() {
+                    pasteJSON = clipboard
+                }
+                #endif
             }
+            .accessibilityIdentifier("alleycat.pastePairingJSON")
             .litterFont(.footnote)
             .foregroundColor(LitterTheme.accent)
 
@@ -359,6 +918,7 @@ struct AlleycatAddServerSheet: View {
             Button(parsedParams == nil ? "Parse JSON" : "Reparse JSON") {
                 handleScannedPayload(pasteJSON)
             }
+            .accessibilityIdentifier("alleycat.parsePairingJSON")
             .litterFont(.footnote)
             .foregroundColor(LitterTheme.accent)
             .disabled(pasteJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -489,15 +1049,21 @@ struct AlleycatAddServerSheet: View {
                 }
             }
             .disabled(!canConnect)
+            .accessibilityIdentifier("alleycat.connectRemoteHost")
         }
         .listRowBackground(LitterTheme.surface.opacity(0.6))
     }
 
-    private func errorSection(_ message: String, color: Color) -> some View {
+    private func errorSection(
+        _ message: String,
+        color: Color,
+        accessibilityID: String = "alleycat-error"
+    ) -> some View {
         Section {
             Text(message)
                 .litterFont(.caption)
                 .foregroundColor(color)
+                .accessibilityIdentifier(accessibilityID)
         }
         .listRowBackground(LitterTheme.surface.opacity(0.6))
     }
@@ -529,8 +1095,19 @@ struct AlleycatAddServerSheet: View {
     ) {
         let trimmed = AgentAssistedPairing.pairingPayloadCandidate(from: raw)
         guard !trimmed.isEmpty else { return }
+        #if DEBUG
+        if checkpointScenario != nil {
+            connectAfterAgentLoad = false
+            pairingRequestIDForParsedParams = nil
+            parsedParams = nil
+            agents = []
+            selectedAgentNames = []
+            parseError = "Redacted fixture could not parse the pairing response."
+            return
+        }
+        #endif
         do {
-            let params = try alleycat.parsePairPayload(json: trimmed)
+            let params = try runtime.parsePairPayload(trimmed)
             connectAfterAgentLoad = connectAfterLoading
             pairingRequestIDForParsedParams = pairingRequestID
             parsedParams = params
@@ -564,10 +1141,13 @@ struct AlleycatAddServerSheet: View {
                 let prompt = AgentAssistedPairing.prompt(
                     submitURL: pairing.submitURL
                 )
-                UIPasteboard.general.setItems(
-                    [[UTType.plainText.identifier: prompt]],
-                    options: [.expirationDate: pairing.expiresAt]
-                )
+                #if DEBUG
+                if checkpointScenario != nil {
+                    withAnimation(.easeOut(duration: 0.15)) { copiedAgentPrompt = true }
+                    return
+                }
+                #endif
+                platform.writeExpiringPrompt(prompt, pairing.expiresAt)
                 withAnimation(.easeOut(duration: 0.15)) {
                     copiedAgentPrompt = true
                 }
@@ -580,31 +1160,48 @@ struct AlleycatAddServerSheet: View {
     }
 
     private var pairingInstallationId: String {
-        let key = "learnfold.pairingInstallationId"
-        if let existing = UserDefaults.standard.string(forKey: key) {
-            return existing
-        }
-        let generated = UUID().uuidString
-        UserDefaults.standard.set(generated, forKey: key)
-        return generated
+        #if DEBUG
+        if checkpointScenario != nil { return "REDACTED-INSTALLATION" }
+        #endif
+        return platform.loadOrCreateInstallationID()
     }
 
-    private var hermesConfirmationMessage: String {
-        guard let host = hermesPairing.readyHost else {
-            return "Hermes submitted a pairing request. Connect to this computer?"
-        }
+    private func hermesConfirmationMessage(
+        host: HermesPairingStatus.Host,
+        isRetry: Bool
+    ) -> String {
         let name = host.name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let display = name?.isEmpty == false ? name! : shortNodeId(host.nodeId)
-        if hermesPairing.phase == .claimed {
+        if isRetry {
             return "Retry the connection to \(display) using the same secure pairing request?"
         }
         return "\(display) is ready to connect. The one-time credential will only be claimed after you tap Connect."
     }
 
+    private func presentCameraDeniedAlert() {
+        alertPresentation = .cameraDenied(id: UUID())
+    }
+
+    private func presentHermesConfirmation(host: HermesPairingStatus.Host) {
+        alertPresentation = .hermesReady(
+            id: UUID(),
+            host: host,
+            isRetry: hermesPairing.phase == .claimed
+        )
+    }
+
     private func claimHermesPairingAndConnect() {
         Task {
             if let claim = await hermesPairing.claim() {
-                showHermesConfirmation = false
+                #if DEBUG
+                if checkpointScenario != nil {
+                    alertPresentation = nil
+                    installCheckpointPairingFixture()
+                    connect(pairingRequestID: claim.requestID)
+                    return
+                }
+                #endif
+                alertPresentation = nil
                 handleScannedPayload(
                     claim.payload,
                     connectAfterLoading: true,
@@ -617,14 +1214,14 @@ struct AlleycatAddServerSheet: View {
     private func cancelHermesPairing() {
         hermesPairing.cancel()
         copiedAgentPrompt = false
-        showHermesConfirmation = false
+        alertPresentation = nil
     }
 
     private func loadAgents(params: AppAlleycatPairPayload, pairingRequestID: String?) {
         isLoadingAgents = true
         Task {
             do {
-                let loaded = try await appModel.serverBridge.listAlleycatAgents(params: params)
+                let loaded = try await runtime.listAgents(params)
                 await MainActor.run {
                     guard parsedParams?.nodeId == params.nodeId,
                           pairingRequestIDForParsedParams == pairingRequestID
@@ -661,6 +1258,13 @@ struct AlleycatAddServerSheet: View {
     }
 
     private func connect(pairingRequestID: String?) {
+        #if DEBUG
+        if checkpointScenario != nil {
+            isConnecting = false
+            _ = hermesPairing.completeConnection(requestID: pairingRequestID)
+            return
+        }
+        #endif
         guard let params = parsedParams, let fallbackAgent = selectedAgents.first else { return }
         let trimmedDisplay = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedName = trimmedDisplay.isEmpty ? suggestedDisplayName(for: params) : trimmedDisplay
@@ -672,19 +1276,21 @@ struct AlleycatAddServerSheet: View {
 
         Task {
             do {
-                let result = try await appModel.serverBridge.connectRemoteOverAlleycat(
-                    serverId: serverId,
-                    displayName: resolvedName,
-                    params: params,
-                    agentName: fallbackAgent.name,
-                    selectedAgentNames: selectedNames,
-                    wire: fallbackAgent.wire
+                let result = try await runtime.connect(
+                    HermesLinkConnectRequest(
+                        serverId: serverId,
+                        displayName: resolvedName,
+                        params: params,
+                        agentName: fallbackAgent.name,
+                        selectedAgentNames: selectedNames,
+                        wire: fallbackAgent.wire
+                    )
                 )
                 let credentialCommit = HermesPairingConnectionCommitPolicy.persistCredential(
                     token: params.token,
                     nodeID: params.nodeId
                 ) { token, nodeID in
-                    try AlleycatCredentialStore.shared.saveToken(token, nodeId: nodeID)
+                    try runtime.saveCredential(token, nodeID)
                 }
                 if case .failure = credentialCommit {
                     await MainActor.run {
@@ -698,7 +1304,7 @@ struct AlleycatAddServerSheet: View {
                 // secret key so the next cold launch reuses the same
                 // `EndpointId`.
                 await MainActor.run {
-                    AppRuntimeController.shared.persistAlleycatSecretKeyIfNeeded()
+                    runtime.persistRuntimeSecretIfNeeded()
                 }
 
                 // The broker request stays recoverable until the remote target
@@ -736,30 +1342,33 @@ struct AlleycatAddServerSheet: View {
     }
 
     private func requestCameraAndScan() {
-        let status = AVCaptureDevice.authorizationStatus(for: .video)
-        switch status {
+        #if DEBUG
+        if checkpointScenario != nil {
+            showScanner = true
+            return
+        }
+        #endif
+        switch platform.cameraAuthorization() {
         case .authorized:
             showScanner = true
         case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { granted in
-                Task { @MainActor in
-                    if granted {
-                        showScanner = true
-                    } else {
-                        cameraDenied = true
-                    }
+            Task { @MainActor in
+                if await platform.requestCameraAccess() {
+                    showScanner = true
+                } else {
+                    presentCameraDeniedAlert()
                 }
             }
-        case .denied, .restricted:
-            cameraDenied = true
-        @unknown default:
-            cameraDenied = true
+        case .denied:
+            presentCameraDeniedAlert()
         }
     }
 
     private func openAppSettings() {
-        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-        UIApplication.shared.open(url)
+        #if DEBUG
+        guard checkpointScenario == nil else { return }
+        #endif
+        platform.openAppSettings()
     }
 
     private func suggestedDisplayName(for params: AppAlleycatPairPayload) -> String {
@@ -786,26 +1395,65 @@ struct AlleycatAddServerSheet: View {
 
 }
 
+#if DEBUG
+/// Direct typed root for central strict-launch dispatch. It deliberately has
+/// no `AppModel` input and owns the Link sentinel boundary so callers must not
+/// wrap it in a second banner.
+@MainActor
+struct HermesLinkStrictCheckpointRoot: View {
+    let scenario: HermesLinkCheckpointScenario
+
+    var body: some View {
+        AlleycatAddServerSheet(checkpointScenario: scenario)
+            .learnfoldStrictHarnessBoundary(.hermesLink)
+    }
+}
+#endif
+
 // MARK: - QR Scanner
 
 private struct QRScannerScreen: View {
     let onScan: (String) -> Void
     let onCancel: () -> Void
     let onPermissionDenied: () -> Void
+    let captureEnabled: Bool
+    let onCopyCommand: () -> Void
+    let showsNonLiveCheckpointBadge: Bool
 
     private static let pairCommand = "npx learnfold-link"
 
     @State private var copied = false
+    @State private var captureController: QRScannerViewController?
+
+    init(
+        onScan: @escaping (String) -> Void,
+        onCancel: @escaping () -> Void,
+        onPermissionDenied: @escaping () -> Void,
+        captureEnabled: Bool,
+        copyCommand: @escaping () -> Void,
+        showsNonLiveCheckpointBadge: Bool
+    ) {
+        self.onScan = onScan
+        self.onCancel = onCancel
+        self.onPermissionDenied = onPermissionDenied
+        self.captureEnabled = captureEnabled
+        self.onCopyCommand = copyCommand
+        self.showsNonLiveCheckpointBadge = showsNonLiveCheckpointBadge
+    }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            QRCaptureSheet(
-                onScan: onScan,
-                onCancel: onCancel,
-                onPermissionDenied: onPermissionDenied
-            )
-            .ignoresSafeArea()
+            if captureEnabled {
+                QRCaptureSheet(
+                    onScan: onScan,
+                    onPermissionDenied: onPermissionDenied,
+                    onControllerReady: { controller in
+                        captureController = controller
+                    }
+                )
+                .ignoresSafeArea()
+            }
 
             LinearGradient(
                 colors: [Color.black.opacity(0.55), Color.black.opacity(0.0)],
@@ -818,6 +1466,12 @@ private struct QRScannerScreen: View {
             .allowsHitTesting(false)
 
             VStack(spacing: 16) {
+                if showsNonLiveCheckpointBadge {
+                    Text("NON-LIVE CHECKPOINT — camera disabled")
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(LitterTheme.accent)
+                        .accessibilityIdentifier("hermes-link-scanner-checkpoint-boundary")
+                }
                 topBar
                 instructionsCard
                 Spacer()
@@ -832,7 +1486,7 @@ private struct QRScannerScreen: View {
     private var topBar: some View {
         HStack {
             Spacer()
-            Button(action: onCancel) {
+            Button(action: cancelCapture) {
                 Text("Cancel")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.white)
@@ -903,6 +1557,7 @@ private struct QRScannerScreen: View {
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("alleycat.scanner.copyCommandButton")
+            .accessibilityLabel(copied ? "Copied" : "Copy command")
         }
         .padding(.leading, 30)
     }
@@ -919,40 +1574,99 @@ private struct QRScannerScreen: View {
     }
 
     private func copyCommand() {
-        UIPasteboard.general.string = Self.pairCommand
+        onCopyCommand()
         withAnimation(.easeOut(duration: 0.15)) { copied = true }
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.4))
             withAnimation(.easeOut(duration: 0.15)) { copied = false }
         }
     }
+
+    private func cancelCapture() {
+        captureController?.cancelCapture()
+        onCancel()
+    }
 }
 
 private struct QRCaptureSheet: UIViewControllerRepresentable {
     let onScan: (String) -> Void
-    let onCancel: () -> Void
     let onPermissionDenied: () -> Void
+    let onControllerReady: (QRScannerViewController) -> Void
 
     func makeUIViewController(context: Context) -> QRScannerViewController {
         let controller = QRScannerViewController()
         controller.onScan = onScan
-        controller.onCancel = onCancel
         controller.onPermissionDenied = onPermissionDenied
+        onControllerReady(controller)
         return controller
     }
 
     func updateUIViewController(_ uiViewController: QRScannerViewController, context: Context) {}
+
+    static func dismantleUIViewController(
+        _ uiViewController: QRScannerViewController,
+        coordinator: ()
+    ) {
+        uiViewController.invalidateCaptureLifecycle()
+    }
 }
 
+private struct QRScannerCaptureLifecycle: Sendable {
+    var generation: UInt64 = 0
+    var isActive = false
+    var didReportScan = false
+}
+
+/// `Mutex` is noncopyable, so it stays inside this immutable reference while
+/// the session queue retains the reference rather than consuming a field from
+/// the main-actor view controller. Every mutable field is protected by `state`.
+private final class QRScannerCaptureLifecycleStore: @unchecked Sendable {
+    private let state = Mutex(QRScannerCaptureLifecycle())
+
+    func begin() -> UInt64 {
+        state.withLock { lifecycle in
+            lifecycle.generation &+= 1
+            lifecycle.isActive = true
+            lifecycle.didReportScan = false
+            return lifecycle.generation
+        }
+    }
+
+    func invalidate() {
+        state.withLock { lifecycle in
+            lifecycle.generation &+= 1
+            lifecycle.isActive = false
+        }
+    }
+
+    func isCurrent(_ generation: UInt64) -> Bool {
+        state.withLock { lifecycle in
+            lifecycle.isActive && lifecycle.generation == generation
+        }
+    }
+
+    func claimDelivery() -> UInt64? {
+        state.withLock { lifecycle in
+            guard lifecycle.isActive, !lifecycle.didReportScan else { return nil }
+            lifecycle.didReportScan = true
+            return lifecycle.generation
+        }
+    }
+}
+
+@MainActor
 private final class QRScannerViewController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
     var onScan: ((String) -> Void)?
-    var onCancel: (() -> Void)?
     var onPermissionDenied: (() -> Void)?
 
     private let captureSession = AVCaptureSession()
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private let metadataQueue = DispatchQueue(label: "com.alleycat.qrscanner")
-    private var didReportScan = false
+    private let sessionQueue = DispatchQueue(label: "com.alleycat.qrscanner.session")
+    // AVFoundation invokes its metadata delegate on `metadataQueue`, not the
+    // main actor. The generation gates both repeat frames and callbacks queued
+    // while the scanner is being dismissed.
+    nonisolated private let captureLifecycle = QRScannerCaptureLifecycleStore()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -962,17 +1676,12 @@ private final class QRScannerViewController: UIViewController, AVCaptureMetadata
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        guard !captureSession.isRunning else { return }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.captureSession.startRunning()
-        }
+        beginCaptureLifecycle()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        if captureSession.isRunning {
-            captureSession.stopRunning()
-        }
+        invalidateCaptureLifecycle()
     }
 
     override func viewDidLayoutSubviews() {
@@ -1014,21 +1723,69 @@ private final class QRScannerViewController: UIViewController, AVCaptureMetadata
         previewLayer = preview
     }
 
-    func metadataOutput(
+    func cancelCapture() {
+        invalidateCaptureLifecycle()
+    }
+
+    func invalidateCaptureLifecycle() {
+        captureLifecycle.invalidate()
+        stopCaptureSession()
+    }
+
+    private func beginCaptureLifecycle() {
+        let generation = captureLifecycle.begin()
+        let captureSession = captureSession
+        let captureLifecycle = captureLifecycle
+        sessionQueue.async {
+            guard captureLifecycle.isCurrent(generation) else { return }
+
+            if !captureSession.isRunning {
+                captureSession.startRunning()
+            }
+
+            // Cancellation can win just after start. Queueing the stop on the
+            // same session queue ensures it cannot leave capture resurrected.
+            guard captureLifecycle.isCurrent(generation) else {
+                if captureSession.isRunning {
+                    captureSession.stopRunning()
+                }
+                return
+            }
+        }
+    }
+
+    private func stopCaptureSession() {
+        let captureSession = captureSession
+        sessionQueue.async {
+            if captureSession.isRunning {
+                captureSession.stopRunning()
+            }
+        }
+    }
+
+    nonisolated func metadataOutput(
         _ output: AVCaptureMetadataOutput,
         didOutput metadataObjects: [AVMetadataObject],
         from connection: AVCaptureConnection
     ) {
-        guard !didReportScan else { return }
         guard let payload = metadataObjects
             .compactMap({ $0 as? AVMetadataMachineReadableCodeObject })
             .first(where: { $0.type == .qr })?
             .stringValue
         else { return }
-        didReportScan = true
-        DispatchQueue.main.async { [weak self] in
-            self?.captureSession.stopRunning()
-            self?.onScan?(payload)
+
+        let deliveryGeneration = captureLifecycle.claimDelivery()
+        guard let deliveryGeneration else { return }
+
+        // `payload` is an immutable String snapshot, so no AVFoundation
+        // metadata object crosses into the main-actor UI/state callback. The
+        // generation check rejects a frame queued before Cancel/dismissal.
+        Task { @MainActor [weak self, payload, deliveryGeneration] in
+            guard let self,
+                  self.captureLifecycle.isCurrent(deliveryGeneration)
+            else { return }
+            self.invalidateCaptureLifecycle()
+            self.onScan?(payload)
         }
     }
 }

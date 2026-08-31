@@ -64,9 +64,9 @@ actor CourseWorkspaceSecurityGate {
     private var lockedWorkspaceIDs: Set<String> = []
     private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
 
-    func withExclusiveAccess<T>(
+    func withExclusiveAccess<T: Sendable>(
         workspaceID: String,
-        operation: () async throws -> T
+        operation: @Sendable () async throws -> T
     ) async throws -> T {
         await acquire(workspaceID: workspaceID)
         do {

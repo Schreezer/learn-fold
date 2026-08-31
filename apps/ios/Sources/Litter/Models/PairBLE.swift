@@ -1,4 +1,4 @@
-import CoreBluetooth
+@preconcurrency import CoreBluetooth
 import Foundation
 
 /// Shared constants and helpers for the BLE-based proximity channel that
@@ -9,7 +9,8 @@ enum PairBLE {
     /// 128-bit service UUID advertised by `MacPairingHost` and scanned for
     /// by `NearbyMacPairing`. Treated as the litter-pair beacon namespace —
     /// other apps using a different UUID won't show up in our scan.
-    static let serviceUUID = CBUUID(string: "DDC6E1E6-7A7E-4D80-A1D0-B6F1F08C9D10")
+    // CBUUID is immutable, but CoreBluetooth has no Sendable conformance.
+    nonisolated(unsafe) static let serviceUUID = CBUUID(string: "DDC6E1E6-7A7E-4D80-A1D0-B6F1F08C9D10")
 
     /// RSSI threshold (dBm) considered "close enough to auto-pair." Roughly
     /// 0.5–1m for typical BLE peers; tightening past -50 dBm makes pairing

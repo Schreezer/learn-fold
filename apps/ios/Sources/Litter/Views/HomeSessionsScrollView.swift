@@ -133,6 +133,7 @@ private final class PinchVignetteView: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
+@MainActor
 final class HomeSessionsScrollUIView: UIView {
     private let scrollView = UIScrollView()
     private let contentView = UIView()
@@ -992,7 +993,8 @@ struct AlphaAnimatedImageView: UIViewRepresentable {
         Coordinator()
     }
 
-    final class Coordinator: NSObject, CAAnimationDelegate {
+    @MainActor
+    final class Coordinator: NSObject, @preconcurrency CAAnimationDelegate {
         private var configuredURL: URL?
         private var configuredRepeatCount: Int?
         private var onFinished: (() -> Void)?
@@ -1118,6 +1120,7 @@ struct AlphaAnimatedImageView: UIViewRepresentable {
 
 // MARK: - Row container
 
+@MainActor
 final class HomeRowContainer: UIView {
     private let hostingController: UIHostingController<AnyView>
     private let backgroundHostingController: UIHostingController<AnyView>
@@ -1288,18 +1291,20 @@ final class HomeRowContainer: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     deinit {
-        // UIKit raises NSInternalInconsistencyException if a
-        // UIViewPropertyAnimator is released while still in `.active`
-        // (running or paused). We hold it paused-active for
-        // `fractionComplete` scrubbing, so terminate it explicitly here.
-        fadeLink?.invalidate()
-        if !LitterPlatform.rendersAsMacApp {
-            NotificationCenter.default.removeObserver(
-                self,
-                name: UIAccessibility.reduceTransparencyStatusDidChangeNotification,
-                object: nil
-            )
-            tearDownPinchBlurAnimator()
+        MainActor.assumeIsolated {
+            // UIKit raises NSInternalInconsistencyException if a
+            // UIViewPropertyAnimator is released while still in `.active`
+            // (running or paused). We hold it paused-active for
+            // `fractionComplete` scrubbing, so terminate it explicitly here.
+            fadeLink?.invalidate()
+            if !LitterPlatform.rendersAsMacApp {
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: UIAccessibility.reduceTransparencyStatusDidChangeNotification,
+                    object: nil
+                )
+                tearDownPinchBlurAnimator()
+            }
         }
     }
 

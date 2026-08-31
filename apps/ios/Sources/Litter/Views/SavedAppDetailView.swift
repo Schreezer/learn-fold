@@ -362,7 +362,7 @@ struct SavedAppDetailView: View {
             return
         }
         let cached = cachedStructuredThreadId
-        Task.detached {
+        Task { @MainActor in
             let result = await AppModel.shared.client.structuredResponse(
                 serverId: serverId,
                 cachedThreadId: cached,
@@ -371,9 +371,7 @@ struct SavedAppDetailView: View {
             )
             switch result {
             case .success(let threadId, let responseJson):
-                await MainActor.run {
-                    cachedStructuredThreadId = threadId
-                }
+                cachedStructuredThreadId = threadId
                 respond(requestId, responseJson, nil)
             case .error(let message):
                 respond(requestId, nil, message)

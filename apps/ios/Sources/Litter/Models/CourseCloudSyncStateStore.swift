@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+@preconcurrency import SQLite3
 
 enum CourseCloudChangeKind: String, Codable, Sendable {
     case save
@@ -63,7 +63,11 @@ struct CourseCloudAccountChange: Codable, Equatable, Sendable {
 /// engine state serialization commit in one SQLite transaction, so a crash
 /// cannot advance the CloudKit cursor past unapplied course data.
 actor CourseCloudSyncStateStore {
-    private let database: OpaquePointer
+    // SQLite owns this handle for the store's entire lifetime. It never leaves
+    // this actor, but actor deinits are nonisolated under strict concurrency.
+    // The immutable pointer must therefore be explicitly available to deinit
+    // for `sqlite3_close`; all database use still occurs on this actor.
+    private nonisolated(unsafe) let database: OpaquePointer
     private let path: String
 
     init(url: URL) throws {

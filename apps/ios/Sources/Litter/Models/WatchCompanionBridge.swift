@@ -129,12 +129,6 @@ final class WatchCompanionBridge: NSObject {
     deinit {
         pushThrottle?.cancel()
         complicationRefreshTask?.cancel()
-        if let themeObserver {
-            NotificationCenter.default.removeObserver(themeObserver)
-        }
-        if let preferencesObserver {
-            NotificationCenter.default.removeObserver(preferencesObserver)
-        }
     }
 
     // MARK: - Observation
@@ -855,10 +849,73 @@ final class WatchCompanionBridge: NSObject {
     }
 }
 
-/// WCSessionDelegate proxy. Declared as a separate class so the bridge can
-/// own a single activation + delegate lifecycle.
+/// The subset of inbound WatchConnectivity values the bridge accepts. The
+/// framework gives delegates `[String: Any]` on its own serial queue, which is
+/// neither Sendable nor main-actor isolated. Decode its scalar fields before
+/// crossing executors; the main actor reconstructs the legacy dictionary only
+/// at the bridge boundary.
+private struct WatchInboundPayload: Sendable {
+    let kind: String
+    let requestId: String?
+    let approve: Bool?
+    let text: String?
+    let serverId: String?
+    let threadId: String?
+
+    init?(_ values: [String: Any]) {
+        guard let kind = values["kind"] as? String else { return nil }
+        self.kind = kind
+        self.requestId = values["requestId"] as? String
+        self.approve = values["approve"] as? Bool
+        self.text = values["text"] as? String
+        self.serverId = values["serverId"] as? String
+        self.threadId = values["threadId"] as? String
+    }
+
+    static let snapshotRequest = WatchInboundPayload(kind: "snapshot.request")
+
+    private init(kind: String) {
+        self.kind = kind
+        requestId = nil
+        approve = nil
+        text = nil
+        serverId = nil
+        threadId = nil
+    }
+
+    var bridgeMessage: [String: Any] {
+        var values: [String: Any] = ["kind": kind]
+        if let requestId { values["requestId"] = requestId }
+        if let approve { values["approve"] = approve }
+        if let text { values["text"] = text }
+        if let serverId { values["serverId"] = serverId }
+        if let threadId { values["threadId"] = threadId }
+        return values
+    }
+}
+
+/// `replyHandler` has no Sendable annotation in WatchConnectivity even though
+/// its completion may be invoked after the delegate method returns. This box
+/// is the one narrowly-scoped escape hatch: it owns the callback, forwards it
+/// exactly once from the main-actor task, and never exposes the incoming
+/// non-Sendable message to another executor.
+private final class WatchReplyHandlerBox: @unchecked Sendable {
+    private let handler: ([String: Any]) -> Void
+
+    init(_ handler: @escaping ([String: Any]) -> Void) {
+        self.handler = handler
+    }
+
+    func reply(_ values: [String: Any]) {
+        handler(values)
+    }
+}
+
+/// WCSessionDelegate proxy. WatchConnectivity invokes these entry points on
+/// its own serial queue. Keep the proxy nonisolated and hop only after the
+/// inbound payload has been converted to scalar Sendable values.
 final class WatchCompanionSessionDelegate: NSObject, WCSessionDelegate {
-    nonisolated func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
+    func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         // Bail unless the session actually came up clean. `inactive` and
         // `notActivated` show up during a watch app reinstall or pairing
         // change; firing a re-push then would race against an unsettled
@@ -866,36 +923,47 @@ final class WatchCompanionSessionDelegate: NSObject, WCSessionDelegate {
         guard state == .activated, error == nil else { return }
         Task { @MainActor in
             // On activation, re-push so the watch gets current state.
-            _ = await WatchCompanionBridge.shared.handleInbound(["kind": "snapshot.request"])
+            _ = await WatchCompanionBridge.shared.handleInbound(
+                WatchInboundPayload.snapshotRequest.bridgeMessage
+            )
         }
     }
 
-    nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
-    nonisolated func sessionDidDeactivate(_ session: WCSession) {
+    func sessionDidBecomeInactive(_ session: WCSession) {}
+    func sessionDidDeactivate(_ session: WCSession) {
         WCSession.default.activate()
     }
-    nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
+    func sessionWatchStateDidChange(_ session: WCSession) {
         Task { @MainActor in
-            _ = await WatchCompanionBridge.shared.handleInbound(["kind": "snapshot.request"])
+            _ = await WatchCompanionBridge.shared.handleInbound(
+                WatchInboundPayload.snapshotRequest.bridgeMessage
+            )
         }
     }
 
-    nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        guard let payload = WatchInboundPayload(message) else { return }
         Task { @MainActor in
-            _ = await WatchCompanionBridge.shared.handleInbound(message)
+            _ = await WatchCompanionBridge.shared.handleInbound(payload.bridgeMessage)
         }
     }
 
-    nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        guard let payload = WatchInboundPayload(message) else {
+            replyHandler(["ok": false, "error": "invalid payload"])
+            return
+        }
+        let replyBox = WatchReplyHandlerBox(replyHandler)
         Task { @MainActor in
-            let reply = await WatchCompanionBridge.shared.handleInbound(message)
-            replyHandler(reply ?? ["ok": true])
+            let reply = await WatchCompanionBridge.shared.handleInbound(payload.bridgeMessage)
+            replyBox.reply(reply ?? ["ok": true])
         }
     }
 
-    nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+    func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        guard let payload = WatchInboundPayload(userInfo) else { return }
         Task { @MainActor in
-            _ = await WatchCompanionBridge.shared.handleInbound(userInfo)
+            _ = await WatchCompanionBridge.shared.handleInbound(payload.bridgeMessage)
         }
     }
 }

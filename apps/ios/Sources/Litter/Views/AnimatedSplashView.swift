@@ -11,6 +11,7 @@ struct AnimatedSplashView: View {
 
     let appReady: Bool
     var compact: Bool = false
+    var freezeBrandedFrame: Bool = false
     let onFinished: () -> Void
 
     // 30 Hz is plenty for this animation — the fastest thing in it is a
@@ -63,7 +64,9 @@ struct AnimatedSplashView: View {
                 }
 
                 TimelineView(.periodic(from: startDate, by: Self.frameInterval)) { timeline in
-                    let t = timeline.date.timeIntervalSince(startDate)
+                    let t = freezeBrandedFrame
+                        ? 0
+                        : timeline.date.timeIntervalSince(startDate)
                     let pulse = 1 + CGFloat(sin(t * 2.4)) * (compact ? 0.025 : 0.012)
                     let rise = CGFloat(sin(t * 1.7)) * (compact ? 0.8 : 2.5)
 
@@ -119,6 +122,10 @@ struct AnimatedSplashView: View {
         .onAppear { startDate = .now }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(compact ? "" : "Learnfold. Turn anything into a course.")
+        .accessibilityIdentifier("learnfold-splash-branded-frame")
+        .accessibilityValue(
+            freezeBrandedFrame ? "acceptance-freeze-active" : "animated"
+        )
         .accessibilityHidden(compact)
     }
 

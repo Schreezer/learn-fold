@@ -38,6 +38,7 @@ enum StreamingEffectKind: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 @Observable
 final class DebugSettings {
     static let shared = DebugSettings()

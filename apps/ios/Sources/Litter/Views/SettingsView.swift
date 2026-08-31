@@ -1,11 +1,29 @@
 import SwiftUI
 import UIKit
+#if !targetEnvironment(macCatalyst)
+import UserNotifications
+#endif
+
+enum SettingsServerLifecycleProjection {
+    static func resolve(_ healths: [AppServerHealth]) -> String {
+        if healths.contains(.connecting) {
+            return "connecting"
+        }
+        if healths.contains(where: { $0 != .connected }) {
+            return "disconnected"
+        }
+        return healths.isEmpty ? "none" : "connected"
+    }
+}
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
     @Environment(\.textScale) private var textScale
+    #if !targetEnvironment(macCatalyst)
+    @Environment(\.scenePhase) private var scenePhase
+    #endif
     @AppStorage("fontFamily") private var fontFamily = FontFamilyOption.mono.rawValue
     @AppStorage("collapseTurns") private var collapseTurns = false
     @AppStorage(ConversationDisplayPreferenceKey.reasoning) private var reasoningDisplayMode = ConversationDetailDisplayMode.collapsed.rawValue
@@ -13,6 +31,10 @@ struct SettingsView: View {
     @AppStorage(ConversationDisplayPreferenceKey.tools) private var toolDisplayMode = ConversationDetailDisplayMode.collapsed.rawValue
     @State private var activeServerSheet: SettingsServerSheet?
     @State private var serverEditError: String?
+    #if !targetEnvironment(macCatalyst)
+    @State private var notificationAuthorizationStatus: UNAuthorizationStatus?
+    @State private var notificationPermissionRequestInFlight = false
+    #endif
 
     private var localServer: AppServerSnapshot? {
         // Account management (ChatGPT login / API key) is local-only, always.
@@ -29,12 +51,19 @@ struct SettingsView: View {
         )
     }
 
+    private var serverLifecycleAccessibilityValue: String {
+        SettingsServerLifecycleProjection.resolve(connectedServers.map(\.health))
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 LitterTheme.backgroundGradient.ignoresSafeArea()
                 Form {
                     appearanceSection
+                    #if !targetEnvironment(macCatalyst)
+                    notificationSection
+                    #endif
                     fontSection
                     conversationSection
                     petSection
@@ -56,9 +85,15 @@ struct SettingsView: View {
                 switch sheet {
                 case .add:
                     NavigationStack {
-                        DiscoveryView(onServerSelected: { _ in
-                            activeServerSheet = nil
-                        })
+                        DiscoveryView(
+                            runtimeDependencies: .live(
+                                appModel: appModel,
+                                appState: appState
+                            ),
+                            onServerSelected: { _ in
+                                activeServerSheet = nil
+                            }
+                        )
                     }
                     .environment(appModel)
                     .environment(appState)
@@ -103,6 +138,15 @@ struct SettingsView: View {
                 Text(serverEditError ?? "Unable to update this server.")
             }
         }
+        #if !targetEnvironment(macCatalyst)
+        .task {
+            await refreshNotificationAuthorizationStatus()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await refreshNotificationAuthorizationStatus() }
+        }
+        #endif
     }
 
     // MARK: - Appearance Section
@@ -127,6 +171,89 @@ struct SettingsView: View {
                 .foregroundColor(LitterTheme.textSecondary)
         }
     }
+
+    #if !targetEnvironment(macCatalyst)
+    // MARK: - Notifications Section
+
+    private var notificationPresentation: AppNotificationPermissionPresentation {
+        AppNotificationPermissionPolicy.presentation(for: notificationAuthorizationStatus)
+    }
+
+    private var notificationSection: some View {
+        Section {
+            HStack(spacing: 10) {
+                Image(systemName: "bell.badge")
+                    .foregroundColor(LitterTheme.accent)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Notifications")
+                        .litterFont(.subheadline)
+                        .foregroundColor(LitterTheme.textPrimary)
+                    Text(notificationPresentation.detailText)
+                        .litterFont(.caption)
+                        .foregroundColor(LitterTheme.textSecondary)
+                }
+                Spacer(minLength: 12)
+                Text(notificationPresentation.statusText)
+                    .litterFont(.caption)
+                    .foregroundColor(LitterTheme.textSecondary)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Notifications")
+            .accessibilityValue(notificationPresentation.statusText)
+            .accessibilityIdentifier("settings.notifications.row")
+            .listRowBackground(LitterTheme.surface.opacity(0.6))
+
+            if let actionTitle = notificationPresentation.actionTitle {
+                Button {
+                    performNotificationPermissionAction()
+                } label: {
+                    HStack {
+                        if notificationPermissionRequestInFlight {
+                            ProgressView()
+                                .tint(LitterTheme.accent)
+                        }
+                        Text(actionTitle)
+                            .litterFont(.subheadline, weight: .semibold)
+                        Spacer()
+                    }
+                }
+                .foregroundColor(LitterTheme.accent)
+                .disabled(notificationPermissionRequestInFlight)
+                .accessibilityLabel(actionTitle)
+                .accessibilityIdentifier(
+                    notificationPresentation.action == .requestAuthorization
+                        ? "settings.notifications.enable"
+                        : "settings.notifications.openSettings"
+                )
+                .listRowBackground(LitterTheme.surface.opacity(0.6))
+            }
+        } header: {
+            Text("Alerts")
+                .foregroundColor(LitterTheme.textSecondary)
+        }
+    }
+
+    private func refreshNotificationAuthorizationStatus() async {
+        notificationAuthorizationStatus = await AppLifecycleController.notificationAuthorizationStatus()
+    }
+
+    private func performNotificationPermissionAction() {
+        switch notificationPresentation.action {
+        case .none:
+            return
+        case .requestAuthorization:
+            notificationPermissionRequestInFlight = true
+            Task { @MainActor in
+                notificationAuthorizationStatus =
+                    await AppLifecycleController.requestNotificationAuthorization()
+                notificationPermissionRequestInFlight = false
+            }
+        case .openSettings:
+            AppLifecycleController.openNotificationSettings()
+        }
+    }
+    #endif
 
     // MARK: - Conversation Section
 
@@ -368,6 +495,8 @@ struct SettingsView: View {
         } header: {
             Text("Servers")
                 .foregroundColor(LitterTheme.textSecondary)
+                .accessibilityIdentifier("settings-server-lifecycle-root")
+                .accessibilityValue(serverLifecycleAccessibilityValue)
         }
     }
 

@@ -143,6 +143,7 @@ struct WidgetWebView: UIViewRepresentable {
 
     // MARK: - Coordinator
 
+    @MainActor
     class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, UIGestureRecognizerDelegate {
         @objc func absorbDoubleTap(_ recogniser: UITapGestureRecognizer) {
             // No-op. Recogniser is attached only in minigame mode to swallow
@@ -219,10 +220,12 @@ struct WidgetWebView: UIViewRepresentable {
             pendingHTML = html
             guard updateTimer == nil else { return }
             updateTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
-                guard let self, let html = self.pendingHTML else { return }
-                self.pendingHTML = nil
-                self.updateTimer = nil
-                self.sendContent(html, runScripts: false)
+                Task { @MainActor [weak self] in
+                    guard let self, let html = self.pendingHTML else { return }
+                    self.pendingHTML = nil
+                    self.updateTimer = nil
+                    self.sendContent(html, runScripts: false)
+                }
             }
         }
 
@@ -242,11 +245,11 @@ struct WidgetWebView: UIViewRepresentable {
                 pendingHeight = h
                 heightTimer?.invalidate()
                 heightTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
-                    guard let self else { return }
-                    let finalHeight = ceil(self.pendingHeight)
-                    guard abs(finalHeight - self.lastCommittedHeight) > 1 else { return }
-                    self.lastCommittedHeight = finalHeight
-                    DispatchQueue.main.async {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        let finalHeight = ceil(self.pendingHeight)
+                        guard abs(finalHeight - self.lastCommittedHeight) > 1 else { return }
+                        self.lastCommittedHeight = finalHeight
                         self.heightBinding?.wrappedValue = finalHeight
                     }
                 }
@@ -318,7 +321,7 @@ struct WidgetWebView: UIViewRepresentable {
         }
 
         // Block navigation to external URLs
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
             if navigationAction.navigationType == .other || navigationAction.request.url?.scheme == "about" {
                 decisionHandler(.allow)
                 return

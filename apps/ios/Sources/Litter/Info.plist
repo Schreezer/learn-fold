@@ -35,6 +35,10 @@
 	<false/>
 	<key>LearnfoldCourseCloudSyncEnabled</key>
 	<true/>
+	<key>LearnfoldHostedAgentURL</key>
+	<string>$(LEARNFOLD_HOSTED_AGENT_URL)</string>
+	<key>LearnfoldHostedAccessToken</key>
+	<string>$(LEARNFOLD_HOSTED_ACCESS_TOKEN)</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>tailscale</string>

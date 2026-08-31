@@ -1,4 +1,4 @@
-import ActivityKit
+@preconcurrency import ActivityKit
 import AVFoundation
 import Foundation
 import Observation
@@ -818,8 +818,11 @@ final class VoiceRuntimeController: VoiceActions {
             } catch {}
             return
         }
-        guard let activity = voiceCallActivity else { return }
-        Task {
+        guard let activityID = voiceCallActivity?.id else { return }
+        Task { @MainActor in
+            guard let activity = Activity<CodexVoiceCallAttributes>.activities.first(where: { $0.id == activityID }) else {
+                return
+            }
             await activity.update(
                 .init(state: session.activityContentState, staleDate: Date(timeIntervalSinceNow: 120))
             )
@@ -827,8 +830,11 @@ final class VoiceRuntimeController: VoiceActions {
     }
 
     private func endVoiceCallActivity() {
-        guard let activity = voiceCallActivity else { return }
-        Task {
+        guard let activityID = voiceCallActivity?.id else { return }
+        Task { @MainActor in
+            guard let activity = Activity<CodexVoiceCallAttributes>.activities.first(where: { $0.id == activityID }) else {
+                return
+            }
             await activity.end(nil, dismissalPolicy: .after(.now + 2))
         }
         voiceCallActivity = nil

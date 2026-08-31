@@ -85,7 +85,8 @@ struct SessionTreeNode: Identifiable, Equatable {
 }
 
 struct SessionsDerivedData: Equatable {
-    static let empty = SessionsDerivedData(
+    static var empty: SessionsDerivedData {
+        SessionsDerivedData(
         allThreads: [],
         allThreadKeys: [],
         filteredThreads: [],
@@ -96,7 +97,8 @@ struct SessionsDerivedData: Equatable {
         parentByKey: [:],
         siblingsByKey: [:],
         childrenByKey: [:]
-    )
+        )
+    }
 
     let allThreads: [AppSessionSummary]
     let allThreadKeys: [ThreadKey]

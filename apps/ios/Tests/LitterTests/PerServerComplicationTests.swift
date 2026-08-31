@@ -32,8 +32,8 @@ final class PerServerComplicationTests: XCTestCase {
     private var savedPinnedKeys: [PinnedThreadKey] = []
     private var savedHiddenKeys: [PinnedThreadKey] = []
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         savedSnapshot = AppModel.shared.snapshot
         savedPinnedKeys = SavedThreadsStore.pinnedKeys()
         savedHiddenKeys = SavedThreadsStore.hiddenKeys()
@@ -41,13 +41,13 @@ final class PerServerComplicationTests: XCTestCase {
         for key in savedHiddenKeys { SavedThreadsStore.unhide(key) }
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         AppModel.shared.applySnapshot(savedSnapshot)
         for key in SavedThreadsStore.pinnedKeys() { SavedThreadsStore.remove(key) }
         for key in SavedThreadsStore.hiddenKeys() { SavedThreadsStore.unhide(key) }
         for key in savedPinnedKeys.reversed() { SavedThreadsStore.add(key) }
         for key in savedHiddenKeys.reversed() { SavedThreadsStore.hide(key) }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     // MARK: - servers.v1 Codable round trip

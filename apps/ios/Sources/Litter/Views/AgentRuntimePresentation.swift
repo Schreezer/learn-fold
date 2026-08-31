@@ -1,4 +1,5 @@
 import SwiftUI
+import Synchronization
 
 /// Bridge alias: Rust exposes agent identity as an opaque `String` (the
 /// lowercase id alleycat advertises). The legacy `AgentRuntimeKind`
@@ -13,8 +14,22 @@ typealias AgentRuntimeKind = String
 /// app launch in `LitterApp` so any view can resolve an `AgentId` to
 /// its metadata. Returns `nil` before the first probe response.
 enum AgentRuntimeMetadataProvider {
-    static var lookup: ((String) -> AppAgentMetadata?)?
-    static var all: (() -> [AppAgentMetadata])?
+    private static let client = Mutex<AppClient?>(nil)
+
+    @MainActor
+    static func install(client: AppClient) {
+        self.client.withLock { $0 = client }
+    }
+
+    nonisolated static func metadata(for name: String) -> AppAgentMetadata? {
+        let client = client.withLock { $0 }
+        return client?.agentMetadata(name: name)
+    }
+
+    nonisolated static func allMetadata() -> [AppAgentMetadata] {
+        let client = client.withLock { $0 }
+        return client?.allAgentMetadata() ?? []
+    }
 }
 
 extension AgentRuntimeKind {
@@ -23,6 +38,7 @@ extension AgentRuntimeKind {
     static let devin: AgentRuntimeKind = "devin"
     static let droid: AgentRuntimeKind = "droid"
     static let opencode: AgentRuntimeKind = "opencode"
+    static let hosted: AgentRuntimeKind = CourseAgentProvider.hosted
     static let appleOnDevice: AgentRuntimeKind = CourseAgentProvider.appleOnDevice
     static let applePrivateCloud: AgentRuntimeKind = CourseAgentProvider.applePrivateCloud
 
@@ -31,11 +47,11 @@ extension AgentRuntimeKind {
     /// manifest). Empty when no probe has populated the cache yet —
     /// callers should treat that as "no agents available."
     static var presentationOrder: [AgentRuntimeKind] {
-        AgentRuntimeMetadataProvider.all?().map(\.name) ?? []
+        AgentRuntimeMetadataProvider.allMetadata().map(\.name)
     }
 
     var metadata: AppAgentMetadata? {
-        AgentRuntimeMetadataProvider.lookup?(self)
+        AgentRuntimeMetadataProvider.metadata(for: self)
     }
 
     /// Short label used in lists. Prefers metadata `display_name`;
@@ -45,6 +61,7 @@ extension AgentRuntimeKind {
     var displayLabel: String {
         if self == .appleOnDevice { return "Apple On-Device" }
         if self == .applePrivateCloud { return "Apple Private Cloud" }
+        if self == .hosted { return "Hosted" }
         if let meta = metadata, !meta.displayName.isEmpty {
             return meta.displayName
         }
@@ -99,6 +116,7 @@ extension AgentRuntimeKind {
     /// `AgentIconView`. Litter ships icons for the agents it knows
     /// about (codex, claude, etc.) and renders a monogram for anything
     /// new that alleycat advertises.
+    @MainActor
     var bundledAssetName: String? {
         let candidate = "agent_\(self)"
         return UIImage(named: candidate) != nil ? candidate : nil
@@ -113,7 +131,7 @@ extension AgentRuntimeKind {
         if isStableAgentIdentity(key, displayName: displayName) {
             return false
         }
-        return AgentRuntimeMetadataProvider.lookup?(key)?.presentation?.isBeta ?? true
+        return AgentRuntimeMetadataProvider.metadata(for: key)?.presentation?.isBeta ?? true
     }
 
     private static func isStableAgentIdentity(_ name: String, displayName: String) -> Bool {
@@ -137,7 +155,13 @@ struct AgentIconView: View {
     var size: CGFloat = 24
 
     var body: some View {
-        if kind == .appleOnDevice {
+        if kind == .hosted {
+            Image(systemName: "cloud.fill")
+                .font(.system(size: size * 0.62, weight: .semibold))
+                .foregroundStyle(.blue)
+                .frame(width: size, height: size)
+                .background(.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: size * 0.22))
+        } else if kind == .appleOnDevice {
             Image(systemName: "apple.logo")
                 .font(.system(size: size * 0.68, weight: .semibold))
                 .foregroundStyle(.primary)

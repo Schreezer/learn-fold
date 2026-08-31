@@ -1,8 +1,10 @@
 import Foundation
 import ImageIO
+import NativeBlockEditorCore
 import NativeEditorMCP
 import Observation
 import UIKit
+import Darwin
 
 #if canImport(FoundationModels)
 import FoundationModels
@@ -35,23 +37,28 @@ struct LearningCourse: Identifiable, Codable, Equatable {
     var agentThreadID: String? = nil
     var agentRuntimeKind: String? = nil
     var agentModelID: String? = nil
+    var agentReasoningEffortID: String? = nil
     var appleSessionID: UUID? = nil
+    var hostedSessionID: UUID? = nil
 
 }
 
 struct PreparedCourseLessonTarget: Codable, Equatable, Sendable {
     let nodeID: String
+    let title: String?
     let pageID: String
     let revision: Int64
     let courseRole: String?
 
     init(
         nodeID: String,
+        title: String? = nil,
         pageID: String,
         revision: Int64,
         courseRole: String? = nil
     ) {
         self.nodeID = nodeID
+        self.title = title
         self.pageID = pageID
         self.revision = revision
         self.courseRole = courseRole
@@ -324,6 +331,11 @@ struct CourseSource: Identifiable, Equatable {
     var image: UIImage?
 }
 
+enum CourseAgentTranscriptVisibility: Equatable {
+    case learner
+    case internalInstruction
+}
+
 struct CourseChatMessage: Identifiable {
     enum Role {
         case learner
@@ -335,6 +347,7 @@ struct CourseChatMessage: Identifiable {
     var role: Role
     var text: String
     var sources: [CourseSource] = []
+    var transcriptVisibility: CourseAgentTranscriptVisibility = .learner
 }
 
 enum CourseChatScope: Hashable {
@@ -362,6 +375,667 @@ enum CourseChatRunPhase: Equatable {
         }
     }
 }
+
+enum CourseAgentInternalPromptPolicy {
+    private static let marker = "<learnfold_internal_course_instruction version=\"1\">"
+
+    static func wrap(_ instruction: String, purpose: String) -> String {
+        """
+        \(marker)
+        purpose: \(purpose)
+        \(instruction)
+        </learnfold_internal_course_instruction>
+        """
+    }
+
+    static func isInternalInstruction(_ text: String) -> Bool {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = normalized.lowercased()
+        if lowercased.contains(marker) {
+            return true
+        }
+
+        // These conjunctions identify prompts emitted by older Learnfold
+        // builds. Requiring several product-only phrases avoids hiding a
+        // learner message merely because it mentions one editor tool.
+        let isLegacyTargetedGeneration =
+            lowercased.contains("this request was started from the learn screen")
+                && lowercased.contains("native-editor-fetch")
+                && lowercased.contains("native-editor-update-page")
+                && lowercased.contains("pending_generation")
+                && lowercased.contains("never generate siblings or later sections")
+        if isLegacyTargetedGeneration {
+            return true
+        }
+
+        return lowercased.hasPrefix("i approve course plan ")
+            && lowercased.contains("learnfold has already created")
+            && (
+                lowercased.contains("learnfold_generate_lesson")
+                    || lowercased.contains("generation_status")
+            )
+            && lowercased.contains("do not recreate the course structure")
+    }
+
+    static func visibleLearnerText(_ text: String?) -> String? {
+        guard let text, !isInternalInstruction(text) else { return nil }
+        return text
+    }
+
+    static func recoverableLearnerText(
+        learnerText: String?,
+        legacySubmittedText: String?
+    ) -> String? {
+        if let learnerText {
+            return visibleLearnerText(learnerText)
+        }
+        return visibleLearnerText(legacySubmittedText)
+    }
+}
+
+enum CourseChatTranscriptPolicy {
+    static func learnerVisibleMessages(
+        _ messages: [CourseChatMessage]
+    ) -> [CourseChatMessage] {
+        var hidesFollowingInternalResponse = false
+        var visible: [CourseChatMessage] = []
+        visible.reserveCapacity(messages.count)
+        for message in messages {
+            if message.transcriptVisibility == .internalInstruction {
+                if message.role == .learner {
+                    hidesFollowingInternalResponse = true
+                }
+                continue
+            }
+            switch message.role {
+            case .learner:
+                if CourseAgentInternalPromptPolicy.isInternalInstruction(message.text) {
+                    hidesFollowingInternalResponse = true
+                    continue
+                }
+                hidesFollowingInternalResponse = false
+                visible.append(message)
+            case .agent where hidesFollowingInternalResponse:
+                hidesFollowingInternalResponse = false
+            case .agent:
+                visible.append(message)
+            }
+        }
+        return visible
+    }
+}
+
+enum CourseLessonExampleKind: Equatable, Sendable {
+    case topicDemonstration
+    case runnableCode(languageOrFramework: String)
+    case runnableCodeNamedByPlan
+}
+
+enum CourseLessonExamplePolicy {
+    static func kind(for brief: CourseBrief) -> CourseLessonExampleKind {
+        programmingExampleKind(in: brief) ?? .topicDemonstration
+    }
+
+    static func promptInstruction(for brief: CourseBrief) -> String {
+        switch kind(for: brief) {
+        case .topicDemonstration:
+            "one small topic-relevant demonstration, worked example, or concrete scenario"
+        case .runnableCode(let languageOrFramework):
+            "one small runnable \(languageOrFramework) example"
+        case .runnableCodeNamedByPlan:
+            "one small runnable example using the language or framework specified by the plan"
+        }
+    }
+
+    static func codeFenceLanguage(for languageOrFramework: String) -> String {
+        switch languageOrFramework.lowercased() {
+        case "swift", "swiftui": "swift"
+        case "typescript": "typescript"
+        case "javascript": "javascript"
+        case "python": "python"
+        case "rust": "rust"
+        case "kotlin": "kotlin"
+        case "dart or flutter": "dart"
+        case "ruby": "ruby"
+        case "php": "php"
+        case "sql": "sql"
+        case "java": "java"
+        case "c++": "cpp"
+        case "c#": "csharp"
+        default: "text"
+        }
+    }
+
+    private static func programmingExampleKind(
+        in brief: CourseBrief
+    ) -> CourseLessonExampleKind? {
+        let firstChapter = brief.chapters.first
+        let subject = [
+            brief.title,
+            brief.summary,
+            brief.outcome,
+            brief.startingPoint,
+            brief.focusGap,
+            firstChapter?.title ?? "",
+            firstChapter?.objective ?? "",
+            firstChapter?.deliverables.joined(separator: " ") ?? "",
+        ].joined(separator: " ").lowercased()
+        let tokens = Set(
+            subject.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        )
+        let hasSoftwareContext = softwareContextSignals.contains(where: tokens.contains)
+            || softwareContextPhrases.contains(where: subject.contains)
+        let namedSubjects: [(terms: [String], label: String, requiresContext: Bool)] = [
+            (["swiftui"], "SwiftUI", false),
+            (["typescript"], "TypeScript", false),
+            (["javascript", "nodejs"], "JavaScript", false),
+            (["kotlin"], "Kotlin", false),
+            (["php"], "PHP", false),
+            (["sql"], "SQL", false),
+            (["swift"], "Swift", true),
+            (["python"], "Python", true),
+            (["rust"], "Rust", true),
+            (["flutter", "dart"], "Dart or Flutter", true),
+            (["react"], "React", true),
+            (["ruby"], "Ruby", true),
+            (["java"], "Java", true),
+        ]
+        if subject.contains("c++") {
+            return .runnableCode(languageOrFramework: "C++")
+        }
+        if subject.contains("c#") {
+            return .runnableCode(languageOrFramework: "C#")
+        }
+        for namedSubject in namedSubjects
+        where namedSubject.terms.contains(where: tokens.contains)
+            && (!namedSubject.requiresContext || hasSoftwareContext) {
+            return .runnableCode(languageOrFramework: namedSubject.label)
+        }
+        let genericSignals = [
+            "programming",
+            "coding",
+            "software development",
+            "web development",
+            "app development",
+        ]
+        if genericSignals.contains(where: subject.contains) {
+            return .runnableCodeNamedByPlan
+        }
+        return nil
+    }
+
+    private static let softwareContextSignals: Set<String> = [
+        "algorithm",
+        "algorithms",
+        "api",
+        "app",
+        "apps",
+        "code",
+        "coding",
+        "compiler",
+        "concurrency",
+        "database",
+        "developer",
+        "developers",
+        "development",
+        "framework",
+        "function",
+        "functions",
+        "isolation",
+        "programming",
+        "query",
+        "software",
+        "variable",
+        "variables",
+    ]
+
+    private static let softwareContextPhrases = [
+        "app development",
+        "runnable app",
+        "runnable program",
+        "software development",
+        "source code",
+        "web development",
+    ]
+}
+
+enum CourseAgentSubmissionRecoveryState: String, Codable, Equatable {
+    /// The learner submission is journaled, but dispatch has not started.
+    case preparing
+    /// Learnfold can prove the submission did not reach the agent runtime.
+    case knownNotAccepted
+    /// Dispatch started, but Learnfold did not receive an authoritative receipt.
+    case acceptanceUnknown
+    /// The runtime accepted the turn, but its reply did not finish hydrating.
+    case acceptedReplyIncomplete
+
+    var blocksNewSubmission: Bool {
+        switch self {
+        case .acceptanceUnknown, .acceptedReplyIncomplete:
+            true
+        case .preparing, .knownNotAccepted:
+            false
+        }
+    }
+
+    var canDiscardDraft: Bool {
+        switch self {
+        case .preparing, .knownNotAccepted:
+            true
+        case .acceptanceUnknown, .acceptedReplyIncomplete:
+            false
+        }
+    }
+
+    var draftProvenanceText: String? {
+        switch self {
+        case .preparing, .knownNotAccepted:
+            "Draft restored from the message that was not sent."
+        case .acceptanceUnknown:
+            "Draft preserved while Learnfold checks whether the message was received."
+        case .acceptedReplyIncomplete:
+            nil
+        }
+    }
+}
+
+/// A render-safe projection of the durable Hermes recovery journals. The IDs
+/// come from the same workspace and thread records that own retry/abandon
+/// behavior; the UI never infers recovery provenance from generic error copy.
+struct CourseHermesRecoveryProvenance: Equatable {
+    enum DiscussionKind: Equatable {
+        case course
+        case selection
+    }
+
+    enum JournalState: Equatable {
+        case submissionIntent
+        case acceptedTurn
+        case toolLifecyclePending
+        case toolExecuting
+        case toolExecuted
+        case resultSubmitting
+        case resultSubmitted
+        case terminalFailure
+        case unreadableEvidence
+    }
+
+    let workspaceID: String
+    let threadID: String?
+    let discussionKind: DiscussionKind
+    let journalState: JournalState
+    let toolName: String?
+}
+
+enum CourseHermesRecoveryAbandonMode: Equatable {
+    case chooseWorkspaceDisposition
+    case finishDraftDeletion
+}
+
+struct CourseHermesRecoveryPresentation: Equatable {
+    let provenance: CourseHermesRecoveryProvenance
+    let abandonMode: CourseHermesRecoveryAbandonMode
+
+    init(
+        provenance: CourseHermesRecoveryProvenance,
+        abandonMode: CourseHermesRecoveryAbandonMode = .chooseWorkspaceDisposition
+    ) {
+        self.provenance = provenance
+        self.abandonMode = abandonMode
+    }
+}
+
+#if DEBUG
+protocol CourseHermesRecoveryTestSuspending: Sendable {
+    func wait() async
+}
+
+enum CourseHermesRecoveryTestCommitPolicy {
+    case onlyWhileOpen
+    case commitBeforeClosingExit
+}
+#endif
+
+#if DEBUG
+/// Frozen, local-only checkpoints used to verify recovery UI without contacting
+/// an agent runtime, reading a journal, or mutating a real course workspace.
+enum CourseRecoveryCheckpointUITestScenario: String, CaseIterable {
+    static let launchArgument =
+        LearnfoldStrictHarnessPolicy.recoveryCheckpointBaseArgument
+
+    case lf34Preparing = "--ui-test-lf34-preparing"
+    case lf34KnownNotAccepted = "--ui-test-lf34-known-not-accepted"
+    case lf34AcceptanceUnknown = "--ui-test-lf34-acceptance-unknown"
+    case lf34AcceptedReplyIncomplete = "--ui-test-lf34-accepted-reply-incomplete"
+    case lf34DestructiveConfirmation = "--ui-test-lf34-destructive-confirmation"
+
+    case lf35MissingDiscussion = "--ui-test-lf35-missing-discussion"
+    case lf35Recovering = "--ui-test-lf35-recovering"
+    case lf35RecoveryFailure = "--ui-test-lf35-recovery-failure"
+    case lf35UnreadableEvidence = "--ui-test-lf35-unreadable-evidence"
+    case lf35Provenance = "--ui-test-lf35-provenance"
+    case lf35Confirmation = "--ui-test-lf35-confirmation"
+    case lf35FinishDeletion = "--ui-test-lf35-finish-deletion"
+
+    case lf36AuthenticationRecovery = "--ui-test-lf36-authentication-recovery"
+    case lf36TransportRecovery = "--ui-test-lf36-transport-recovery"
+
+    case lf53ConflictDialog = "--ui-test-lf53-conflict-dialog"
+    case lf53ContinueExisting = "--ui-test-lf53-continue-existing"
+    case lf53CloseAndStartNew = "--ui-test-lf53-close-and-start-new"
+    case lf53Cancel = "--ui-test-lf53-cancel"
+    case lf53ReplacementFailure = "--ui-test-lf53-replacement-failure"
+
+    static func current() -> Self? {
+        guard case .valid(.courseRecovery(let scenario)) =
+            StrictUITestLaunchConfiguration.current else {
+            return nil
+        }
+        return scenario
+    }
+
+    static func current(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Self? {
+        guard case .valid(.courseRecovery(let scenario)) =
+            StrictUITestLaunchConfiguration.parse(
+                arguments: arguments,
+                environment: environment
+            ) else {
+            return nil
+        }
+        return scenario
+    }
+
+    var issueID: String {
+        switch self {
+        case .lf34Preparing,
+             .lf34KnownNotAccepted,
+             .lf34AcceptanceUnknown,
+             .lf34AcceptedReplyIncomplete,
+             .lf34DestructiveConfirmation:
+            "LF-34"
+        case .lf35MissingDiscussion,
+             .lf35Recovering,
+             .lf35RecoveryFailure,
+             .lf35UnreadableEvidence,
+             .lf35Provenance,
+             .lf35Confirmation,
+             .lf35FinishDeletion:
+            "LF-35"
+        case .lf36AuthenticationRecovery, .lf36TransportRecovery:
+            "LF-36"
+        case .lf53ConflictDialog,
+             .lf53ContinueExisting,
+             .lf53CloseAndStartNew,
+             .lf53Cancel,
+             .lf53ReplacementFailure:
+            "LF-53"
+        }
+    }
+
+    var stateKey: String {
+        String(rawValue.dropFirst("--ui-test-".count))
+    }
+
+    var title: String {
+        switch self {
+        case .lf34Preparing: "Submission preparing"
+        case .lf34KnownNotAccepted: "Submission not accepted"
+        case .lf34AcceptanceUnknown: "Submission acceptance unknown"
+        case .lf34AcceptedReplyIncomplete: "Accepted reply incomplete"
+        case .lf34DestructiveConfirmation: "Recovered draft confirmation"
+        case .lf35MissingDiscussion: "Discussion thread missing"
+        case .lf35Recovering: "Hermes recovery in progress"
+        case .lf35RecoveryFailure: "Hermes recovery failed"
+        case .lf35UnreadableEvidence: "Hermes recovery evidence unreadable"
+        case .lf35Provenance: "Recovery evidence provenance"
+        case .lf35Confirmation: "Hermes abandonment confirmation"
+        case .lf35FinishDeletion: "Finish deleting Hermes draft"
+        case .lf36AuthenticationRecovery: "Authentication recovery"
+        case .lf36TransportRecovery: "Transport recovery"
+        case .lf53ConflictDialog: "Agent conflict"
+        case .lf53ContinueExisting: "Continue existing discussion"
+        case .lf53CloseAndStartNew: "Replace existing discussion"
+        case .lf53Cancel: "Cancel agent conflict"
+        case .lf53ReplacementFailure: "Discussion replacement failure"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .lf34Preparing:
+            "The learner message is staged locally and dispatch has not started."
+        case .lf34KnownNotAccepted:
+            "Learnfold can prove the agent did not accept this message."
+        case .lf34AcceptanceUnknown:
+            "Dispatch started without an authoritative acceptance receipt."
+        case .lf34AcceptedReplyIncomplete:
+            "The agent accepted the message, but its reply did not finish hydrating."
+        case .lf34DestructiveConfirmation:
+            "Discarding removes only the restored local message and source."
+        case .lf35MissingDiscussion:
+            "The saved discussion thread is missing; its annotation and recovery metadata remain preserved."
+        case .lf35Recovering:
+            "Learnfold is reconciling a preserved Hermes turn and has not repeated an ambiguous mutation."
+        case .lf35RecoveryFailure:
+            "Recovery stopped safely after a deterministic injected journal failure."
+        case .lf35UnreadableEvidence:
+            "Recovery evidence could not be decoded by the deterministic local fixture."
+        case .lf35Provenance:
+            "The production recovery card projects a frozen local copy of durable workspace, discussion, and journal state."
+        case .lf35Confirmation:
+            "The learner must explicitly choose whether the draft workspace is retained or archived then deleted."
+        case .lf35FinishDeletion:
+            "Draft deletion did not finish. Recovery evidence is archived and new messages remain blocked. Finish deleting the remaining draft data to continue."
+        case .lf36AuthenticationRecovery:
+            "The course is preserved while the learner restores agent authentication."
+        case .lf36TransportRecovery:
+            "The course is preserved while the learner reconnects the selected transport."
+        case .lf53ConflictDialog:
+            "The exact passage already has a discussion with another selected agent."
+        case .lf53ContinueExisting:
+            "Continuing keeps the original discussion and its bound agent."
+        case .lf53CloseAndStartNew:
+            "Replacing preserves the old annotation evidence and transfers the local draft."
+        case .lf53Cancel:
+            "Cancelling leaves the existing discussion unchanged."
+        case .lf53ReplacementFailure:
+            "A deterministic replacement fault leaves the existing discussion and draft intact."
+        }
+    }
+
+    var markerKind: CourseRecoveryCheckpointMarkerKind {
+        switch self {
+        case .lf34Preparing, .lf35Recovering, .lf35Provenance,
+             .lf53ConflictDialog, .lf53ContinueExisting,
+             .lf53CloseAndStartNew, .lf53Cancel:
+            .fixture
+        default:
+            .injectedFault
+        }
+    }
+
+    var accessibilityIdentifier: String {
+        "courseRecoveryCheckpoint.state.\(stateKey)"
+    }
+
+    var submissionRecoveryState: CourseAgentSubmissionRecoveryState? {
+        switch self {
+        case .lf34Preparing:
+            .preparing
+        case .lf34KnownNotAccepted, .lf34DestructiveConfirmation:
+            .knownNotAccepted
+        case .lf34AcceptanceUnknown:
+            .acceptanceUnknown
+        case .lf34AcceptedReplyIncomplete:
+            .acceptedReplyIncomplete
+        default:
+            nil
+        }
+    }
+
+    var usesConflictFixture: Bool {
+        issueID == "LF-53"
+    }
+
+    var hermesRecoveryProvenance: CourseHermesRecoveryProvenance? {
+        guard self == .lf35Provenance || self == .lf35FinishDeletion else {
+            return nil
+        }
+        return CourseHermesRecoveryProvenance(
+            workspaceID: "lf35-fixture-workspace",
+            threadID: "lf35-fixture-thread",
+            discussionKind: .course,
+            journalState: self == .lf35FinishDeletion
+                ? .terminalFailure
+                : .resultSubmitting,
+            toolName: self == .lf35FinishDeletion
+                ? nil
+                : "learnfold_generate_lesson"
+        )
+    }
+
+    var hermesRecoveryPresentation: CourseHermesRecoveryPresentation? {
+        guard let provenance = hermesRecoveryProvenance else { return nil }
+        return CourseHermesRecoveryPresentation(
+            provenance: provenance,
+            abandonMode: self == .lf35FinishDeletion
+                ? .finishDraftDeletion
+                : .chooseWorkspaceDisposition
+        )
+    }
+}
+
+enum CourseRecoveryCheckpointMarkerKind: String, Equatable {
+    case fixture = "LOCAL UI FIXTURE"
+    case injectedFault = "INJECTED LOCAL FAULT"
+}
+
+enum CourseRecoveryCheckpointAction: String, Equatable {
+    case retrySubmission = "retry-submission"
+    case checkSubmissionStatus = "check-submission-status"
+    case discardDraft = "discard-draft"
+    case abandonUnknownDraft = "abandon-unknown-draft"
+    case dismiss = "dismiss"
+    case retryHermesRecovery = "retry-hermes-recovery"
+    case keepWorkspace = "keep-workspace"
+    case deleteDraftWorkspace = "delete-draft-workspace"
+    case finishDraftDeletion = "finish-draft-deletion"
+    case startReplacementDiscussion = "start-replacement-discussion"
+    case signIn = "sign-in"
+    case reconnectTransport = "reconnect-transport"
+    case continueExistingDiscussion = "continue-existing-discussion"
+    case cancelConflict = "cancel-conflict"
+    case replacementFailed = "replacement-failed"
+}
+
+enum CourseRecoveryCheckpointWorkspaceDisposition: String, Equatable {
+    case preserved = "Workspace preserved"
+    case recoveryAbandoned = "Workspace preserved; recovery abandoned"
+    case archivedThenDeleted = "Recovery archived; draft workspace deleted"
+    case cleanupRequired = "Draft deletion incomplete; cleanup required"
+}
+
+enum CourseRecoveryCheckpointDiscussionDisposition: String, Equatable {
+    case existing = "Existing discussion preserved"
+    case continuedExisting = "Existing discussion opened"
+    case replacementStarted = "New discussion opened; prior evidence preserved"
+    case replacementFailed = "Replacement failed; existing discussion preserved"
+}
+
+struct CourseRecoveryCheckpointFixtureState: Equatable {
+    let scenario: CourseRecoveryCheckpointUITestScenario
+    var lastAction: CourseRecoveryCheckpointAction?
+    var draftText: String
+    var sourceCount: Int
+    var workspaceDisposition: CourseRecoveryCheckpointWorkspaceDisposition
+    var discussionDisposition: CourseRecoveryCheckpointDiscussionDisposition
+
+    init(scenario: CourseRecoveryCheckpointUITestScenario) {
+        self.scenario = scenario
+        lastAction = nil
+        if scenario == .lf34AcceptedReplyIncomplete {
+            draftText = ""
+            sourceCount = 0
+        } else if scenario.issueID == "LF-34" {
+            draftText = "Please keep the examples runnable on my Mac."
+            sourceCount = 1
+        } else {
+            draftText = "Explain the selected passage with one concrete example."
+            sourceCount = 0
+        }
+        workspaceDisposition = scenario == .lf35FinishDeletion
+            ? .cleanupRequired
+            : .preserved
+        discussionDisposition = .existing
+    }
+
+    var actionResultText: String {
+        guard let lastAction else { return "No local fixture action performed." }
+        return switch lastAction {
+        case .retrySubmission:
+            "Retry requested from the preserved local draft."
+        case .checkSubmissionStatus:
+            "Status check requested; no backend was contacted by this fixture."
+        case .discardDraft:
+            "Restored local draft discarded; course workspace preserved."
+        case .abandonUnknownDraft:
+            "Unconfirmed local draft abandoned; course workspace preserved."
+        case .dismiss:
+            "Recovery prompt dismissed; preserved state is unchanged."
+        case .retryHermesRecovery:
+            "Hermes recovery retry requested from preserved evidence."
+        case .keepWorkspace:
+            "Hermes recovery abandoned; course workspace retained."
+        case .deleteDraftWorkspace:
+            "Recovery evidence archived before the draft workspace was deleted."
+        case .finishDraftDeletion:
+            "Remaining draft data deleted; previously archived recovery evidence retained."
+        case .startReplacementDiscussion:
+            "Replacement discussion opened; prior recovery evidence preserved."
+        case .signIn:
+            "Authentication recovery requested; course workspace preserved."
+        case .reconnectTransport:
+            "Transport reconnect requested; course workspace preserved."
+        case .continueExistingDiscussion:
+            "Existing discussion opened with its originally bound agent."
+        case .cancelConflict:
+            "Agent conflict cancelled; existing discussion preserved."
+        case .replacementFailed:
+            "Injected replacement failure; existing discussion and local draft preserved."
+        }
+    }
+
+    mutating func apply(_ action: CourseRecoveryCheckpointAction) {
+        lastAction = action
+        switch action {
+        case .discardDraft, .abandonUnknownDraft:
+            draftText = ""
+            sourceCount = 0
+        case .keepWorkspace:
+            workspaceDisposition = .recoveryAbandoned
+        case .deleteDraftWorkspace, .finishDraftDeletion:
+            workspaceDisposition = .archivedThenDeleted
+        case .continueExistingDiscussion:
+            discussionDisposition = .continuedExisting
+        case .startReplacementDiscussion:
+            discussionDisposition = .replacementStarted
+        case .replacementFailed:
+            discussionDisposition = .replacementFailed
+        case .retrySubmission,
+             .checkSubmissionStatus,
+             .dismiss,
+             .retryHermesRecovery,
+             .signIn,
+             .reconnectTransport,
+             .cancelConflict:
+            break
+        }
+    }
+}
+#endif
 
 struct CourseChatRunRegistry {
     private struct Entry {
@@ -457,6 +1131,13 @@ struct CourseBackgroundGenerationRegistry {
     }
 }
 
+struct CourseDirectGenerationRequest: Equatable {
+    let target: CourseLearningNode
+    let controlTitle: String
+    let accessibilityLabel: String
+    let accessibilityHint: String
+}
+
 struct CourseTextReference: Identifiable, Equatable {
     static let maximumLength = 12_000
 
@@ -506,6 +1187,19 @@ struct CourseAgentExecutionTarget: Codable, Equatable, Sendable {
     let runtimeID: String
     let serverID: String?
     let modelID: String?
+    let reasoningEffortID: String?
+
+    init(
+        runtimeID: String,
+        serverID: String?,
+        modelID: String?,
+        reasoningEffortID: String? = nil
+    ) {
+        self.runtimeID = runtimeID
+        self.serverID = serverID
+        self.modelID = modelID
+        self.reasoningEffortID = reasoningEffortID
+    }
 
     var displayName: String { runtimeID.displayLabel }
 }
@@ -580,9 +1274,11 @@ struct CourseSelectionDiscussion: Identifiable, Codable, Equatable, Sendable {
     let createdAt: Date
     var agentRuntimeKind: String?
     var agentModelID: String?
+    var agentReasoningEffortID: String?
     var serverID: String?
     var threadID: String?
     var appleSessionID: UUID?
+    var hostedSessionID: UUID?
     var hasSubmittedQuestion: Bool
     var status: Status
     var resolvedAt: Date?
@@ -609,9 +1305,11 @@ struct CourseSelectionDiscussion: Identifiable, Codable, Equatable, Sendable {
         self.createdAt = createdAt
         agentRuntimeKind = target?.runtimeID
         agentModelID = target?.modelID
+        agentReasoningEffortID = target?.reasoningEffortID
         serverID = target?.serverID
         threadID = nil
         appleSessionID = nil
+        hostedSessionID = nil
         hasSubmittedQuestion = false
         status = .unresolved
         resolvedAt = nil
@@ -651,7 +1349,8 @@ struct CourseSelectionDiscussion: Identifiable, Codable, Equatable, Sendable {
         return CourseAgentExecutionTarget(
             runtimeID: agentRuntimeKind,
             serverID: serverID,
-            modelID: agentModelID
+            modelID: agentModelID,
+            reasoningEffortID: agentReasoningEffortID
         )
     }
 }
@@ -676,19 +1375,48 @@ struct CourseLearningNode: Codable, Equatable, Identifiable, Sendable {
         case partiallyGenerated = "partially_generated"
     }
 
+    enum Role: String, Codable, Sendable {
+        case chapter
+        case subchapter
+        case lesson
+        case module
+        case explainer
+
+        var isFolder: Bool {
+            self == .chapter || self == .subchapter
+        }
+
+        var displayName: String {
+            switch self {
+            case .chapter: "Chapter"
+            case .subchapter: "Subchapter"
+            case .lesson: "Lesson"
+            case .module: "Module"
+            case .explainer: "Explainer"
+            }
+        }
+    }
+
     var id: String
     var title: String
     var kind: Kind
     var status: GenerationStatus
+    var role: Role?
     var relativePath: String?
     var pageID: String?
     var children: [CourseLearningNode]
+    /// Preserves whether the corresponding key was present on a decoded wire
+    /// payload. Legacy plans intentionally omit these keys, while a v2 plan
+    /// must state both fields explicitly even for leaf nodes.
+    private(set) var hasExplicitRoleKey: Bool
+    private(set) var hasExplicitChildrenKey: Bool
 
     init(
         id: String,
         title: String,
         kind: Kind,
         status: GenerationStatus,
+        role: Role? = nil,
         relativePath: String? = nil,
         pageID: String? = nil,
         children: [CourseLearningNode] = []
@@ -697,9 +1425,12 @@ struct CourseLearningNode: Codable, Equatable, Identifiable, Sendable {
         self.title = title
         self.kind = kind
         self.status = status
+        self.role = role
         self.relativePath = relativePath
         self.pageID = pageID
         self.children = children
+        hasExplicitRoleKey = role != nil
+        hasExplicitChildrenKey = true
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -707,9 +1438,53 @@ struct CourseLearningNode: Codable, Equatable, Identifiable, Sendable {
         case title
         case kind
         case status
+        case role
         case relativePath = "relative_path"
         case pageID = "page_id"
         case children
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        if container.contains(.children) {
+            children = try container.decode([CourseLearningNode].self, forKey: .children)
+        } else {
+            children = []
+        }
+        role = try container.decodeIfPresent(Role.self, forKey: .role)
+        hasExplicitRoleKey = container.contains(.role)
+        hasExplicitChildrenKey = container.contains(.children)
+        kind = try container.decodeIfPresent(Kind.self, forKey: .kind)
+            ?? ((role?.isFolder == true || !children.isEmpty) ? .folder : .markdown)
+        status = try container.decodeIfPresent(GenerationStatus.self, forKey: .status)
+            ?? .pendingGeneration
+        relativePath = try container.decodeIfPresent(String.self, forKey: .relativePath)
+        pageID = try container.decodeIfPresent(String.self, forKey: .pageID)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(status, forKey: .status)
+        try container.encodeIfPresent(role, forKey: .role)
+        try container.encodeIfPresent(relativePath, forKey: .relativePath)
+        try container.encodeIfPresent(pageID, forKey: .pageID)
+        try container.encode(children, forKey: .children)
+    }
+
+    static func == (lhs: CourseLearningNode, rhs: CourseLearningNode) -> Bool {
+        lhs.id == rhs.id
+            && lhs.title == rhs.title
+            && lhs.kind == rhs.kind
+            && lhs.status == rhs.status
+            && lhs.role == rhs.role
+            && lhs.relativePath == rhs.relativePath
+            && lhs.pageID == rhs.pageID
+            && lhs.children == rhs.children
     }
 }
 
@@ -722,6 +1497,7 @@ struct CourseBrief: Codable, Equatable, Sendable {
     var startingPoint = ""
     var focusGap = ""
     var estimatedDuration = ""
+    var structureVersion: Int? = nil
     var learningPath: [CourseLearningNode]? = nil
     var chapters: [CourseChapter] = []
 
@@ -734,8 +1510,241 @@ struct CourseBrief: Codable, Equatable, Sendable {
         case startingPoint = "starting_point"
         case focusGap = "focus_gap"
         case estimatedDuration = "estimated_duration"
+        case structureVersion = "structure_version"
         case learningPath = "learning_path"
         case chapters
+    }
+
+    var plannedLearningPath: [CourseLearningNode] {
+        CoursePlanHierarchyPolicy.plannedLearningPath(for: self)
+    }
+}
+
+struct CoursePlanOutlineEntry: Equatable, Identifiable {
+    var id: String
+    var title: String
+    var role: CourseLearningNode.Role
+    var depth: Int
+    var ordinal: String
+}
+
+enum CoursePlanHierarchyPolicy {
+    static let currentStructureVersion = 2
+    static let maximumDepth = 4
+    static let maximumDirectChildren = 6
+    static let maximumNodeCount = 48
+    static let maximumNodeTitleLength = 160
+    static let maximumPlanTitleLength = 160
+    static let maximumNarrativeFieldLength = 1_200
+    static let maximumEstimatedDurationLength = 80
+    static let maximumChapterObjectiveLength = 1_200
+    static let maximumDeliverableLength = 500
+    static let reservedContextNodeIDs: Set<String> = [
+        "learner-profile",
+        "course-design",
+        "agent-notes",
+    ]
+
+    static func plannedLearningPath(for brief: CourseBrief) -> [CourseLearningNode] {
+        if let explicit = brief.learningPath, !explicit.isEmpty {
+            return explicit.map { normalize($0, depth: 1) }
+        }
+        return brief.chapters.map { chapter in
+            let plannedLessons = chapter.deliverables.isEmpty
+                ? [chapter.title]
+                : chapter.deliverables
+            return CourseLearningNode(
+                id: chapter.id,
+                title: chapter.title,
+                kind: .folder,
+                status: .pendingGeneration,
+                role: .chapter,
+                children: plannedLessons.enumerated().compactMap { index, item in
+                    let title = item.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !title.isEmpty else { return nil }
+                    return CourseLearningNode(
+                        id: "\(chapter.id)-lesson-\(index + 1)",
+                        title: title,
+                        kind: .markdown,
+                        status: .pendingGeneration,
+                        role: .lesson
+                    )
+                }
+            )
+        }
+    }
+
+    static func firstContentLeaf(in brief: CourseBrief) -> CourseLearningNode? {
+        guard let firstChapter = plannedLearningPath(for: brief).first else { return nil }
+        return firstContentLeaf(in: firstChapter)
+    }
+
+    static func outlineEntries(for brief: CourseBrief) -> [CoursePlanOutlineEntry] {
+        var entries: [CoursePlanOutlineEntry] = []
+        func append(_ nodes: [CourseLearningNode], depth: Int, prefix: [Int]) {
+            for (index, node) in nodes.enumerated() {
+                let path = prefix + [index + 1]
+                entries.append(CoursePlanOutlineEntry(
+                    id: node.id,
+                    title: node.title,
+                    role: node.role ?? (depth == 0 ? .chapter : node.children.isEmpty ? .lesson : .subchapter),
+                    depth: depth,
+                    ordinal: path.map(String.init).joined(separator: ".")
+                ))
+                append(node.children, depth: depth + 1, prefix: path)
+            }
+        }
+        append(plannedLearningPath(for: brief), depth: 0, prefix: [])
+        return entries
+    }
+
+    static func validationIssue(
+        in brief: CourseBrief,
+        requiresTypedHierarchy: Bool
+    ) -> String? {
+        if reservedContextNodeIDs.contains(brief.planID) {
+            return "plan_id must not reuse a reserved course context page ID"
+        }
+        if requiresTypedHierarchy, brief.structureVersion != currentStructureVersion {
+            return "structure_version must be \(currentStructureVersion)"
+        }
+        if let version = brief.structureVersion,
+           version != currentStructureVersion {
+            return "unsupported structure_version \(version)"
+        }
+        let validatesStrictV2 = brief.structureVersion == currentStructureVersion
+        let hierarchy: [CourseLearningNode]
+        if let explicit = brief.learningPath, !explicit.isEmpty {
+            if validatesStrictV2,
+               let wireIssue = strictV2WireIssue(in: explicit) {
+                return wireIssue
+            }
+            hierarchy = explicit.map { normalize($0, depth: 1) }
+        } else {
+            guard !requiresTypedHierarchy && !validatesStrictV2 else {
+                return "learning_path must contain the complete typed course hierarchy"
+            }
+            hierarchy = plannedLearningPath(for: brief)
+        }
+        guard (1...8).contains(hierarchy.count) else {
+            return "learning_path must contain between 1 and 8 chapter roots"
+        }
+        guard hierarchy.count == brief.chapters.count else {
+            return "learning_path must have exactly one root for every chapter"
+        }
+        for (chapter, root) in zip(brief.chapters, hierarchy) {
+            guard root.id == chapter.id, root.title == chapter.title else {
+                return "learning_path chapter roots must match chapters in ID, title, and order"
+            }
+        }
+
+        let idPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$/
+        let reservedIDs = reservedContextNodeIDs.union([brief.planID])
+        var seenIDs: Set<String> = []
+        var nodeCount = 0
+        var issue: String?
+        func validate(_ node: CourseLearningNode, depth: Int) {
+            guard issue == nil else { return }
+            nodeCount += 1
+            guard nodeCount <= maximumNodeCount else {
+                issue = "learning_path may contain at most \(maximumNodeCount) nodes"
+                return
+            }
+            guard depth <= maximumDepth else {
+                issue = "learning_path may be at most \(maximumDepth) levels deep"
+                return
+            }
+            guard node.id.wholeMatch(of: idPattern) != nil,
+                  seenIDs.insert(node.id).inserted,
+                  !reservedIDs.contains(node.id) else {
+                issue = "every learning_path node needs a unique non-reserved stable ID"
+                return
+            }
+            guard node.title.count <= maximumNodeTitleLength else {
+                issue = "every learning_path node needs a readable title of at most \(maximumNodeTitleLength) characters"
+                return
+            }
+            let title = node.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard title.unicodeScalars.contains(where: CharacterSet.letters.contains) else {
+                issue = "every learning_path node needs a readable title of at most \(maximumNodeTitleLength) characters"
+                return
+            }
+            guard let role = node.role else {
+                issue = "every learning_path node needs an explicit role"
+                return
+            }
+            if depth == 1, role != .chapter {
+                issue = "every learning_path root must have role chapter"
+                return
+            }
+            if role.isFolder {
+                guard role == (depth == 1 ? .chapter : .subchapter) else {
+                    issue = "only chapter roots and nested subchapters may contain children"
+                    return
+                }
+                guard (1...maximumDirectChildren).contains(node.children.count) else {
+                    issue = "every chapter or subchapter needs 1 to \(maximumDirectChildren) children"
+                    return
+                }
+            } else if !node.children.isEmpty {
+                issue = "lesson, module, and explainer nodes cannot contain children"
+                return
+            }
+            for child in node.children {
+                validate(child, depth: depth + 1)
+            }
+        }
+        for root in hierarchy {
+            validate(root, depth: 1)
+        }
+        return issue
+    }
+
+    private static func strictV2WireIssue(
+        in nodes: [CourseLearningNode]
+    ) -> String? {
+        for node in nodes {
+            guard node.hasExplicitRoleKey else {
+                return "every structure_version 2 learning_path node must include role"
+            }
+            guard node.hasExplicitChildrenKey else {
+                return "every structure_version 2 learning_path node must include children, including leaves"
+            }
+            if let issue = strictV2WireIssue(in: node.children) {
+                return issue
+            }
+        }
+        return nil
+    }
+
+    private static func normalize(
+        _ node: CourseLearningNode,
+        depth: Int
+    ) -> CourseLearningNode {
+        let children = node.children.map { normalize($0, depth: depth + 1) }
+        let role = node.role ?? (depth == 1 ? .chapter : children.isEmpty ? .lesson : .subchapter)
+        return CourseLearningNode(
+            id: node.id,
+            title: node.title,
+            kind: role.isFolder ? .folder : .markdown,
+            status: .pendingGeneration,
+            role: role,
+            children: children
+        )
+    }
+
+    private static func firstContentLeaf(
+        in node: CourseLearningNode
+    ) -> CourseLearningNode? {
+        if node.role?.isFolder == false, node.children.isEmpty {
+            return node
+        }
+        for child in node.children {
+            if let leaf = firstContentLeaf(in: child) {
+                return leaf
+            }
+        }
+        return nil
     }
 }
 
@@ -751,6 +1760,7 @@ private struct CourseWorkspaceMetadata: Decodable {
     var summary: String?
     var outcome: String?
     var estimatedDuration: String?
+    var structureVersion: Int?
     var learningPath: [CourseLearningNode]?
     var chapters: [CourseWorkspaceChapter]?
 
@@ -761,6 +1771,7 @@ private struct CourseWorkspaceMetadata: Decodable {
         case summary
         case outcome
         case estimatedDuration = "estimated_duration"
+        case structureVersion = "structure_version"
         case learningPath = "learning_path"
         case chapters
     }
@@ -825,14 +1836,25 @@ struct RemoteHermesToolJournalEntry: Codable, Equatable, Identifiable {
 struct RemoteHermesToolJournal {
     private let fileURL: URL
     private let initializationError: String?
+    private let onMutation: @Sendable () -> Void
     private let maximumEntries = 100
 
-    init(fileURL: URL, initializationError: String? = nil) {
+    var storageURL: URL { fileURL }
+
+    init(
+        fileURL: URL,
+        initializationError: String? = nil,
+        onMutation: @escaping @Sendable () -> Void = {}
+    ) {
         self.fileURL = fileURL
         self.initializationError = initializationError
+        self.onMutation = onMutation
     }
 
     func load() throws -> [RemoteHermesToolJournalEntry] {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesToolJournal.load"
+        )
         try ensureAvailable()
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         return try JSONDecoder().decode(
@@ -863,6 +1885,9 @@ struct RemoteHermesToolJournal {
     }
 
     func save(_ entry: RemoteHermesToolJournalEntry) throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesToolJournal.save"
+        )
         try ensureAvailable()
         var entries = try load()
         if let index = entries.firstIndex(where: { $0.id == entry.id }) {
@@ -882,9 +1907,13 @@ struct RemoteHermesToolJournal {
         )
         let data = try JSONEncoder().encode(entries)
         try data.write(to: fileURL, options: .atomic)
+        onMutation()
     }
 
     func abandon(workspaceID: String, threadID: String) throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesToolJournal.abandon"
+        )
         try ensureAvailable()
         var entries = try load()
         var changed = false
@@ -898,9 +1927,42 @@ struct RemoteHermesToolJournal {
         guard changed else { return }
         let data = try JSONEncoder().encode(entries)
         try data.write(to: fileURL, options: .atomic)
+        onMutation()
+    }
+
+    func abandon(
+        workspaceID: String,
+        threadID: String?,
+        selectionDiscussionID: UUID?
+    ) throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesToolJournal.abandonScoped"
+        )
+        try ensureAvailable()
+        var entries = try load()
+        var changed = false
+        for index in entries.indices where entries[index].workspaceID == workspaceID
+            && Self.matches(
+                threadID: entries[index].threadID,
+                selectionDiscussionID: entries[index].selectionDiscussionID,
+                requestedThreadID: threadID,
+                requestedSelectionDiscussionID: selectionDiscussionID
+            )
+            && entries[index].requiresRecovery {
+            entries[index].phase = .abandoned
+            entries[index].updatedAt = Date()
+            changed = true
+        }
+        guard changed else { return }
+        let data = try JSONEncoder().encode(entries)
+        try data.write(to: fileURL, options: .atomic)
+        onMutation()
     }
 
     func archive(to archiveURL: URL) throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesToolJournal.archive"
+        )
         try ensureAvailable()
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         try FileManager.default.createDirectory(
@@ -908,6 +1970,7 @@ struct RemoteHermesToolJournal {
             withIntermediateDirectories: true
         )
         try FileManager.default.copyItem(at: fileURL, to: archiveURL)
+        onMutation()
     }
 
     private func ensureAvailable() throws {
@@ -918,6 +1981,20 @@ struct RemoteHermesToolJournal {
             userInfo: [NSLocalizedDescriptionKey: initializationError]
         )
     }
+
+    private static func matches(
+        threadID: String,
+        selectionDiscussionID: UUID?,
+        requestedThreadID: String?,
+        requestedSelectionDiscussionID: UUID?
+    ) -> Bool {
+        if let requestedSelectionDiscussionID {
+            guard selectionDiscussionID == requestedSelectionDiscussionID else { return false }
+            return requestedThreadID.map { threadID == $0 } ?? true
+        }
+        guard selectionDiscussionID == nil, let requestedThreadID else { return false }
+        return threadID == requestedThreadID
+    }
 }
 
 struct PendingHermesCourseIdentity: Codable, Equatable {
@@ -926,10 +2003,25 @@ struct PendingHermesCourseIdentity: Codable, Equatable {
     var threadID: String
     var runtimeID: String
     var modelID: String?
+    var reasoningEffortID: String? = nil
     var brief: CourseBrief
     var showsBrief: Bool
     var expectedTurnID: String?
     var terminalError: String?
+}
+
+struct PendingHostedCourseIdentity: Codable, Equatable {
+    var workspaceID: String
+    var sessionID: UUID
+    var runtimeID: String
+    var modelID: String
+    var brief: CourseBrief
+    var showsBrief: Bool
+}
+
+private struct PendingHermesRecoveryCleanup: Codable, Equatable {
+    var workspaceID: String
+    var threadID: String?
 }
 
 struct PendingHermesAcceptedTurn: Codable, Equatable {
@@ -954,20 +2046,36 @@ struct PendingHermesAcceptedTurn: Codable, Equatable {
 }
 
 struct PendingHermesLinkedSource: Codable, Equatable {
+    /// Optional for journals written before source identity became durable.
+    var id: UUID? = nil
     var name: String
     var detail: String
+    /// Legacy journals contained links only and therefore omitted this field.
+    var kind: CourseSource.Kind? = nil
+    var runtimePath: String? = nil
 }
 
 struct RemoteHermesSubmissionJournal {
     private let fileURL: URL
     private let initializationError: String?
+    private let onMutation: @Sendable () -> Void
 
-    init(fileURL: URL, initializationError: String? = nil) {
+    var storageURL: URL { fileURL }
+
+    init(
+        fileURL: URL,
+        initializationError: String? = nil,
+        onMutation: @escaping @Sendable () -> Void = {}
+    ) {
         self.fileURL = fileURL
         self.initializationError = initializationError
+        self.onMutation = onMutation
     }
 
     func load() throws -> [PendingHermesAcceptedTurn] {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesSubmissionJournal.load"
+        )
         try ensureAvailable()
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         return try JSONDecoder().decode(
@@ -977,6 +2085,9 @@ struct RemoteHermesSubmissionJournal {
     }
 
     func save(_ record: PendingHermesAcceptedTurn) throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesSubmissionJournal.save"
+        )
         try ensureAvailable()
         var records = try load()
         records.removeAll(where: {
@@ -987,12 +2098,38 @@ struct RemoteHermesSubmissionJournal {
     }
 
     func remove(workspaceID: String, threadID: String? = nil) throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesSubmissionJournal.remove"
+        )
         try ensureAvailable()
         let records = try load().filter { record in
             guard record.workspaceID == workspaceID else { return true }
             guard let threadID else { return false }
             return record.threadID != threadID
         }
+        try write(records)
+    }
+
+    func remove(
+        workspaceID: String,
+        threadID: String?,
+        selectionDiscussionID: UUID?
+    ) throws {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "RemoteHermesSubmissionJournal.removeScoped"
+        )
+        try ensureAvailable()
+        let existing = try load()
+        let records = existing.filter { record in
+            guard record.workspaceID == workspaceID else { return true }
+            if let selectionDiscussionID {
+                guard record.selectionDiscussionID == selectionDiscussionID else { return true }
+                return threadID.map { record.threadID != $0 } ?? false
+            }
+            guard record.selectionDiscussionID == nil, let threadID else { return true }
+            return record.threadID != threadID
+        }
+        guard records != existing else { return }
         try write(records)
     }
 
@@ -1004,6 +2141,7 @@ struct RemoteHermesSubmissionJournal {
         )
         let data = try JSONEncoder().encode(records)
         try data.write(to: fileURL, options: .atomic)
+        onMutation()
     }
 
     private func ensureAvailable() throws {
@@ -1016,9 +2154,311 @@ struct RemoteHermesSubmissionJournal {
     }
 }
 
+enum CourseHermesJournalReadState<Entry> {
+    case missing
+    case readable([Entry])
+    case unreadable
+}
+
+extension RemoteHermesToolJournal {
+    func readState() -> CourseHermesJournalReadState<RemoteHermesToolJournalEntry> {
+        do {
+            let entries = try load()
+            return FileManager.default.fileExists(atPath: storageURL.path)
+                ? .readable(entries)
+                : .missing
+        } catch {
+            return .unreadable
+        }
+    }
+}
+
+extension RemoteHermesSubmissionJournal {
+    func readState() -> CourseHermesJournalReadState<PendingHermesAcceptedTurn> {
+        do {
+            let entries = try load()
+            return FileManager.default.fileExists(atPath: storageURL.path)
+                ? .readable(entries)
+                : .missing
+        } catch {
+            return .unreadable
+        }
+    }
+}
+
+protocol CourseHermesRecoveryFileOperating {
+    func quarantineFile(at sourceURL: URL, archiveRootURL: URL) throws
+    func archiveFile(at sourceURL: URL, archiveRootURL: URL) throws
+    func removeWorkspaceRecursively(rootURL: URL, workspaceID: String) throws
+}
+
+struct LiveCourseHermesRecoveryFileOperations: CourseHermesRecoveryFileOperating {
+    private let fileManager = FileManager.default
+
+    func quarantineFile(at sourceURL: URL, archiveRootURL: URL) throws {
+        guard fileManager.fileExists(atPath: sourceURL.path) else { return }
+        let destinationURL = try makeDestination(
+            sourceURL: sourceURL,
+            archiveRootURL: archiveRootURL,
+            category: "Quarantine"
+        )
+        // Prepare the existing inode before the atomic rename. If either
+        // protection operation fails, the opaque source remains in place;
+        // after a successful rename there is no fallible metadata step that
+        // could strand evidence while making a later retry see a missing file.
+        try protectAndExclude(sourceURL)
+        let moved = sourceURL.withUnsafeFileSystemRepresentation { sourcePath in
+            destinationURL.withUnsafeFileSystemRepresentation { destinationPath in
+                guard let sourcePath, let destinationPath else { return false }
+                return Darwin.rename(sourcePath, destinationPath) == 0
+            }
+        }
+        guard moved else {
+            throw NSError(domain: "LearnfoldHermesRecovery", code: 31)
+        }
+    }
+
+    func archiveFile(at sourceURL: URL, archiveRootURL: URL) throws {
+        guard fileManager.fileExists(atPath: sourceURL.path) else { return }
+        let destinationURL = try makeDestination(
+            sourceURL: sourceURL,
+            archiveRootURL: archiveRootURL,
+            category: "Archive"
+        )
+        do {
+            try fileManager.copyItem(at: sourceURL, to: destinationURL)
+            try protectAndExclude(destinationURL)
+        } catch {
+            try? fileManager.removeItem(at: destinationURL)
+            throw error
+        }
+    }
+
+    func removeWorkspaceRecursively(rootURL: URL, workspaceID: String) throws {
+        try CourseWorkspaceFileSystem(rootURL: rootURL)
+            .removeRecursively(workspaceID)
+    }
+
+    private func makeDestination(
+        sourceURL: URL,
+        archiveRootURL: URL,
+        category: String
+    ) throws -> URL {
+        let directoryURL = archiveRootURL
+            .appendingPathComponent(category, isDirectory: true)
+            .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+        try fileManager.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [
+                .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
+            ]
+        )
+        try protectAndExclude(archiveRootURL)
+        try protectAndExclude(directoryURL)
+        return directoryURL.appendingPathComponent(sourceURL.lastPathComponent)
+    }
+
+    private func protectAndExclude(_ url: URL) throws {
+        try fileManager.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: url.path
+        )
+        var protectedURL = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try protectedURL.setResourceValues(values)
+    }
+}
+
+enum CourseHermesRecoveryPresentationLoader {
+    static func load(
+        workspaceID: String,
+        requestedThreadID: String?,
+        selectionDiscussionID: UUID?,
+        toolJournal: RemoteHermesToolJournal,
+        submissionJournal: RemoteHermesSubmissionJournal
+    ) -> CourseHermesRecoveryPresentation? {
+        let toolEntries: [RemoteHermesToolJournalEntry]
+        let toolJournalUnreadable: Bool
+        do {
+            toolEntries = try toolJournal.load()
+            toolJournalUnreadable = false
+        } catch {
+            toolEntries = []
+            toolJournalUnreadable = true
+        }
+
+        let acceptedTurns: [PendingHermesAcceptedTurn]
+        let submissionJournalUnreadable: Bool
+        do {
+            acceptedTurns = try submissionJournal.load()
+            submissionJournalUnreadable = false
+        } catch {
+            acceptedTurns = []
+            submissionJournalUnreadable = true
+        }
+
+        let matchesDiscussion: (String, UUID?) -> Bool = {
+            recordThreadID,
+            recordDiscussionID in
+            if let selectionDiscussionID {
+                guard recordDiscussionID == selectionDiscussionID else { return false }
+                return requestedThreadID.map { recordThreadID == $0 } ?? true
+            }
+            guard recordDiscussionID == nil else { return false }
+            return requestedThreadID.map { recordThreadID == $0 } ?? true
+        }
+
+        if let entry = toolEntries.first(where: {
+            $0.workspaceID == workspaceID
+                && matchesDiscussion($0.threadID, $0.selectionDiscussionID)
+                && $0.requiresRecovery
+        }), let journalState = journalState(for: entry.phase) {
+            return CourseHermesRecoveryPresentation(
+                provenance: CourseHermesRecoveryProvenance(
+                    workspaceID: entry.workspaceID,
+                    threadID: entry.threadID,
+                    discussionKind: entry.selectionDiscussionID == nil
+                        ? .course
+                        : .selection,
+                    journalState: journalState,
+                    toolName: entry.toolName
+                )
+            )
+        }
+
+        if let pending = acceptedTurns.last(where: {
+            $0.workspaceID == workspaceID
+                && matchesDiscussion($0.threadID, $0.selectionDiscussionID)
+                && ($0.expectedTurnID?.isEmpty == false
+                    || $0.submissionIntentID != nil
+                    || $0.toolLifecycleOwned == true
+                    || $0.terminalError?.isEmpty == false)
+        }), let journalState = journalState(for: pending) {
+            return CourseHermesRecoveryPresentation(
+                provenance: CourseHermesRecoveryProvenance(
+                    workspaceID: pending.workspaceID,
+                    threadID: pending.threadID,
+                    discussionKind: pending.selectionDiscussionID == nil
+                        ? .course
+                        : .selection,
+                    journalState: journalState,
+                    toolName: nil
+                )
+            )
+        }
+
+        guard toolJournalUnreadable || submissionJournalUnreadable else {
+            return nil
+        }
+        return CourseHermesRecoveryPresentation(
+            provenance: CourseHermesRecoveryProvenance(
+                workspaceID: workspaceID,
+                threadID: requestedThreadID,
+                discussionKind: selectionDiscussionID == nil ? .course : .selection,
+                journalState: .unreadableEvidence,
+                toolName: nil
+            )
+        )
+    }
+
+    private static func journalState(
+        for phase: RemoteHermesToolJournalEntry.Phase
+    ) -> CourseHermesRecoveryProvenance.JournalState? {
+        switch phase {
+        case .executing:
+            .toolExecuting
+        case .executed:
+            .toolExecuted
+        case .resultSubmitting:
+            .resultSubmitting
+        case .resultSubmitted:
+            .resultSubmitted
+        case .completed, .abandoned:
+            nil
+        }
+    }
+
+    private static func journalState(
+        for pending: PendingHermesAcceptedTurn
+    ) -> CourseHermesRecoveryProvenance.JournalState? {
+        if pending.terminalError?.isEmpty == false {
+            return .terminalFailure
+        }
+        if pending.toolLifecycleOwned == true {
+            return .toolLifecyclePending
+        }
+        if pending.expectedTurnID?.isEmpty == false {
+            return .acceptedTurn
+        }
+        if pending.submissionIntentID != nil {
+            return .submissionIntent
+        }
+        return nil
+    }
+}
+
+private final class CourseHermesRecoveryJournalRevision: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func current() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance() {
+        lock.lock()
+        value &+= 1
+        lock.unlock()
+    }
+}
+
+struct CourseExperienceStoreLaunchOverrides: Equatable {
+    static let resetOnboardingKey = "SNAPPY_RESET_ONBOARDING"
+    static let skipAgentSetupKey = "SNAPPY_SKIP_AGENT_SETUP"
+    static let explicitUITestingKey =
+        LearnfoldUITestLaunchPolicy.explicitUITestingKey
+
+    let resetsOnboarding: Bool
+    let skipsAgentSetup: Bool
+
+    static func resolve(
+        environment: [String: String],
+        hasXCTestConfiguration: Bool,
+        hasExplicitUITestingAuthority: Bool = false
+    ) -> Self {
+        let isExplicitTestEnvironment = LearnfoldUITestLaunchPolicy
+            .allowsTestOnlyOverrides(
+                environment: environment,
+                hasXCTestConfiguration: hasXCTestConfiguration,
+                hasExplicitUITestingAuthority: hasExplicitUITestingAuthority
+            )
+        return Self(
+            resetsOnboarding: isExplicitTestEnvironment
+                && environment[resetOnboardingKey] == "1",
+            skipsAgentSetup: isExplicitTestEnvironment
+                && environment[skipAgentSetupKey] == "1"
+        )
+    }
+}
+
 @MainActor
 @Observable
 final class CourseExperienceStore {
+    private struct HermesRecoveryPresentationCacheKey: Hashable {
+        let workspaceID: String
+        let threadID: String?
+        let selectionDiscussionID: UUID?
+    }
+
+    private struct HermesRecoveryPresentationCacheEntry {
+        let revision: UInt64
+        let presentation: CourseHermesRecoveryPresentation?
+    }
+
     private struct PersistedDraftSource: Codable {
         let id: UUID
         let name: String
@@ -1030,31 +2470,76 @@ final class CourseExperienceStore {
     private struct PersistedDraftSources: Codable {
         let workspaceID: String
         let sources: [PersistedDraftSource]
+        let draftText: String?
         let importInProgress: Bool?
         let importBaselineFilenames: [String]?
         let runtimeID: String?
         let serverID: String?
         let threadID: String?
         let modelID: String?
+        let reasoningEffortID: String?
         let appleSessionID: UUID?
         let brief: CourseBrief?
         let showsBrief: Bool?
         let pendingOutboundText: String?
         let pendingOutboundSources: [PersistedDraftSource]?
         let pendingSelectionDiscussionID: UUID?
+        let submissionRecoveryState: CourseAgentSubmissionRecoveryState?
+        let pendingAttemptID: UUID?
+        let pendingPromptText: String?
+        let pendingRuntimeID: String?
+        let pendingServerID: String?
+        let pendingModelID: String?
+        let pendingReasoningEffortID: String?
+        let pendingOptimisticMessageID: UUID?
     }
 
     private struct PersistedPendingSelectionSubmission: Codable {
         let discussionID: UUID
         let workspaceID: String
-        let text: String
+        let text: String?
+        let sources: [PersistedDraftSource]?
+        let recoveryState: CourseAgentSubmissionRecoveryState?
+        let attemptID: UUID?
+        let promptText: String?
+        let runtimeID: String?
+        let serverID: String?
+        let modelID: String?
+        let reasoningEffortID: String?
+        let optimisticMessageID: UUID?
+        let draftText: String?
+        let draftSources: [PersistedDraftSource]?
+    }
+
+    private struct PersistedWorkspaceComposerDraft: Codable {
+        let workspaceID: String
+        let text: String?
         let sources: [PersistedDraftSource]
     }
 
-    private struct PendingSelectionSubmission {
-        let workspaceID: String
-        var text: String
+    private struct MainComposerDraft {
+        var text: String?
         var sources: [CourseSource]
+    }
+
+    private struct CourseAgentDispatchAttempt {
+        let id: UUID
+        let workspaceID: String
+        let promptText: String
+        let learnerText: String?
+        let sources: [CourseSource]
+        let target: CourseAgentExecutionTarget
+        let optimisticMessageID: UUID?
+    }
+
+    private struct HermesRecoveryScope: Hashable {
+        let workspaceID: String
+        let selectionDiscussionID: UUID?
+    }
+
+    private struct HermesRecoveryLease: Equatable {
+        let scope: HermesRecoveryScope
+        let generation: UInt64
     }
 
     private struct PreparedCourseSourceFile: Sendable {
@@ -1081,7 +2566,12 @@ final class CourseExperienceStore {
     private static let selectionDiscussionsKey = "snappy.course.selectionDiscussions"
     static let pendingHermesCourseKey = "snappy.course.pendingHermesIdentity"
     static let pendingHermesTurnsKey = "snappy.course.pendingHermesTurns"
+    static let pendingHostedCourseKey = "snappy.course.pendingHostedIdentity"
+    private static let pendingHermesRecoveryCleanupKey =
+        "snappy.course.pendingHermesRecoveryCleanup"
     private static let draftSourcesKey = "learnfold.course.activeDraftSources"
+    private static let workspaceComposerDraftsKey =
+        "learnfold.course.workspaceComposerDrafts.v1"
     private static let pendingSelectionSubmissionsKey =
         "learnfold.course.pendingSelectionSubmissions"
 
@@ -1182,7 +2672,15 @@ final class CourseExperienceStore {
     var selectedReasoningEffortID: String?
     var agentOptions: [CourseAgentOption] = []
     var appleAvailability: AppleCourseAgentAvailability
-    var courseModels: [ModelInfo] = []
+    var hostedAvailability: HostedCourseAgentAvailability
+    private var courseModelsByServerID: [String: [ModelInfo]] = [:]
+    private var presentedAgentCatalogServerID: String?
+    private var agentCatalogPresentationRequest: (id: UUID, serverID: String)?
+
+    var courseModels: [ModelInfo] {
+        guard let serverID = presentedAgentCatalogServerID else { return [] }
+        return courseModelsByServerID[serverID] ?? []
+    }
     var isLoadingAgentCatalog = false
     var hasCompletedIntro: Bool
     var setupComplete: Bool
@@ -1202,6 +2700,7 @@ final class CourseExperienceStore {
     private var chatRuns = CourseChatRunRegistry()
     private var backgroundGenerations = CourseBackgroundGenerationRegistry()
     var courseChatDraft: String?
+    private(set) var mainSubmissionRecoveryState: CourseAgentSubmissionRecoveryState?
     var lastAcceptedSelectionContextID: UUID?
     var backgroundGeneratingCourseID: String?
     var backgroundGeneratingNodeID: String?
@@ -1214,6 +2713,7 @@ final class CourseExperienceStore {
     private(set) var selectionDiscussionReadinessErrors: [UUID: String] = [:]
     var selectionLocalMessages: [UUID: [CourseChatMessage]] = [:]
     var selectionDiscussionDrafts: [UUID: String] = [:]
+    private(set) var selectionSubmissionRecoveryStates: [UUID: CourseAgentSubmissionRecoveryState] = [:]
     var selectionDiscussionSources: [UUID: [CourseSource]] = [:]
     private(set) var missingSelectionDiscussionThreadIDs: Set<UUID> = []
     private var selectionConnectionStates: [UUID: AgentConnectionState] = [:]
@@ -1221,28 +2721,65 @@ final class CourseExperienceStore {
     private var preparingSelectionSourceIDs: Set<UUID> = []
     private var cleaningSelectionDiscussionIDs: Set<UUID> = []
     private var currentCourseWorkspaceID = UUID().uuidString.lowercased()
+    // A persisted identity is diagnostic evidence, not authority to select a
+    // workspace. Keep an invalid value separate from the active workspace so
+    // recovery can remain actionable without ever resolving it against either
+    // the course or control roots.
+    private var invalidPersistedHermesRecoveryProvenance: CourseHermesRecoveryProvenance?
     private var mainAgentReadinessRevision: UInt64 = 0
     private var currentWorkspaceWasBuilt = false
     private(set) var isPreparingSource = false
-    private var pendingOutboundText: String?
-    private var pendingOutboundSources: [CourseSource] = []
-    private var pendingSelectionDiscussionID: UUID?
-    private var pendingSelectionSubmissions: [UUID: PendingSelectionSubmission] = [:]
+    private var pendingMainSubmission: CourseAgentDispatchAttempt?
+    private var pendingSelectionSubmissions: [UUID: CourseAgentDispatchAttempt] = [:]
+    private var hermesRecoveryGenerations: [HermesRecoveryScope: UInt64] = [:]
+    private var closingHermesRecoveryScopes: Set<HermesRecoveryScope> = []
+    private var activeHermesAbandonmentScopes: Set<HermesRecoveryScope> = []
+    private var activeHermesWorkspaceDeletions: Set<String> = []
+    private var activeHermesRecoveryLeaseCounts: [HermesRecoveryScope: Int] = [:]
+    private var hermesRecoveryDrainWaiters: [
+        HermesRecoveryScope: [CheckedContinuation<Void, Never>]
+    ] = [:]
+#if DEBUG
+    private var hermesRecoveryClosingTestWaiters: [
+        HermesRecoveryScope: [CheckedContinuation<Void, Never>]
+    ] = [:]
+#endif
+    private var mainComposerDrafts: [String: MainComposerDraft] = [:]
     private var agentForwardTasks: [CourseChatScope: Task<Void, Never>] = [:]
     private var generationTask: Task<Void, Never>?
+    var hasActiveCourseGenerationPoll: Bool {
+        generationTask != nil
+    }
     private var backgroundNodeGenerationTask: Task<Void, Never>?
     private var processedCoursePlanToolCallIDs: Set<String> = []
     private let defaults: UserDefaults
     private let coursesRootURL: URL
     private let courseControlRootURL: URL
+    private let hermesRecoveryArchiveRootURL: URL
+    private let hermesRecoveryFileOperations: any CourseHermesRecoveryFileOperating
+    @ObservationIgnored
+    private let hermesRecoveryJournalRevision = CourseHermesRecoveryJournalRevision()
+    @ObservationIgnored
+    private var hermesRecoveryPresentationCache: [
+        HermesRecoveryPresentationCacheKey: HermesRecoveryPresentationCacheEntry
+    ] = [:]
     private var currentAgentRuntimeID: String?
     private var currentAgentServerID: String?
     private var currentAgentModelID: String?
+    private var currentAgentReasoningEffortID: String?
     private var currentAppleSessionID: UUID?
+    private var currentHostedSessionID: UUID?
     private var didInstallDocumentToolRouter = false
     private let appleRuntime: any AppleCourseAgentRuntime
+    private let hostedRuntime: any HostedCourseAgentRuntime
     private let agentReadinessProbe: any CourseAgentReadinessProbing
     private let sourceIngestion: CourseSourceIngestionCoordinator
+    private let remoteHermesToolExecutor: (@MainActor @Sendable (
+        RemoteCourseToolCall,
+        ThreadKey,
+        String,
+        Bool
+    ) async -> AppPlatformDynamicToolResult)?
     @ObservationIgnored
     nonisolated(unsafe) private var courseBashWorkspaceChangeTask: Task<Void, Never>?
 
@@ -1261,19 +2798,24 @@ final class CourseExperienceStore {
     var isCourseNodeGenerationDisabled: Bool {
         Self.shouldDisableCourseNodeGeneration(
             backgroundGenerationActive: backgroundGeneratingNodeID != nil,
-            mainAgentPhase: agentRunPhase(for: nil)
+            mainAgentPhase: agentRunPhase(for: nil),
+            submissionRecoveryState: mainSubmissionRecoveryState
         )
     }
 
     static func shouldDisableCourseNodeGeneration(
         backgroundGenerationActive: Bool,
-        mainAgentPhase: CourseChatRunPhase
+        mainAgentPhase: CourseChatRunPhase,
+        submissionRecoveryState: CourseAgentSubmissionRecoveryState? = nil
     ) -> Bool {
-        backgroundGenerationActive || mainAgentPhase.isWorking
+        backgroundGenerationActive
+            || mainAgentPhase.isWorking
+            || submissionRecoveryState == .acceptanceUnknown
+            || submissionRecoveryState == .acceptedReplyIncomplete
     }
 
     var activeAgentID: String {
-        currentAgentRuntimeID ?? selectedAgentID ?? "codex"
+        currentAgentRuntimeID ?? selectedAgentID ?? preferredSetupAgentID
     }
 
     func effectiveMainCourseServerID() -> String? {
@@ -1457,39 +2999,75 @@ final class CourseExperienceStore {
         defaults: UserDefaults = .standard,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         appleRuntime: (any AppleCourseAgentRuntime)? = nil,
+        hostedRuntime: (any HostedCourseAgentRuntime)? = nil,
         coursesRootURL: URL? = nil,
         courseControlRootURL: URL? = nil,
+        hermesRecoveryArchiveRootURL: URL? = nil,
+        hermesRecoveryFileOperations: any CourseHermesRecoveryFileOperating =
+            LiveCourseHermesRecoveryFileOperations(),
         sourceIngestion: CourseSourceIngestionCoordinator = .shared,
-        agentReadinessProbe: (any CourseAgentReadinessProbing)? = nil
+        agentReadinessProbe: (any CourseAgentReadinessProbing)? = nil,
+        remoteHermesToolExecutor: (@MainActor @Sendable (
+            RemoteCourseToolCall,
+            ThreadKey,
+            String,
+            Bool
+        ) async -> AppPlatformDynamicToolResult)? = nil
     ) {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "CourseExperienceStore.init"
+        )
+        let processEnvironment = ProcessInfo.processInfo.environment
+        let launchOverrides = CourseExperienceStoreLaunchOverrides.resolve(
+            environment: environment,
+            hasXCTestConfiguration:
+                processEnvironment[LearnfoldUITestLaunchPolicy.xctestConfigurationKey] != nil,
+            hasExplicitUITestingAuthority:
+                processEnvironment[LearnfoldUITestLaunchPolicy.explicitUITestingKey] == "1"
+        )
         self.defaults = defaults
         self.sourceIngestion = sourceIngestion
         self.agentReadinessProbe = agentReadinessProbe ?? LiveCourseAgentReadinessProbe()
+        self.remoteHermesToolExecutor = remoteHermesToolExecutor
         let resolvedCoursesRootURL = coursesRootURL
             ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("Apps", isDirectory: true)
                 .appendingPathComponent("Courses", isDirectory: true)
         self.coursesRootURL = resolvedCoursesRootURL
+        let resolvedCourseControlRootURL: URL
         if let courseControlRootURL {
-            self.courseControlRootURL = courseControlRootURL
+            resolvedCourseControlRootURL = courseControlRootURL
         } else if coursesRootURL != nil {
-            self.courseControlRootURL = resolvedCoursesRootURL
+            resolvedCourseControlRootURL = resolvedCoursesRootURL
                 .appendingPathComponent(".learnfold-control", isDirectory: true)
         } else {
-            self.courseControlRootURL = FileManager.default.urls(
+            resolvedCourseControlRootURL = FileManager.default.urls(
                 for: .applicationSupportDirectory,
                 in: .userDomainMask
             )[0]
                 .appendingPathComponent("Learnfold", isDirectory: true)
                 .appendingPathComponent("CourseControl", isDirectory: true)
         }
+        self.courseControlRootURL = resolvedCourseControlRootURL
+        self.hermesRecoveryArchiveRootURL = hermesRecoveryArchiveRootURL
+            ?? resolvedCourseControlRootURL.deletingLastPathComponent()
+                .appendingPathComponent("HermesRecovery", isDirectory: true)
+        self.hermesRecoveryFileOperations = hermesRecoveryFileOperations
         Self.migrateLegacyApprovalArtifacts(in: resolvedCoursesRootURL)
         let resolvedAppleRuntime = appleRuntime ?? SystemAppleCourseAgentRuntime(environment: environment)
         self.appleRuntime = resolvedAppleRuntime
         let resolvedAvailability = resolvedAppleRuntime.availability()
         appleAvailability = resolvedAvailability
-        agentOptions = Self.initialAgentOptions(appleAvailability: resolvedAvailability)
-        if environment["SNAPPY_RESET_ONBOARDING"] == "1" {
+        let resolvedHostedRuntime = hostedRuntime
+            ?? SystemHostedCourseAgentRuntime(environment: environment)
+        self.hostedRuntime = resolvedHostedRuntime
+        let resolvedHostedAvailability = resolvedHostedRuntime.availability()
+        hostedAvailability = resolvedHostedAvailability
+        agentOptions = Self.initialAgentOptions(
+            hostedAvailability: resolvedHostedAvailability,
+            appleAvailability: resolvedAvailability
+        )
+        if launchOverrides.resetsOnboarding {
             defaults.removeObject(forKey: Self.introKey)
             defaults.removeObject(forKey: Self.setupKey)
             defaults.removeObject(forKey: Self.agentKey)
@@ -1500,7 +3078,9 @@ final class CourseExperienceStore {
             defaults.removeObject(forKey: Self.selectionDiscussionsKey)
             defaults.removeObject(forKey: Self.pendingHermesCourseKey)
             defaults.removeObject(forKey: Self.pendingHermesTurnsKey)
+            defaults.removeObject(forKey: Self.pendingHostedCourseKey)
             defaults.removeObject(forKey: Self.draftSourcesKey)
+            defaults.removeObject(forKey: Self.workspaceComposerDraftsKey)
             defaults.removeObject(forKey: Self.pendingSelectionSubmissionsKey)
             for storageKey in [
                 Self.coursesKey,
@@ -1526,7 +3106,7 @@ final class CourseExperienceStore {
             // flow. Do not interrupt them with onboarding after an update.
             hasCompletedIntro = persistedSetupComplete
         }
-        if environment["SNAPPY_SKIP_AGENT_SETUP"] == "1" {
+        if launchOverrides.skipsAgentSetup {
             selectedAgentID = "codex"
             setupComplete = true
             hasCompletedIntro = true
@@ -1572,6 +3152,7 @@ final class CourseExperienceStore {
             selectionDiscussions = []
         }
         messages = []
+        restoreWorkspaceComposerDrafts()
         restorePendingSelectionSubmissions()
 
         let pendingHermesTurns: [PendingHermesAcceptedTurn]
@@ -1588,16 +3169,29 @@ final class CourseExperienceStore {
             )
         }
 
-        if let data = defaults.data(forKey: Self.pendingHermesCourseKey),
-           let pending = try? JSONDecoder().decode(PendingHermesCourseIdentity.self, from: data),
+        let persistedHermesIdentity = defaults.data(forKey: Self.pendingHermesCourseKey)
+            .flatMap { try? JSONDecoder().decode(PendingHermesCourseIdentity.self, from: $0) }
+        if let pending = persistedHermesIdentity,
            pending.runtimeID == "hermes",
-           !pending.workspaceID.isEmpty,
-           !pending.serverID.isEmpty,
-           Self.isValidAppServerThreadID(pending.threadID) {
+           !CourseBashTool.isValidWorkspaceID(pending.workspaceID) {
+            invalidPersistedHermesRecoveryProvenance = CourseHermesRecoveryProvenance(
+                workspaceID: pending.workspaceID,
+                threadID: pending.threadID,
+                discussionKind: .course,
+                journalState: .unreadableEvidence,
+                toolName: nil
+            )
+            agentError = "Hermes recovery evidence could not be read safely because its preserved workspace identity is invalid. Your draft and recovery evidence remain protected."
+        } else if let pending = persistedHermesIdentity,
+                  pending.runtimeID == "hermes",
+                  CourseBashTool.isValidWorkspaceID(pending.workspaceID),
+                  !pending.serverID.isEmpty,
+                  Self.isValidAppServerThreadID(pending.threadID) {
             currentCourseWorkspaceID = pending.workspaceID
             currentAgentServerID = pending.serverID
             currentAgentRuntimeID = pending.runtimeID
             currentAgentModelID = pending.modelID
+            currentAgentReasoningEffortID = pending.reasoningEffortID
             agentThreadKey = ThreadKey(serverId: pending.serverID, threadId: pending.threadID)
             brief = pending.brief
             showsBrief = pending.showsBrief
@@ -1625,6 +3219,7 @@ final class CourseExperienceStore {
             currentAgentServerID = pendingTurn.serverID
             currentAgentRuntimeID = course.agentRuntimeKind ?? "hermes"
             currentAgentModelID = course.agentModelID
+            currentAgentReasoningEffortID = course.agentReasoningEffortID
             if pendingTurn.selectionDiscussionID == nil {
                 agentThreadKey = ThreadKey(
                     serverId: pendingTurn.serverID,
@@ -1655,23 +3250,42 @@ final class CourseExperienceStore {
             currentAgentServerID = pending.serverID
             currentAgentRuntimeID = pending.runtimeID
             currentAgentModelID = pending.modelID
+            currentAgentReasoningEffortID = pending.reasoningEffortID
             agentThreadKey = ThreadKey(serverId: pending.serverID, threadId: pending.threadID)
             brief = pending.brief
             showsBrief = pending.showsBrief
             navigationPath = [.newCourse]
             agentError = pendingTurn.terminalError ?? agentError
+        } else if let data = defaults.data(forKey: Self.pendingHostedCourseKey),
+                  let pending = try? JSONDecoder().decode(
+                      PendingHostedCourseIdentity.self,
+                      from: data
+                  ),
+                  pending.runtimeID == CourseAgentProvider.hosted,
+                  CourseBashTool.isValidWorkspaceID(pending.workspaceID) {
+            currentCourseWorkspaceID = pending.workspaceID
+            currentAgentRuntimeID = pending.runtimeID
+            currentAgentModelID = pending.modelID
+            currentHostedSessionID = pending.sessionID
+            brief = pending.brief
+            showsBrief = pending.showsBrief
+            navigationPath = [.newCourse]
         }
 
         if navigationPath.isEmpty,
            generatedCourseID == nil,
            agentThreadKey == nil {
             restorePersistedDraftSourcesIfAvailable()
+        } else {
+            restorePersistedDraftSourcesIfAvailable(
+                expectedWorkspaceID: currentCourseWorkspaceID
+            )
         }
 
-        if environment["SNAPPY_SKIP_AGENT_SETUP"] != "1",
+        if !launchOverrides.skipsAgentSetup,
            setupComplete,
            let selectedAgentID,
-           CourseAgentProvider.isApple(selectedAgentID),
+           CourseAgentProvider.usesLocalMessages(selectedAgentID),
            agentOptions.first(where: { $0.id == selectedAgentID })?.available != true {
             // Capability can change after an OS update, an Apple Intelligence
             // settings change, or restoring this app onto an older iPhone.
@@ -1712,9 +3326,16 @@ final class CourseExperienceStore {
     }
 
     private static func initialAgentOptions(
+        hostedAvailability: HostedCourseAgentAvailability,
         appleAvailability: AppleCourseAgentAvailability
     ) -> [CourseAgentOption] {
         [
+            CourseAgentOption(
+                id: CourseAgentProvider.hosted,
+                title: "Hosted",
+                available: hostedAvailability.available,
+                availabilityDescription: hostedAvailability.reason
+            ),
             CourseAgentOption(
                 id: CourseAgentProvider.applePrivateCloud,
                 title: "Apple Private Cloud Compute",
@@ -1740,13 +3361,24 @@ final class CourseExperienceStore {
         guard !isLoadingAgentCatalog else { return }
         isLoadingAgentCatalog = true
         defer { isLoadingAgentCatalog = false }
+        refreshHostedAvailability()
         refreshAppleAvailability()
         LitterPlatform.bootstrapLocalRuntimeIfNeeded()
 
         do {
-            let serverID = try await connectedCourseServerID(appModel: appModel)
+            let serverID = try await connectedCourseServerID(
+                appModel: appModel,
+                preferredServerID: selectedAgentServerID
+            )
+            let presentationRequestID = requestAgentCatalogPresentation(
+                for: serverID
+            )
             await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
-            refreshAgentCatalog(appModel: appModel, serverID: serverID)
+            refreshAgentCatalog(
+                appModel: appModel,
+                serverID: serverID,
+                presentationRequestID: presentationRequestID
+            )
         } catch {
             agentError = error.localizedDescription
         }
@@ -1757,19 +3389,28 @@ final class CourseExperienceStore {
         appModel: AppModel
     ) async {
         while isLoadingAgentCatalog {
+            guard !Task.isCancelled else { return }
             try? await Task.sleep(for: .milliseconds(50))
         }
+        isLoadingAgentCatalog = true
+        defer { isLoadingAgentCatalog = false }
         guard appModel.snapshot?.serverSnapshot(for: serverID)?.isConnected == true else {
             agentError = "The selected server is no longer connected."
             return
         }
         selectedAgentServerID = serverID
         defaults.set(serverID, forKey: Self.agentServerKey)
+        let presentationRequestID = requestAgentCatalogPresentation(for: serverID)
         await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
-        refreshAgentCatalog(appModel: appModel, serverID: serverID)
-        if agentOptions.first(where: { $0.id == "hermes" })?.available == true {
+        let serverOptions = refreshAgentCatalog(
+            appModel: appModel,
+            serverID: serverID,
+            presentationRequestID: presentationRequestID
+        )
+        guard selectedAgentServerID == serverID else { return }
+        if serverOptions.first(where: { $0.id == "hermes" })?.available == true {
             selectedAgentID = "hermes"
-            selectedModelID = defaultModelID(for: "hermes")
+            selectedModelID = defaultModelID(for: "hermes", serverID: serverID)
             selectedReasoningEffortID = nil
         }
         setupComplete = false
@@ -1803,6 +3444,48 @@ final class CourseExperienceStore {
         agentError = nil
         agentNeedsAuthentication = false
 
+        #if DEBUG
+        switch LF06LiveAcceptanceControl.current() {
+        case .connecting:
+            do {
+                try await Task.sleep(
+                    nanoseconds: LF06LiveAcceptanceControl
+                        .connectingDelayNanoseconds
+                )
+            } catch {
+                connectionState = .idle
+                return false
+            }
+        case .failed:
+            let message = LF06LiveAcceptanceControl.forcedFailureDescription
+            connectionState = .failed(message)
+            agentError = message
+            if !hadCompletedSetup { setupComplete = false }
+            return false
+        case nil:
+            break
+        }
+        #endif
+
+        if agentID == CourseAgentProvider.hosted {
+            refreshHostedAvailability()
+            guard hostedAvailability.available else {
+                connectionState = .failed(hostedAvailability.reason)
+                agentError = hostedAvailability.reason
+                if !hadCompletedSetup { setupComplete = false }
+                return false
+            }
+            selectedAgentID = agentID
+            selectedAgentServerID = nil
+            selectedModelID = SystemHostedCourseAgentRuntime.modelID
+            selectedReasoningEffortID = nil
+            setupComplete = true
+            connectionState = .connected
+            agentNeedsAuthentication = false
+            persistAgentSelection()
+            return true
+        }
+
         if CourseAgentProvider.isApple(agentID) {
             refreshAppleAvailability()
             guard agentOptions.first(where: { $0.id == agentID })?.available == true else {
@@ -1828,7 +3511,14 @@ final class CourseExperienceStore {
         do {
             let serverID: String
             if agentID == .codex {
-                switch await agentReadinessProbe.validateCodex(appModel: appModel) {
+                let readiness = await agentReadinessProbe.validateCodex(appModel: appModel)
+                do {
+                    try Task.checkCancellation()
+                } catch {
+                    connectionState = .idle
+                    return false
+                }
+                switch readiness {
                 case .ready(let validatedServerID):
                     serverID = validatedServerID
                 case .cancelled:
@@ -1844,17 +3534,32 @@ final class CourseExperienceStore {
                     return false
                 }
             } else {
-                serverID = try await connectedCourseServerID(appModel: appModel)
-                refreshAgentCatalog(appModel: appModel, serverID: serverID)
-                guard agentOptions.first(where: { $0.id == agentID })?.available == true else {
+                serverID = try await connectedCourseServerID(
+                    appModel: appModel,
+                    preferredServerID: selectedAgentServerID
+                )
+                let serverOptions = refreshAgentCatalog(
+                    appModel: appModel,
+                    serverID: serverID
+                )
+                guard serverOptions.first(where: { $0.id == agentID })?.available == true else {
                     throw CourseAgentSelectionError.runtimeUnavailable(agentID.titleDisplayLabel)
                 }
             }
             await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
             refreshAgentCatalog(appModel: appModel, serverID: serverID)
+            do {
+                try Task.checkCancellation()
+            } catch {
+                connectionState = .idle
+                return false
+            }
 
-            let matchingModels = models(for: agentID)
-            let requestedModel = modelID ?? (selectedAgentID == agentID ? selectedModelID : nil)
+            let matchingModels = models(for: agentID, serverID: serverID)
+            let selectedIdentityMatches = selectedAgentID == agentID
+                && selectedAgentServerID == serverID
+            let requestedModel = modelID
+                ?? (selectedIdentityMatches ? selectedModelID : nil)
             let catalogMatch = matchingModels.first(where: {
                 $0.id == requestedModel || $0.model == requestedModel
             })
@@ -1866,12 +3571,21 @@ final class CourseExperienceStore {
                 fallbackModelID: fallbackModel?.id,
                 customEndpointEnabled: agentID == .codex && OpenAIApiKeyStore.shared.hasStoredBaseURL
             )
-            let resolvedEffort = reasoningEffortID
-                ?? (selectedAgentID == agentID && selectedModelID == resolvedModelID ? selectedReasoningEffortID : nil)
-                ?? resolvedModel?.supportedReasoningEfforts.first(where: {
-                    $0.reasoningEffort == resolvedModel?.defaultReasoningEffort
-                })?.reasoningEffort.wireValue
+            let requestedEffort = reasoningEffortID
+                ?? (selectedIdentityMatches && selectedModelID == resolvedModelID
+                    ? selectedReasoningEffortID
+                    : nil)
+            let resolvedEffort = Self.normalizedReasoningEffortID(
+                requestedEffort,
+                for: resolvedModel
+            )
 
+            do {
+                try Task.checkCancellation()
+            } catch {
+                connectionState = .idle
+                return false
+            }
             selectedAgentID = agentID
             selectedAgentServerID = serverID
             selectedModelID = resolvedModelID
@@ -1925,8 +3639,8 @@ final class CourseExperienceStore {
         agentID == CourseAgentProvider.codex
     }
 
-    func models(for runtimeID: String) -> [ModelInfo] {
-        courseModels
+    func models(for runtimeID: String, serverID: String) -> [ModelInfo] {
+        return (courseModelsByServerID[serverID] ?? [])
             .filter { !$0.hidden && $0.agentRuntimeKind == runtimeID }
             .sorted {
                 if $0.isDefault != $1.isDefault { return $0.isDefault }
@@ -1934,9 +3648,68 @@ final class CourseExperienceStore {
             }
     }
 
-    func defaultModelID(for runtimeID: String) -> String? {
-        let choices = models(for: runtimeID)
+    func defaultModelID(for runtimeID: String, serverID: String) -> String? {
+        let choices = models(for: runtimeID, serverID: serverID)
         return choices.first(where: \.isDefault)?.id ?? choices.first?.id
+    }
+
+    func presentedModels(for runtimeID: String) -> [ModelInfo] {
+        guard let serverID = presentedAgentCatalogServerID else { return [] }
+        return models(for: runtimeID, serverID: serverID)
+    }
+
+    func presentedDefaultModelID(for runtimeID: String) -> String? {
+        guard let serverID = presentedAgentCatalogServerID else { return nil }
+        return defaultModelID(for: runtimeID, serverID: serverID)
+    }
+
+    static func normalizedReasoningEffortID(
+        _ requestedEffortID: String?,
+        for model: ModelInfo?
+    ) -> String? {
+        guard let model else { return nil }
+        let supported = model.supportedReasoningEfforts.map {
+            $0.reasoningEffort.wireValue
+        }
+        let requested = requestedEffortID?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if let requested,
+           !requested.isEmpty,
+           supported.contains(requested) {
+            return requested
+        }
+        let defaultEffort = model.defaultReasoningEffort.wireValue
+        return supported.contains(defaultEffort) ? defaultEffort : nil
+    }
+
+    private func modelInfo(
+        runtimeID: String?,
+        serverID: String,
+        modelID: String?
+    ) -> ModelInfo? {
+        guard let runtimeID,
+              let modelID,
+              !modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return models(for: runtimeID, serverID: serverID).first {
+            $0.id == modelID || $0.model == modelID
+        }
+    }
+
+    private func normalizedReasoningEffortID(
+        _ requestedEffortID: String?,
+        runtimeID: String?,
+        serverID: String,
+        modelID: String?
+    ) -> String? {
+        guard let model = modelInfo(
+            runtimeID: runtimeID,
+            serverID: serverID,
+            modelID: modelID
+        ) else { return requestedEffortID }
+        return Self.normalizedReasoningEffortID(requestedEffortID, for: model)
     }
 
     func canSwitchCurrentThread(to providerID: String) -> Bool {
@@ -1979,6 +3752,10 @@ final class CourseExperienceStore {
             agentError = "Wait for the selected source to finish preparing before switching courses."
             return
         }
+        // An invalid persisted locator is recovery evidence only. Resolving it
+        // means discarding that locator and starting a fresh chat; it must not
+        // be passed to any workspace, control-root, or archive operation.
+        resolveInvalidPersistedHermesRecoveryIdentityIfNeeded()
         if hasUnresolvedPendingHermesWork(workspaceID: currentCourseWorkspaceID) {
             if agentError == nil {
                 agentError = "Hermes still owns an accepted course turn or mobile tool result. Reopen this course and let it reach a terminal state before starting another course."
@@ -1987,7 +3764,9 @@ final class CourseExperienceStore {
             return
         }
         let previousWorkspaceID = currentCourseWorkspaceID
+        persistCurrentMainComposerDraft()
         clearPendingHermesCourseIdentity(workspaceID: previousWorkspaceID)
+        clearPendingHostedCourseIdentity(workspaceID: previousWorkspaceID)
         agentForwardTasks.values.forEach { $0.cancel() }
         agentForwardTasks.removeAll()
         chatRuns.reset()
@@ -2000,18 +3779,22 @@ final class CourseExperienceStore {
         if !currentWorkspaceWasBuilt && !workspaceIsPersisted {
             try? FileManager.default.removeItem(at: nativeCourseDirectory())
             removeCourseControlDirectory(workspaceID: previousWorkspaceID)
+            removeMainComposerDraft(workspaceID: previousWorkspaceID)
         }
         currentCourseWorkspaceID = UUID().uuidString.lowercased()
-        currentAgentRuntimeID = selectedAgentID ?? "codex"
+        currentAgentRuntimeID = selectedAgentID ?? preferredSetupAgentID
         currentAgentServerID = selectedAgentServerID
         currentAgentModelID = selectedModelID
+        currentAgentReasoningEffortID = selectedReasoningEffortID
         currentAppleSessionID = CourseAgentProvider.isApple(currentAgentRuntimeID ?? "")
             ? UUID()
             : nil
+        currentHostedSessionID = currentAgentRuntimeID == CourseAgentProvider.hosted
+            ? UUID()
+            : nil
         currentWorkspaceWasBuilt = false
-        pendingOutboundText = nil
-        pendingOutboundSources = []
-        pendingSelectionDiscussionID = nil
+        pendingMainSubmission = nil
+        mainSubmissionRecoveryState = nil
         messages = []
         sources = []
         showsBrief = false
@@ -2030,39 +3813,85 @@ final class CourseExperienceStore {
         backgroundGenerationError = nil
         backgroundGenerationErrorCourseID = nil
         processedCoursePlanToolCallIDs = []
-        navigationPath.append(.newCourse)
+        navigationPath = [.newCourse]
         prepareCourseWorkspace()
+        persistCurrentHostedSession()
         persistDraftSources()
     }
 
     func hasPendingHermesRecovery(selectionDiscussionID: UUID? = nil) -> Bool {
-        let threadID = selectionDiscussionID
-            .flatMap { selectionDiscussionThreadKey(id: $0)?.threadId }
-            ?? agentThreadKey?.threadId
-        do {
-            if try pendingHermesAcceptedTurns().contains(where: {
-                $0.workspaceID == currentCourseWorkspaceID
-                    && (threadID == nil || $0.threadID == threadID)
-                    && ($0.expectedTurnID?.isEmpty == false
-                        || $0.submissionIntentID != nil
-                        || $0.toolLifecycleOwned == true
-                        || $0.terminalError != nil)
-            }) {
-                return true
-            }
-            return try remoteHermesToolJournal(workspaceID: currentCourseWorkspaceID).load()
-                .contains(where: {
-                    $0.workspaceID == currentCourseWorkspaceID
-                        && (threadID == nil || $0.threadID == threadID)
-                        && $0.requiresRecovery
-                })
-        } catch {
-            return true
+        hermesRecoveryPresentation(
+            selectionDiscussionID: selectionDiscussionID
+        ) != nil
+    }
+
+    func hermesRecoveryPresentation(
+        selectionDiscussionID: UUID? = nil
+    ) -> CourseHermesRecoveryPresentation? {
+        if selectionDiscussionID == nil,
+           let provenance = invalidPersistedHermesRecoveryProvenance {
+            return CourseHermesRecoveryPresentation(provenance: provenance)
         }
+        let workspaceID = currentCourseWorkspaceID
+        let requestedThreadID: String?
+        if let selectionDiscussionID {
+            requestedThreadID = selectionDiscussionThreadKey(
+                id: selectionDiscussionID
+            )?.threadId
+        } else {
+            requestedThreadID = agentThreadKey?.threadId
+        }
+        let key = HermesRecoveryPresentationCacheKey(
+            workspaceID: workspaceID,
+            threadID: requestedThreadID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        let revision = hermesRecoveryJournalRevision.current()
+        if let cached = hermesRecoveryPresentationCache[key],
+           cached.revision == revision {
+            return cached.presentation
+        }
+
+        var presentation = CourseHermesRecoveryPresentationLoader.load(
+            workspaceID: workspaceID,
+            requestedThreadID: requestedThreadID,
+            selectionDiscussionID: selectionDiscussionID,
+            toolJournal: remoteHermesToolJournal(workspaceID: workspaceID),
+            submissionJournal: remoteHermesSubmissionJournal(
+                workspaceID: workspaceID
+            )
+        )
+        if selectionDiscussionID == nil,
+           let cleanup = pendingHermesRecoveryCleanup(workspaceID: workspaceID),
+           requestedThreadID == nil || cleanup.threadID == requestedThreadID {
+            presentation = CourseHermesRecoveryPresentation(
+                provenance: CourseHermesRecoveryProvenance(
+                    workspaceID: workspaceID,
+                    threadID: cleanup.threadID,
+                    discussionKind: .course,
+                    journalState: .terminalFailure,
+                    toolName: nil
+                ),
+                abandonMode: .finishDraftDeletion
+            )
+        }
+        if hermesRecoveryPresentationCache.count >= 8 {
+            hermesRecoveryPresentationCache.removeAll(keepingCapacity: true)
+        }
+        if presentation?.provenance.journalState != .unreadableEvidence {
+            hermesRecoveryPresentationCache[key] =
+                HermesRecoveryPresentationCacheEntry(
+                    revision: revision,
+                    presentation: presentation
+                )
+        }
+        return presentation
     }
 
     func canDeletePendingHermesDraft(selectionDiscussionID: UUID?) -> Bool {
-        selectionDiscussionID == nil
+        invalidPersistedHermesRecoveryProvenance == nil
+            && selectionDiscussionID == nil
+            && !currentWorkspaceWasBuilt
             && !courses.contains(where: { $0.workspaceID == currentCourseWorkspaceID })
     }
 
@@ -2071,6 +3900,11 @@ final class CourseExperienceStore {
         appModel: AppModel,
         appState: AppState
     ) async {
+        if selectionDiscussionID == nil,
+           invalidPersistedHermesRecoveryProvenance != nil {
+            agentError = "Hermes recovery evidence could not be read safely because its preserved workspace identity is invalid. Your draft and recovery evidence remain protected."
+            return
+        }
         if let terminalError = pendingTerminalHermesRecoveryError(
             selectionDiscussionID: selectionDiscussionID
         ) {
@@ -2103,87 +3937,366 @@ final class CourseExperienceStore {
         preserveWorkspace: Bool,
         appModel: AppModel
     ) async throws {
+        if selectionDiscussionID == nil,
+           invalidPersistedHermesRecoveryProvenance != nil {
+            // This is the explicit user resolution action for an invalid
+            // locator. It preserves the raw persisted payload under the fixed
+            // app-owned quarantine key, clears the live locator, and starts a
+            // new chat without ever resolving the invalid workspace path.
+            resolveInvalidPersistedHermesRecoveryIdentityIfNeeded()
+            beginNewCourse()
+            return
+        }
         let workspaceID = currentCourseWorkspaceID
-        let key = selectionDiscussionID
-            .flatMap { selectionDiscussionThreadKey(id: $0) }
-            ?? agentThreadKey
-        guard let key else {
+        guard CourseBashTool.isValidWorkspaceID(workspaceID) else {
             throw Self.remoteHermesRecoveryError(
-                "The saved Hermes thread identity is unavailable; recovery evidence was preserved."
+                "Learnfold stopped because the preserved Hermes workspace identity is invalid. Recovery evidence and course files were left untouched."
+            )
+        }
+        var closingScope: HermesRecoveryScope?
+        var activeAbandonmentScope: HermesRecoveryScope?
+        var activeWorkspaceDeletion: String?
+        defer {
+            if let closingScope {
+                closingHermesRecoveryScopes.remove(closingScope)
+            }
+            if let activeAbandonmentScope {
+                activeHermesAbandonmentScopes.remove(activeAbandonmentScope)
+            }
+            if let activeWorkspaceDeletion {
+                activeHermesWorkspaceDeletions.remove(activeWorkspaceDeletion)
+            }
+        }
+        if preserveWorkspace,
+           pendingHermesRecoveryCleanup(workspaceID: workspaceID) != nil {
+            throw Self.remoteHermesRecoveryError(
+                "This draft deletion already removed part of the course workspace. Finish deleting the draft; Learnfold cannot safely keep a partial workspace."
             )
         }
         let isSavedCourse = courses.contains(where: { $0.workspaceID == workspaceID })
-        guard preserveWorkspace || (selectionDiscussionID == nil && !isSavedCourse) else {
+        guard preserveWorkspace || (
+            selectionDiscussionID == nil
+                && !isSavedCourse
+                && !currentWorkspaceWasBuilt
+        ) else {
             throw Self.remoteHermesRecoveryError(
                 "A saved course cannot be deleted when abandoning one Hermes recovery. Its workspace and journal were preserved."
             )
         }
-        let journal = remoteHermesToolJournal(workspaceID: workspaceID)
-        let turnIDs = Self.hermesTurnIDsForAbandon(
-            acceptedTurns: try pendingHermesAcceptedTurns(),
-            journalEntries: try journal.load(),
-            workspaceID: workspaceID,
-            threadID: key.threadId
-        )
-        for turnID in turnIDs {
-            do {
-                _ = try await appModel.client.interruptTurn(
-                    serverId: key.serverId,
-                    params: AppInterruptTurnRequest(
-                        threadId: key.threadId,
-                        turnId: turnID
-                    )
-                )
-            } catch {
-                LLog.warn(
-                    "course-agent",
-                    "Hermes recovery abandon could not interrupt a known turn; preserving terminal evidence",
-                    fields: [
-                        "error": error.localizedDescription,
-                        "threadId": key.threadId,
-                        "turnId": turnID,
-                    ]
-                )
-            }
-        }
-        try journal.abandon(workspaceID: workspaceID, threadID: key.threadId)
-        try persistPendingHermesExpectedTurn(
-            nil,
-            key: key,
+        let requestedScope = HermesRecoveryScope(
             workspaceID: workspaceID,
             selectionDiscussionID: selectionDiscussionID
         )
-        if selectionDiscussionID == nil,
-           pendingHermesCourseIdentity(
-               workspaceID: workspaceID,
-               threadID: key.threadId
-           ) != nil {
-            defaults.removeObject(forKey: Self.pendingHermesCourseKey)
+        if preserveWorkspace {
+            guard !activeHermesWorkspaceDeletions.contains(workspaceID),
+                  !activeHermesAbandonmentScopes.contains(requestedScope) else {
+                throw Self.remoteHermesRecoveryError(
+                    "Hermes recovery abandonment is already in progress for this discussion."
+                )
+            }
+            activeHermesAbandonmentScopes.insert(requestedScope)
+            activeAbandonmentScope = requestedScope
+#if DEBUG
+            signalHermesRecoveryClosingForTesting(
+                scope: requestedScope,
+                workspaceWide: false
+            )
+#endif
+        } else {
+            guard !activeHermesWorkspaceDeletions.contains(workspaceID),
+                  !activeHermesAbandonmentScopes.contains(where: {
+                      $0.workspaceID == workspaceID
+                  }) else {
+                throw Self.remoteHermesRecoveryError(
+                    "Hermes recovery cleanup is already in progress for this workspace."
+                )
+            }
+            activeHermesWorkspaceDeletions.insert(workspaceID)
+            activeWorkspaceDeletion = workspaceID
+#if DEBUG
+            signalHermesRecoveryClosingForTesting(
+                scope: requestedScope,
+                workspaceWide: true
+            )
+#endif
+        }
+        if preserveWorkspace {
+            let scope = requestedScope
+            closingHermesRecoveryScopes.insert(scope)
+            closingScope = scope
+            invalidateHermesRecovery(
+                workspaceID: workspaceID,
+                selectionDiscussionID: selectionDiscussionID
+            )
+            let chatScope = CourseChatScope(
+                selectionDiscussionID: selectionDiscussionID
+            )
+            agentForwardTasks[chatScope]?.cancel()
+            await waitForHermesRecoveryDrain(
+                workspaceID: workspaceID,
+                selectionDiscussionID: selectionDiscussionID
+            )
+        } else {
+            // Deleting a draft closes the entire workspace, including focused
+            // discussions. Persist the tombstone before yielding so no new
+            // main or selection lease can start while active work drains.
+            persistPendingHermesRecoveryCleanup(
+                workspaceID: workspaceID,
+                threadID: agentThreadKey?.threadId
+                    ?? pendingHermesCourseIdentity(
+                        workspaceID: workspaceID
+                    )?.threadID
+            )
+            invalidateHermesRecoveryWorkspace(workspaceID: workspaceID)
+            agentForwardTasks[.main]?.cancel()
+            for discussion in selectionDiscussions
+            where self.workspaceID(for: discussion) == workspaceID {
+                agentForwardTasks[.selection(discussion.id)]?.cancel()
+            }
+            let generationToDrain = generationTask
+            let backgroundGenerationToDrain = backgroundNodeGenerationTask
+            generationTask?.cancel()
+            backgroundNodeGenerationTask?.cancel()
+            await generationToDrain?.value
+            await backgroundGenerationToDrain?.value
+            await waitForHermesRecoveryWorkspaceDrain(
+                workspaceID: workspaceID
+            )
+        }
+
+        let toolJournal = remoteHermesToolJournal(workspaceID: workspaceID)
+        let submissionJournal = remoteHermesSubmissionJournal(workspaceID: workspaceID)
+        let toolState = toolJournal.readState()
+        let submissionState = submissionJournal.readState()
+        let toolEntries: [RemoteHermesToolJournalEntry]
+        let acceptedTurns: [PendingHermesAcceptedTurn]
+
+        do {
+            switch toolState {
+            case .missing:
+                toolEntries = []
+            case .readable(let entries):
+                toolEntries = entries
+            case .unreadable:
+                guard FileManager.default.fileExists(atPath: toolJournal.storageURL.path) else {
+                    throw Self.remoteHermesRecoveryError("unavailable journal")
+                }
+                try hermesRecoveryFileOperations.quarantineFile(
+                    at: toolJournal.storageURL,
+                    archiveRootURL: hermesRecoveryArchiveRootURL
+                )
+                hermesRecoveryJournalRevision.advance()
+                toolEntries = []
+            }
+
+            switch submissionState {
+            case .missing:
+                acceptedTurns = []
+            case .readable(let entries):
+                acceptedTurns = entries
+            case .unreadable:
+                guard FileManager.default.fileExists(
+                    atPath: submissionJournal.storageURL.path
+                ) else {
+                    throw Self.remoteHermesRecoveryError("unavailable journal")
+                }
+                try hermesRecoveryFileOperations.quarantineFile(
+                    at: submissionJournal.storageURL,
+                    archiveRootURL: hermesRecoveryArchiveRootURL
+                )
+                hermesRecoveryJournalRevision.advance()
+                acceptedTurns = []
+            }
+
+            if case .readable = toolState {
+                try hermesRecoveryFileOperations.archiveFile(
+                    at: toolJournal.storageURL,
+                    archiveRootURL: hermesRecoveryArchiveRootURL
+                )
+                hermesRecoveryJournalRevision.advance()
+            }
+            if case .readable = submissionState {
+                try hermesRecoveryFileOperations.archiveFile(
+                    at: submissionJournal.storageURL,
+                    archiveRootURL: hermesRecoveryArchiveRootURL
+                )
+                hermesRecoveryJournalRevision.advance()
+            }
+        } catch {
+            throw Self.remoteHermesRecoveryError(
+                "Learnfold could not secure the private Hermes recovery evidence. The course workspace and durable recovery identity were preserved."
+            )
+        }
+
+        let selectedKey = selectionDiscussionID.flatMap {
+            selectionDiscussionThreadKey(id: $0)
+        }
+        let matchingAcceptedTurn = acceptedTurns.last(where: { record in
+            guard record.workspaceID == workspaceID else { return false }
+            if let selectionDiscussionID {
+                return record.selectionDiscussionID == selectionDiscussionID
+                    && (selectedKey.map { record.threadID == $0.threadId } ?? true)
+            }
+            return record.selectionDiscussionID == nil
+                && (agentThreadKey.map { record.threadID == $0.threadId } ?? true)
+        })
+        let knownThreadID = selectedKey?.threadId
+            ?? (selectionDiscussionID == nil ? agentThreadKey?.threadId : nil)
+            ?? matchingAcceptedTurn?.threadID
+        let matchingToolEntry = toolEntries.first(where: { entry in
+            guard entry.workspaceID == workspaceID,
+                  entry.requiresRecovery else { return false }
+            if let selectionDiscussionID {
+                guard entry.selectionDiscussionID == selectionDiscussionID else {
+                    return false
+                }
+            } else if entry.selectionDiscussionID != nil {
+                return false
+            }
+            return knownThreadID.map { entry.threadID == $0 } ?? true
+        })
+        let key: ThreadKey? = selectedKey
+            ?? (selectionDiscussionID == nil ? agentThreadKey : nil)
+            ?? matchingAcceptedTurn.map {
+                ThreadKey(serverId: $0.serverID, threadId: $0.threadID)
+            }
+        let requestedThreadID = key?.threadId
+            ?? matchingToolEntry?.threadID
+            ?? pendingHermesRecoveryCleanup(workspaceID: workspaceID)?.threadID
+        if !preserveWorkspace {
+            persistPendingHermesRecoveryCleanup(
+                workspaceID: workspaceID,
+                threadID: requestedThreadID
+            )
+        }
+        let interruptKeys: [ThreadKey]
+        if preserveWorkspace {
+            interruptKeys = key.map { [$0] } ?? []
+        } else {
+            let boundSelectionKeys: [ThreadKey] = selectionDiscussions.compactMap {
+                discussion -> ThreadKey? in
+                guard self.workspaceID(for: discussion) == workspaceID else {
+                    return nil
+                }
+                return selectionDiscussionThreadKey(id: discussion.id)
+            }
+            interruptKeys = Self.hermesThreadKeysForWorkspaceAbandon(
+                acceptedTurns: acceptedTurns,
+                workspaceID: workspaceID,
+                mainKey: agentThreadKey,
+                boundSelectionKeys: boundSelectionKeys
+            )
+        }
+        for interruptKey in interruptKeys {
+            let turnIDs = Self.hermesTurnIDsForAbandon(
+                acceptedTurns: acceptedTurns,
+                journalEntries: toolEntries,
+                workspaceID: workspaceID,
+                threadID: interruptKey.threadId
+            )
+            for turnID in turnIDs {
+                do {
+                    _ = try await appModel.client.interruptTurn(
+                        serverId: interruptKey.serverId,
+                        params: AppInterruptTurnRequest(
+                            threadId: interruptKey.threadId,
+                            turnId: turnID
+                        )
+                    )
+                } catch {
+                    LLog.warn(
+                        "course-agent",
+                        "Hermes recovery abandon could not interrupt a known turn; preserving terminal evidence"
+                    )
+                }
+            }
+        }
+
+        if preserveWorkspace {
+            do {
+                if case .readable = toolState {
+                    try toolJournal.abandon(
+                        workspaceID: workspaceID,
+                        threadID: requestedThreadID,
+                        selectionDiscussionID: selectionDiscussionID
+                    )
+                }
+                if case .readable = submissionState {
+                    try submissionJournal.remove(
+                        workspaceID: workspaceID,
+                        threadID: requestedThreadID,
+                        selectionDiscussionID: selectionDiscussionID
+                    )
+                }
+            } catch {
+                throw Self.remoteHermesRecoveryError(
+                    "Learnfold could not safely finish updating the private Hermes recovery evidence. The course workspace and durable recovery identity were preserved."
+                )
+            }
         }
 
         if preserveWorkspace {
             currentWorkspaceWasBuilt = true
         } else {
-            let archiveRoot = FileManager.default.urls(
-                for: .documentDirectory,
-                in: .userDomainMask
-            )[0].appendingPathComponent("HermesRecoveryArchive", isDirectory: true)
-            try journal.archive(
-                to: archiveRoot.appendingPathComponent(
-                    "\(workspaceID)-\(Int(Date().timeIntervalSince1970)).json"
+            do {
+                try hermesRecoveryFileOperations.removeWorkspaceRecursively(
+                    rootURL: coursesRootURL,
+                    workspaceID: workspaceID
                 )
-            )
-            courses.removeAll(where: { $0.workspaceID == workspaceID })
-            persistCourses()
-            try FileManager.default.removeItem(at: nativeCourseDirectory())
-            removeCourseControlDirectory(workspaceID: workspaceID)
+                let legacyControlRootURL = coursesRootURL
+                    .appendingPathComponent(".learnfold-control", isDirectory: true)
+                if legacyControlRootURL.standardizedFileURL
+                    != courseControlRootURL.standardizedFileURL,
+                   legacyControlRootURL.standardizedFileURL
+                    != coursesRootURL.standardizedFileURL {
+                    try hermesRecoveryFileOperations.removeWorkspaceRecursively(
+                        rootURL: legacyControlRootURL,
+                        workspaceID: workspaceID
+                    )
+                }
+                if courseControlRootURL.standardizedFileURL
+                    != coursesRootURL.standardizedFileURL {
+                    // Remove the active journal root last. Until this succeeds,
+                    // either its original rows or the durable cleanup marker
+                    // keeps dispatch blocked and abandonment retryable.
+                    try hermesRecoveryFileOperations.removeWorkspaceRecursively(
+                        rootURL: courseControlRootURL,
+                        workspaceID: workspaceID
+                    )
+                }
+                courses.removeAll(where: { $0.workspaceID == workspaceID })
+                persistCourses()
+                removeMainComposerDraft(workspaceID: workspaceID)
+            } catch {
+                throw Self.remoteHermesRecoveryError(
+                    "Hermes recovery evidence was archived privately, but Learnfold could not safely remove the draft workspace. The durable recovery identity was preserved."
+                )
+            }
         }
-        AppRuntimeController.shared.finishUserInitiatedMultiTurn(
-            key: key,
-            success: false
-        )
+
+        clearPendingHermesRecoveryCleanup(workspaceID: workspaceID)
+        if selectionDiscussionID == nil,
+           let pending = pendingHermesCourseIdentity(workspaceID: workspaceID),
+           requestedThreadID == nil || pending.threadID == requestedThreadID {
+            defaults.removeObject(forKey: Self.pendingHermesCourseKey)
+        }
+        if !preserveWorkspace {
+            // The deleted workspace/thread identity must never become a valid
+            // dispatch target again after the cleanup tombstone is cleared.
+            beginNewCourse()
+        }
+        if let key {
+            AppRuntimeController.shared.finishUserInitiatedMultiTurn(
+                key: key,
+                success: false
+            )
+        }
         if let selectionDiscussionID {
-            selectionDiscussionErrors[selectionDiscussionID] = nil
+            selectionDiscussionErrors[selectionDiscussionID] =
+                missingSelectionDiscussionThreadIDs.contains(selectionDiscussionID)
+                    ? CourseSelectionDiscussionTargetError.boundThreadMissing
+                        .localizedDescription
+                    : nil
         } else {
             agentError = nil
         }
@@ -2202,6 +4315,32 @@ final class CourseExperienceStore {
             $0.workspaceID == workspaceID && $0.threadID == threadID
         }.compactMap(\.resultTurnID)
         return Set(accepted + submitted)
+    }
+
+    static func hermesThreadKeysForWorkspaceAbandon(
+        acceptedTurns: [PendingHermesAcceptedTurn],
+        workspaceID: String,
+        mainKey: ThreadKey?,
+        boundSelectionKeys: [ThreadKey]
+    ) -> [ThreadKey] {
+        var keysByThreadID: [String: ThreadKey] = [:]
+        if let mainKey {
+            keysByThreadID[mainKey.threadId] = mainKey
+        }
+        for accepted in acceptedTurns
+        where accepted.workspaceID == workspaceID
+            && !accepted.serverID.isEmpty
+            && Self.isValidAppServerThreadID(accepted.threadID) {
+            keysByThreadID[accepted.threadID] = ThreadKey(
+                serverId: accepted.serverID,
+                threadId: accepted.threadID
+            )
+        }
+        for key in boundSelectionKeys
+        where Self.isValidAppServerThreadID(key.threadId) {
+            keysByThreadID[key.threadId] = key
+        }
+        return Array(keysByThreadID.values)
     }
 
     @discardableResult
@@ -2226,7 +4365,6 @@ final class CourseExperienceStore {
 
     func removeSource(_ source: CourseSource) {
         sources.removeAll(where: { $0.id == source.id })
-        pendingOutboundSources.removeAll(where: { $0.id == source.id })
         removePersistedSourceFile(source)
         persistDraftSources()
     }
@@ -2248,51 +4386,163 @@ final class CourseExperienceStore {
         )
     }
 
+    private func persistedDraftSource(_ source: CourseSource) -> PersistedDraftSource {
+        PersistedDraftSource(
+            id: source.id,
+            name: source.name,
+            detail: source.detail,
+            kind: source.kind,
+            runtimePath: source.runtimePath
+        )
+    }
+
+    private func restoredSources(
+        from values: [PersistedDraftSource],
+        workspaceID: String
+    ) -> [CourseSource] {
+        let rootURL = coursesRootURL.appendingPathComponent(workspaceID, isDirectory: true)
+        let expectedPrefix = "/mnt/apps/Courses/\(workspaceID)/sources/originals/"
+        let availableFiles = Set(
+            (try? CourseWorkspaceFileSystem(rootURL: rootURL)
+                .contentsOfDirectory("sources/originals")) ?? []
+        )
+        return values.compactMap { value in
+            if let runtimePath = value.runtimePath {
+                guard runtimePath.hasPrefix(expectedPrefix) else { return nil }
+                let filename = String(runtimePath.dropFirst(expectedPrefix.count))
+                guard !filename.isEmpty,
+                      !filename.contains("/"),
+                      availableFiles.contains(filename) else { return nil }
+            }
+            return CourseSource(
+                id: value.id,
+                name: value.name,
+                detail: value.detail,
+                kind: value.kind,
+                runtimePath: value.runtimePath,
+                image: nil
+            )
+        }
+    }
+
+    private func persistCurrentMainComposerDraft() {
+        let normalizedText = courseChatDraft?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalizedText?.isEmpty != false, sources.isEmpty {
+            mainComposerDrafts[currentCourseWorkspaceID] = nil
+        } else {
+            mainComposerDrafts[currentCourseWorkspaceID] = MainComposerDraft(
+                text: normalizedText?.isEmpty == false ? courseChatDraft : nil,
+                sources: sources
+            )
+        }
+        persistMainComposerDrafts()
+    }
+
+    private func removeMainComposerDraft(workspaceID: String) {
+        mainComposerDrafts[workspaceID] = nil
+        persistMainComposerDrafts()
+    }
+
+    private func persistMainComposerDrafts() {
+        let values = mainComposerDrafts.map { workspaceID, draft in
+            PersistedWorkspaceComposerDraft(
+                workspaceID: workspaceID,
+                text: draft.text,
+                sources: draft.sources.map(persistedDraftSource)
+            )
+        }
+        guard !values.isEmpty else {
+            defaults.removeObject(forKey: Self.workspaceComposerDraftsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(values) {
+            defaults.set(data, forKey: Self.workspaceComposerDraftsKey)
+        }
+    }
+
+    private func restoreWorkspaceComposerDrafts() {
+        guard let data = defaults.data(forKey: Self.workspaceComposerDraftsKey),
+              let values = try? JSONDecoder().decode(
+                  [PersistedWorkspaceComposerDraft].self,
+                  from: data
+              ) else { return }
+        for value in values where CourseBashTool.isValidWorkspaceID(value.workspaceID) {
+            let text = CourseAgentInternalPromptPolicy.visibleLearnerText(value.text)
+            let restored = restoredSources(from: value.sources, workspaceID: value.workspaceID)
+            guard text != nil || !restored.isEmpty else { continue }
+            mainComposerDrafts[value.workspaceID] = MainComposerDraft(
+                text: text,
+                sources: restored
+            )
+        }
+    }
+
+    private func restoreMainComposerDraft(workspaceID: String) {
+        let draft = mainComposerDrafts[workspaceID]
+        courseChatDraft = draft?.text
+        sources = draft?.sources ?? []
+    }
+
     private func persistDraftSources(
         importInProgress: Bool = false,
         importBaselineFilenames: [String]? = nil
     ) {
+        persistCurrentMainComposerDraft()
         let workspaceIsSaved = courses.contains {
             $0.workspaceID == currentCourseWorkspaceID
         }
         if workspaceIsSaved,
            sources.isEmpty,
-           pendingOutboundText == nil,
+           courseChatDraft == nil,
+           pendingMainSubmission == nil,
+           mainSubmissionRecoveryState == nil,
            !importInProgress {
             defaults.removeObject(forKey: Self.draftSourcesKey)
             return
         }
+        let persistedTarget = mainDispatchTarget()
+        let preservesUnknownUnconfirmedRuntime =
+            mainSubmissionRecoveryState == .acceptanceUnknown
+                && currentAgentRuntimeID == nil
+        let persistedRuntimeID = preservesUnknownUnconfirmedRuntime
+            ? nil
+            : persistedTarget.runtimeID
+        let persistedServerID = preservesUnknownUnconfirmedRuntime
+            ? currentAgentServerID
+            : persistedTarget.serverID
+        let persistedModelID = preservesUnknownUnconfirmedRuntime
+            ? currentAgentModelID
+            : persistedTarget.modelID
+        let persistedReasoningEffortID = preservesUnknownUnconfirmedRuntime
+            ? currentAgentReasoningEffortID
+            : persistedTarget.reasoningEffortID
         let value = PersistedDraftSources(
             workspaceID: currentCourseWorkspaceID,
-            sources: sources.map {
-                PersistedDraftSource(
-                    id: $0.id,
-                    name: $0.name,
-                    detail: $0.detail,
-                    kind: $0.kind,
-                    runtimePath: $0.runtimePath
-                )
-            },
+            sources: sources.map(persistedDraftSource),
+            draftText: courseChatDraft,
             importInProgress: importInProgress,
             importBaselineFilenames: importBaselineFilenames,
-            runtimeID: currentAgentRuntimeID ?? selectedAgentID,
-            serverID: agentThreadKey?.serverId ?? currentAgentServerID,
+            runtimeID: persistedRuntimeID,
+            serverID: persistedServerID,
             threadID: agentThreadKey?.threadId,
-            modelID: currentAgentModelID ?? selectedModelID,
+            modelID: persistedModelID,
+            reasoningEffortID: persistedReasoningEffortID,
             appleSessionID: currentAppleSessionID,
             brief: brief,
             showsBrief: showsBrief,
-            pendingOutboundText: pendingOutboundText,
-            pendingOutboundSources: pendingOutboundSources.map {
-                PersistedDraftSource(
-                    id: $0.id,
-                    name: $0.name,
-                    detail: $0.detail,
-                    kind: $0.kind,
-                    runtimePath: $0.runtimePath
-                )
-            },
-            pendingSelectionDiscussionID: pendingSelectionDiscussionID
+            pendingOutboundText: pendingMainSubmission?.learnerText,
+            pendingOutboundSources: pendingMainSubmission?.sources.map(persistedDraftSource),
+            pendingSelectionDiscussionID: nil,
+            submissionRecoveryState: mainSubmissionRecoveryState,
+            pendingAttemptID: pendingMainSubmission?.id,
+            pendingPromptText: pendingMainSubmission?.promptText,
+            pendingRuntimeID: preservesUnknownUnconfirmedRuntime
+                ? nil
+                : pendingMainSubmission?.target.runtimeID,
+            pendingServerID: pendingMainSubmission?.target.serverID,
+            pendingModelID: pendingMainSubmission?.target.modelID,
+            pendingReasoningEffortID: pendingMainSubmission?.target.reasoningEffortID,
+            pendingOptimisticMessageID: pendingMainSubmission?.optimisticMessageID
         )
         if let data = try? JSONEncoder().encode(value) {
             defaults.set(data, forKey: Self.draftSourcesKey)
@@ -2300,22 +4550,31 @@ final class CourseExperienceStore {
     }
 
     private func persistPendingSelectionSubmissions() {
-        let records: [PersistedPendingSelectionSubmission] =
-            pendingSelectionSubmissions.compactMap { discussionID, submission in
-            guard selectionDiscussion(id: discussionID)?.status == .unresolved else { return nil }
+        let discussionIDs = Set(pendingSelectionSubmissions.keys)
+            .union(selectionDiscussionDrafts.keys)
+            .union(selectionDiscussionSources.keys)
+            .union(selectionSubmissionRecoveryStates.keys)
+        let records: [PersistedPendingSelectionSubmission] = discussionIDs.compactMap { discussionID in
+            guard let discussion = selectionDiscussion(id: discussionID),
+                  discussion.status == .unresolved,
+                  let workspaceID = workspaceID(for: discussion) else { return nil }
+            let submission = pendingSelectionSubmissions[discussionID]
             return PersistedPendingSelectionSubmission(
                 discussionID: discussionID,
-                workspaceID: submission.workspaceID,
-                text: submission.text,
-                sources: submission.sources.map {
-                    PersistedDraftSource(
-                        id: $0.id,
-                        name: $0.name,
-                        detail: $0.detail,
-                        kind: $0.kind,
-                        runtimePath: $0.runtimePath
-                    )
-                }
+                workspaceID: workspaceID,
+                text: submission?.learnerText,
+                sources: submission?.sources.map(persistedDraftSource),
+                recoveryState: selectionSubmissionRecoveryStates[discussionID],
+                attemptID: submission?.id,
+                promptText: submission?.promptText,
+                runtimeID: submission?.target.runtimeID,
+                serverID: submission?.target.serverID,
+                modelID: submission?.target.modelID,
+                reasoningEffortID: submission?.target.reasoningEffortID,
+                optimisticMessageID: submission?.optimisticMessageID,
+                draftText: selectionDiscussionDrafts[discussionID],
+                draftSources: (selectionDiscussionSources[discussionID] ?? [])
+                    .map(persistedDraftSource)
             )
         }
         guard !records.isEmpty else {
@@ -2344,52 +4603,67 @@ final class CourseExperienceStore {
             guard let discussion = selectionDiscussion(id: record.discussionID),
                   discussion.status == .unresolved,
                   workspaceID(for: discussion) == record.workspaceID else { continue }
-            let rootURL = coursesRootURL.appendingPathComponent(
-                record.workspaceID,
-                isDirectory: true
+            let learnerText = CourseAgentInternalPromptPolicy.visibleLearnerText(record.text)
+            let attemptSources = restoredSources(
+                from: record.sources ?? [],
+                workspaceID: record.workspaceID
             )
-            let expectedPrefix = "/mnt/apps/Courses/\(record.workspaceID)/sources/originals/"
-            let availableFiles = Set(
-                (try? CourseWorkspaceFileSystem(rootURL: rootURL)
-                    .contentsOfDirectory("sources/originals")) ?? []
-            )
-            let restored = record.sources.compactMap { value -> CourseSource? in
-                if let runtimePath = value.runtimePath {
-                    guard runtimePath.hasPrefix(expectedPrefix) else { return nil }
-                    let filename = String(runtimePath.dropFirst(expectedPrefix.count))
-                    guard !filename.isEmpty,
-                          !filename.contains("/"),
-                          availableFiles.contains(filename) else { return nil }
-                }
-                return CourseSource(
-                    id: value.id,
-                    name: value.name,
-                    detail: value.detail,
-                    kind: value.kind,
-                    runtimePath: value.runtimePath,
-                    image: nil
+            if let learnerText {
+                let target = CourseAgentExecutionTarget(
+                    runtimeID: record.runtimeID ?? discussion.agentRuntimeKind ?? "codex",
+                    serverID: record.serverID ?? discussion.serverID,
+                    modelID: record.modelID ?? discussion.agentModelID,
+                    reasoningEffortID: record.reasoningEffortID
+                        ?? discussion.agentReasoningEffortID
                 )
+                pendingSelectionSubmissions[record.discussionID] = CourseAgentDispatchAttempt(
+                    id: record.attemptID ?? UUID(),
+                    workspaceID: record.workspaceID,
+                    promptText: record.promptText ?? learnerText,
+                    learnerText: learnerText,
+                    sources: attemptSources,
+                    target: target,
+                    optimisticMessageID: record.optimisticMessageID
+                )
+                selectionSubmissionRecoveryStates[record.discussionID] =
+                    record.recoveryState == .preparing
+                        ? .knownNotAccepted
+                        : record.recoveryState
             }
-            pendingSelectionSubmissions[record.discussionID] = PendingSelectionSubmission(
-                workspaceID: record.workspaceID,
-                text: record.text,
-                sources: restored
+            let persistedDraftText = CourseAgentInternalPromptPolicy.visibleLearnerText(
+                record.draftText
             )
-            selectionDiscussionDrafts[record.discussionID] = record.text
-            selectionDiscussionSources[record.discussionID] = restored
+            let persistedDraftSources = restoredSources(
+                from: record.draftSources ?? [],
+                workspaceID: record.workspaceID
+            )
+            let isLegacyAttemptOnly = record.draftText == nil
+                && record.draftSources == nil
+                && learnerText != nil
+                && record.recoveryState != .acceptedReplyIncomplete
+            selectionDiscussionDrafts[record.discussionID] = isLegacyAttemptOnly
+                ? learnerText
+                : persistedDraftText
+            selectionDiscussionSources[record.discussionID] = isLegacyAttemptOnly
+                ? attemptSources
+                : persistedDraftSources
         }
         if decoded.rejectedIndices.isEmpty {
             persistPendingSelectionSubmissions()
         }
     }
 
-    private func restorePersistedDraftSourcesIfAvailable() {
+    private func restorePersistedDraftSourcesIfAvailable(
+        expectedWorkspaceID: String? = nil
+    ) {
         guard let data = defaults.data(forKey: Self.draftSourcesKey),
               let draft = try? JSONDecoder().decode(PersistedDraftSources.self, from: data),
               CourseBashTool.isValidWorkspaceID(draft.workspaceID) else {
             defaults.removeObject(forKey: Self.draftSourcesKey)
             return
         }
+        guard expectedWorkspaceID == nil
+                || draft.workspaceID == expectedWorkspaceID else { return }
         let rootURL = coursesRootURL.appendingPathComponent(draft.workspaceID, isDirectory: true)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: rootURL.path, isDirectory: &isDirectory),
@@ -2437,7 +4711,14 @@ final class CourseExperienceStore {
             }
         }
         if let discussionID = draft.pendingSelectionDiscussionID {
-            guard let pendingText = draft.pendingOutboundText,
+            guard let pendingText = draft.pendingOutboundText else { return }
+            guard let learnerText = CourseAgentInternalPromptPolicy.visibleLearnerText(
+                pendingText
+            ) else {
+                defaults.removeObject(forKey: Self.draftSourcesKey)
+                return
+            }
+            guard
                   let discussion = selectionDiscussion(id: discussionID),
                   discussion.status == .unresolved,
                   workspaceID(for: discussion) == draft.workspaceID else {
@@ -2445,13 +4726,28 @@ final class CourseExperienceStore {
                 // but never project it into the main composer or workspace.
                 return
             }
-            selectionDiscussionDrafts[discussionID] = pendingText
+            selectionDiscussionDrafts[discussionID] = learnerText
             selectionDiscussionSources[discussionID] = restoredPending
-            pendingSelectionSubmissions[discussionID] = PendingSelectionSubmission(
-                workspaceID: draft.workspaceID,
-                text: pendingText,
-                sources: restoredPending
+            let discussionTarget = discussion.executionTarget ?? CourseAgentExecutionTarget(
+                runtimeID: draft.pendingRuntimeID ?? draft.runtimeID ?? "codex",
+                serverID: draft.pendingServerID ?? draft.serverID,
+                modelID: draft.pendingModelID ?? draft.modelID,
+                reasoningEffortID: draft.pendingReasoningEffortID
+                    ?? draft.reasoningEffortID
             )
+            pendingSelectionSubmissions[discussionID] = CourseAgentDispatchAttempt(
+                id: draft.pendingAttemptID ?? UUID(),
+                workspaceID: draft.workspaceID,
+                promptText: draft.pendingPromptText ?? learnerText,
+                learnerText: learnerText,
+                sources: restoredPending,
+                target: discussionTarget,
+                optimisticMessageID: draft.pendingOptimisticMessageID
+            )
+            selectionSubmissionRecoveryStates[discussionID] =
+                draft.submissionRecoveryState == .preparing
+                    ? .knownNotAccepted
+                    : draft.submissionRecoveryState
             persistPendingSelectionSubmissions()
             defaults.removeObject(forKey: Self.draftSourcesKey)
             return
@@ -2465,10 +4761,51 @@ final class CourseExperienceStore {
                 brief = savedBrief
             }
         }
-        sources = Self.recoveredSources(submitted: restoredPending, current: restored)
-        currentAgentRuntimeID = draft.runtimeID ?? selectedAgentID
+        let restoredAttemptText = CourseAgentInternalPromptPolicy.visibleLearnerText(
+            draft.pendingOutboundText
+        )
+        let restoredAttemptSources = restoredAttemptText == nil
+            && draft.pendingOutboundText != nil
+            ? []
+            : restoredPending
+        let restoredDraftText = CourseAgentInternalPromptPolicy.visibleLearnerText(draft.draftText)
+        let acceptedAttemptIsAwaitingReply =
+            draft.submissionRecoveryState == .acceptedReplyIncomplete
+        let fallbackDraftText = restoredDraftText
+            ?? (acceptedAttemptIsAwaitingReply ? nil : restoredAttemptText)
+        let fallbackDraftSources = draft.draftText != nil
+            || acceptedAttemptIsAwaitingReply
+            ? restored
+            : Self.recoveredSources(submitted: restoredAttemptSources, current: restored)
+        let scopedDraft = mainComposerDrafts[draft.workspaceID]
+        let scopedDraftMirrorsAcceptedAttempt = acceptedAttemptIsAwaitingReply
+            && scopedDraft?.text == restoredAttemptText
+            && scopedDraft?.sources == restoredAttemptSources
+        if let scopedDraft, !scopedDraftMirrorsAcceptedAttempt {
+            courseChatDraft = scopedDraft.text
+            sources = scopedDraft.sources
+        } else {
+            if scopedDraftMirrorsAcceptedAttempt {
+                mainComposerDrafts[draft.workspaceID] = nil
+            }
+            courseChatDraft = fallbackDraftText
+            sources = fallbackDraftSources
+            if fallbackDraftText != nil || !fallbackDraftSources.isEmpty {
+                mainComposerDrafts[draft.workspaceID] = MainComposerDraft(
+                    text: fallbackDraftText,
+                    sources: fallbackDraftSources
+                )
+            }
+        }
+        let savedCourseRuntimeID = courses.first(where: {
+            $0.workspaceID == draft.workspaceID
+        })?.agentRuntimeKind
+        currentAgentRuntimeID = draft.runtimeID
+            ?? savedCourseRuntimeID
+            ?? (draft.submissionRecoveryState == nil ? selectedAgentID : nil)
         currentAgentServerID = draft.serverID
         currentAgentModelID = draft.modelID
+        currentAgentReasoningEffortID = draft.reasoningEffortID
         currentAppleSessionID = draft.appleSessionID
         if let serverID = draft.serverID,
            let threadID = draft.threadID,
@@ -2479,12 +4816,34 @@ final class CourseExperienceStore {
             brief = restoredBrief
         }
         showsBrief = draft.showsBrief ?? false
-        courseChatDraft = draft.pendingOutboundText
-        // This is still an unaccepted submission. Keep the durable journal
-        // until a resend is accepted so a second termination cannot lose it.
-        pendingOutboundText = draft.pendingOutboundText
-        pendingOutboundSources = restoredPending
-        pendingSelectionDiscussionID = nil
+        if let restoredAttemptText {
+            pendingMainSubmission = CourseAgentDispatchAttempt(
+                id: draft.pendingAttemptID ?? UUID(),
+                workspaceID: draft.workspaceID,
+                promptText: draft.pendingPromptText ?? restoredAttemptText,
+                learnerText: restoredAttemptText,
+                sources: restoredAttemptSources,
+                target: CourseAgentExecutionTarget(
+                    runtimeID: draft.pendingRuntimeID
+                        ?? draft.runtimeID
+                        ?? currentAgentRuntimeID
+                        ?? "codex",
+                    serverID: draft.pendingServerID ?? draft.serverID,
+                    modelID: draft.pendingModelID ?? draft.modelID,
+                    reasoningEffortID: draft.pendingReasoningEffortID
+                        ?? draft.reasoningEffortID
+                ),
+                optimisticMessageID: draft.pendingOptimisticMessageID
+            )
+        } else {
+            pendingMainSubmission = nil
+        }
+        mainSubmissionRecoveryState = restoredAttemptText == nil
+            && draft.pendingOutboundText != nil
+            ? nil
+            : draft.submissionRecoveryState == .preparing
+                ? .knownNotAccepted
+                : draft.submissionRecoveryState
         navigationPath = [.newCourse]
         persistDraftSources()
     }
@@ -2494,13 +4853,97 @@ final class CourseExperienceStore {
             .contentsOfDirectory("sources/originals")) ?? []).sorted()
     }
 
+    static func executionIdentityMatches(
+        runtimeID: String?,
+        serverID: String?,
+        otherRuntimeID: String?,
+        otherServerID: String?
+    ) -> Bool {
+        runtimeID == otherRuntimeID && serverID == otherServerID
+    }
+
+    private func mainDispatchTarget() -> CourseAgentExecutionTarget {
+        let runtimeID = currentAgentRuntimeID ?? selectedAgentID ?? "codex"
+        let currentServerID = agentThreadKey?.serverId ?? currentAgentServerID
+        let serverID = currentServerID
+            ?? (selectedAgentID == runtimeID ? selectedAgentServerID : nil)
+        let currentMatches = Self.executionIdentityMatches(
+            runtimeID: runtimeID,
+            serverID: serverID,
+            otherRuntimeID: currentAgentRuntimeID,
+            otherServerID: currentServerID
+        )
+        let selectedMatches = Self.executionIdentityMatches(
+            runtimeID: runtimeID,
+            serverID: serverID,
+            otherRuntimeID: selectedAgentID,
+            otherServerID: selectedAgentServerID
+        )
+        let modelID = (currentMatches ? currentAgentModelID : nil)
+            ?? (selectedMatches ? selectedModelID : nil)
+        let reasoningEffortID: String?
+        if currentMatches, currentAgentModelID == modelID {
+            reasoningEffortID = currentAgentReasoningEffortID
+        } else if selectedMatches, selectedModelID == modelID {
+            reasoningEffortID = selectedReasoningEffortID
+        } else {
+            reasoningEffortID = nil
+        }
+        return CourseAgentExecutionTarget(
+            runtimeID: runtimeID,
+            serverID: serverID,
+            modelID: modelID,
+            reasoningEffortID: reasoningEffortID
+        )
+    }
+
+    private func scopedMainExecutionTarget(
+        runtimeID: String,
+        serverID: String?
+    ) -> CourseAgentExecutionTarget {
+        let target = mainDispatchTarget()
+        guard Self.executionIdentityMatches(
+            runtimeID: target.runtimeID,
+            serverID: target.serverID,
+            otherRuntimeID: runtimeID,
+            otherServerID: serverID
+        ) else {
+            return CourseAgentExecutionTarget(
+                runtimeID: runtimeID,
+                serverID: serverID,
+                modelID: nil,
+                reasoningEffortID: nil
+            )
+        }
+        return target
+    }
+
     func sendMessage(
         _ text: String,
         reference: CourseTextReference? = nil,
         selectionDiscussionID: UUID? = nil,
+        visibility: CourseAgentTranscriptVisibility = .learner,
         appModel: AppModel,
         appState: AppState
     ) -> Bool {
+        if hasPendingHermesRecovery(selectionDiscussionID: selectionDiscussionID) {
+            let message = "Resolve or abandon the preserved Hermes recovery before sending another message."
+            if let selectionDiscussionID {
+                selectionDiscussionErrors[selectionDiscussionID] = message
+            } else {
+                agentError = message
+            }
+            return false
+        }
+        if submissionRecoveryState(for: selectionDiscussionID)?.blocksNewSubmission == true {
+            let message = "Check the existing conversation before sending again. Learnfold is still preserving a message whose delivery status is unknown."
+            if let selectionDiscussionID {
+                selectionDiscussionErrors[selectionDiscussionID] = message
+            } else {
+                agentError = message
+            }
+            return false
+        }
         guard !isPreparingSource(for: selectionDiscussionID) else {
             let message = "Wait for the selected source to finish preparing before sending."
             if let selectionDiscussionID {
@@ -2511,7 +4954,8 @@ final class CourseExperienceStore {
             return false
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let draftSources = sources(for: selectionDiscussionID)
+        let isLearnerSubmission = visibility == .learner
+        let draftSources = isLearnerSubmission ? sources(for: selectionDiscussionID) : []
         guard !trimmed.isEmpty || !draftSources.isEmpty else { return false }
         let submittedSources = Self.mergedSources(
             explicit: draftSources,
@@ -2522,17 +4966,15 @@ final class CourseExperienceStore {
         }
         if let selectionDiscussionID {
             guard let discussionTarget,
-                  CourseAgentProvider.isApple(discussionTarget.runtimeID)
+                  CourseAgentProvider.usesLocalMessages(discussionTarget.runtimeID)
                     || discussionTarget.serverID?.isEmpty == false else {
                 selectionDiscussionErrors[selectionDiscussionID] =
                     "This discussion’s saved agent target could not be verified. Start a new discussion with the selected agent."
                 return false
             }
         }
-        let runtimeID = discussionTarget?.runtimeID
-            ?? currentAgentRuntimeID
-            ?? selectedAgentID
-            ?? "codex"
+        let dispatchTarget = discussionTarget ?? mainDispatchTarget()
+        let runtimeID = dispatchTarget.runtimeID
         let sourceError = Self.unsupportedAppleSourceMessage(
             runtimeID: runtimeID,
             sources: submittedSources
@@ -2551,43 +4993,55 @@ final class CourseExperienceStore {
         let scope = CourseChatScope(selectionDiscussionID: selectionDiscussionID)
         guard let runToken = chatRuns.begin(scope) else { return false }
 
-        let optimisticMessage = CourseChatMessage(
-            role: .learner,
-            text: trimmed,
-            sources: submittedSources
-        )
-        if let selectionDiscussionID {
-            selectionLocalMessages[selectionDiscussionID, default: []].append(optimisticMessage)
+        let optimisticMessage: CourseChatMessage? = if isLearnerSubmission {
+            CourseChatMessage(
+                role: .learner,
+                text: trimmed,
+                sources: submittedSources
+            )
         } else {
-            messages.append(optimisticMessage)
+            nil
+        }
+        if let optimisticMessage {
+            if let selectionDiscussionID {
+                selectionLocalMessages[selectionDiscussionID, default: []].append(optimisticMessage)
+            } else {
+                messages.append(optimisticMessage)
+            }
         }
 
         let workspaceID = selectionDiscussionID
             .flatMap { selectionDiscussion(id: $0) }
             .flatMap { self.workspaceID(for: $0) }
             ?? currentCourseWorkspaceID
-        if let selectionDiscussionID {
-            pendingSelectionSubmissions[selectionDiscussionID] = PendingSelectionSubmission(
-                workspaceID: workspaceID,
-                text: trimmed,
-                sources: submittedSources
-            )
-            persistPendingSelectionSubmissions()
-        } else {
-            pendingOutboundText = trimmed
-            pendingOutboundSources = submittedSources
-            pendingSelectionDiscussionID = nil
-        }
-        if let selectionDiscussionID {
-            selectionDiscussionSources[selectionDiscussionID] = []
-        } else {
-            sources = []
-        }
-        persistDraftSources()
         let submittedText = Self.agentMessageText(text: trimmed, sources: submittedSources)
         let agentText = reference.map {
             Self.contextualSelectionPrompt(question: submittedText, reference: $0)
         } ?? submittedText
+        let attempt = CourseAgentDispatchAttempt(
+            id: UUID(),
+            workspaceID: workspaceID,
+            promptText: agentText,
+            learnerText: isLearnerSubmission ? trimmed : nil,
+            sources: submittedSources,
+            target: dispatchTarget,
+            optimisticMessageID: optimisticMessage?.id
+        )
+        if isLearnerSubmission {
+            if let selectionDiscussionID {
+                pendingSelectionSubmissions[selectionDiscussionID] = attempt
+                selectionSubmissionRecoveryStates[selectionDiscussionID] = .preparing
+                selectionDiscussionDrafts[selectionDiscussionID] = nil
+                selectionDiscussionSources[selectionDiscussionID] = []
+            } else {
+                pendingMainSubmission = attempt
+                mainSubmissionRecoveryState = .preparing
+                courseChatDraft = nil
+                sources = []
+            }
+            persistPendingSelectionSubmissions()
+            persistDraftSources()
+        }
 
         if let selectionDiscussionID {
             selectionDiscussionErrors[selectionDiscussionID] = nil
@@ -2595,19 +5049,115 @@ final class CourseExperienceStore {
             agentError = nil
         }
         let previousTask = agentForwardTasks[scope]
-        let task = Task { [weak self] in
+        let task = Task { @MainActor [weak self] in
             await previousTask?.value
-            guard let self, !Task.isCancelled else { return }
+            guard let self else { return }
+            guard !Task.isCancelled else {
+                self.restorePreDispatchCancellation(
+                    attempt: attempt,
+                    selectionDiscussionID: selectionDiscussionID
+                )
+                self.chatRuns.finish(scope, token: runToken)
+                return
+            }
             await self.forwardToAgent(
-                text: agentText,
-                originalText: trimmed,
-                submittedSources: submittedSources,
-                optimisticMessageID: optimisticMessage.id,
+                attempt: attempt,
+                transcriptVisibility: visibility,
                 selectionContextID: reference?.id,
                 selectionDiscussionID: selectionDiscussionID,
                 scope: scope,
                 runToken: runToken,
-                workspaceID: workspaceID,
+                appModel: appModel,
+                appState: appState
+            )
+        }
+        agentForwardTasks[scope] = task
+        return true
+    }
+
+    @discardableResult
+    func retryRecoveredSubmission(
+        selectionDiscussionID: UUID?,
+        appModel: AppModel,
+        appState: AppState
+    ) -> Bool {
+        guard submissionRecoveryState(for: selectionDiscussionID) == .knownNotAccepted,
+              let previousAttempt = pendingSubmission(
+                  selectionDiscussionID: selectionDiscussionID
+              ),
+              let learnerText = previousAttempt.learnerText,
+              discussionWorkspaceIsAvailable(
+                  workspaceID: previousAttempt.workspaceID,
+                  selectionDiscussionID: selectionDiscussionID
+              ) else { return false }
+
+        let scope = CourseChatScope(selectionDiscussionID: selectionDiscussionID)
+        guard let runToken = chatRuns.begin(scope) else { return false }
+
+        let optimisticMessage = CourseChatMessage(
+            role: .learner,
+            text: learnerText,
+            sources: previousAttempt.sources
+        )
+        if let selectionDiscussionID {
+            selectionLocalMessages[selectionDiscussionID, default: []]
+                .append(optimisticMessage)
+        } else {
+            messages.append(optimisticMessage)
+        }
+        let attempt = CourseAgentDispatchAttempt(
+            id: UUID(),
+            workspaceID: previousAttempt.workspaceID,
+            promptText: previousAttempt.promptText,
+            learnerText: learnerText,
+            sources: previousAttempt.sources,
+            target: previousAttempt.target,
+            optimisticMessageID: optimisticMessage.id
+        )
+
+        if composerMatches(
+            attempt: previousAttempt,
+            selectionDiscussionID: selectionDiscussionID
+        ) {
+            if let selectionDiscussionID {
+                selectionDiscussionDrafts[selectionDiscussionID] = nil
+                selectionDiscussionSources[selectionDiscussionID] = []
+            } else {
+                courseChatDraft = nil
+                sources = []
+            }
+        }
+        if let selectionDiscussionID {
+            pendingSelectionSubmissions[selectionDiscussionID] = attempt
+            selectionSubmissionRecoveryStates[selectionDiscussionID] = .preparing
+            selectionDiscussionErrors[selectionDiscussionID] = nil
+        } else {
+            pendingMainSubmission = attempt
+            mainSubmissionRecoveryState = .preparing
+            agentError = nil
+        }
+        persistPendingSelectionSubmissions()
+        persistDraftSources()
+
+        let previousTask = agentForwardTasks[scope]
+        let task = Task { @MainActor [weak self] in
+            await previousTask?.value
+            guard let self else { return }
+            guard !Task.isCancelled else {
+                self.restorePreDispatchCancellation(
+                    attempt: attempt,
+                    selectionDiscussionID: selectionDiscussionID
+                )
+                self.chatRuns.finish(scope, token: runToken)
+                return
+            }
+            await self.forwardToAgent(
+                attempt: attempt,
+                transcriptVisibility: .learner,
+                selectionContextID: nil,
+                selectionDiscussionID: selectionDiscussionID,
+                scope: scope,
+                runToken: runToken,
                 appModel: appModel,
                 appState: appState
             )
@@ -2619,9 +5169,30 @@ final class CourseExperienceStore {
     func interruptAgent(appModel: AppModel, selectionDiscussionID: UUID? = nil) {
         let scope = CourseChatScope(selectionDiscussionID: selectionDiscussionID)
         let runToken = chatRuns.beginStopping(scope)
+        let pendingAttempt = pendingSubmission(
+            selectionDiscussionID: selectionDiscussionID
+        )
         let runtimeID = selectionDiscussionID.flatMap {
             selectionDiscussion(id: $0)?.agentRuntimeKind
         } ?? activeAgentID
+        if runtimeID == CourseAgentProvider.hosted {
+            let sessionID = selectionDiscussionID
+                .flatMap { selectionDiscussion(id: $0)?.hostedSessionID }
+                ?? currentHostedSessionID
+            if let sessionID {
+                hostedRuntime.cancel(sessionID: sessionID)
+            }
+            agentForwardTasks[scope]?.cancel()
+            agentForwardTasks[scope] = nil
+            if let pendingAttempt {
+                restorePreDispatchCancellation(
+                    attempt: pendingAttempt,
+                    selectionDiscussionID: selectionDiscussionID
+                )
+            }
+            chatRuns.finish(scope, token: runToken)
+            return
+        }
         if CourseAgentProvider.isApple(runtimeID) {
             let sessionID = selectionDiscussionID
                 .flatMap { selectionDiscussion(id: $0)?.appleSessionID }
@@ -2631,6 +5202,12 @@ final class CourseExperienceStore {
             }
             agentForwardTasks[scope]?.cancel()
             agentForwardTasks[scope] = nil
+            if let pendingAttempt {
+                restorePreDispatchCancellation(
+                    attempt: pendingAttempt,
+                    selectionDiscussionID: selectionDiscussionID
+                )
+            }
             chatRuns.finish(scope, token: runToken)
             return
         }
@@ -2664,6 +5241,12 @@ final class CourseExperienceStore {
                     } ?? self.agentThreadKey
                     self.agentForwardTasks[scope]?.cancel()
                     self.agentForwardTasks[scope] = nil
+                    if let pendingAttempt {
+                        self.restorePreDispatchCancellation(
+                            attempt: pendingAttempt,
+                            selectionDiscussionID: selectionDiscussionID
+                        )
+                    }
                     self.chatRuns.finish(scope, token: runToken)
                     if let pendingThreadKey {
                         AppRuntimeController.shared.finishUserInitiatedMultiTurn(
@@ -2702,10 +5285,19 @@ final class CourseExperienceStore {
 
     func approveCoursePlan(appModel: AppModel, appState: AppState) {
         guard showsBrief else { return }
+        guard !hasPendingHermesRecovery() else {
+            agentError = "Resolve or abandon the preserved Hermes recovery before approving this plan."
+            return
+        }
+        guard mainSubmissionRecoveryState == nil else {
+            agentError = "Resolve the preserved message before approving this plan."
+            return
+        }
         let workspaceID = currentCourseWorkspaceID
         let acceptedBrief = brief
         Task { [weak self] in
             guard let self else { return }
+            let preparedTarget: PreparedCourseLessonTarget
             do {
                 let repository = try await CourseDocumentRegistry.shared.repository(
                     workspaceID: workspaceID,
@@ -2715,41 +5307,31 @@ final class CourseExperienceStore {
                 try await repository.approvePlan(acceptedBrief)
                 guard self.currentCourseWorkspaceID == workspaceID else { return }
                 self.buildCourse()
-                _ = try await self.prepareApprovedCourseShell(
+                preparedTarget = try await self.prepareApprovedCourseShell(
                     brief: acceptedBrief,
                     workspaceID: workspaceID
                 )
             } catch {
                 guard self.currentCourseWorkspaceID == workspaceID else { return }
+                self.generationTask?.cancel()
+                self.generationTask = nil
                 self.generationError =
                     "Couldn’t prepare the approved course structure: \(error.localizedDescription)"
                 return
             }
             guard self.currentCourseWorkspaceID == workspaceID else { return }
-            let firstChapter = acceptedBrief.chapters.first
-            let editorInstruction: String
-            if CourseAgentProvider.isApple(self.currentAgentRuntimeID ?? self.selectedAgentID ?? "") {
-                editorInstruction = """
-                Use learnfold_generate_lesson once to write the current lesson and mark it \
-                generated
-                """
-            } else {
-                editorInstruction = """
-                Use native-editor-fetch to inspect that pending lesson, then native-editor-update-page \
-                to update only that page
-                """
-            }
-            let approval = """
-            I approve course plan \(acceptedBrief.planID), revision \(acceptedBrief.revision). \
-            Learnfold has already created the learner context pages, every chapter folder, and one \
-            pending lesson page for Chapter 1\(firstChapter.map { " (\($0.title))" } ?? ""). \
-            \(editorInstruction) with a \
-            concise, complete beginner lesson of at most 120 words: explanation, one small \
-            compiling Swift example, and one short exercise. Set its generation_status to \
-            generated in that same update. Do not create or edit later chapter lessons, and do \
-            not recreate the course structure.
-            """
-            self.sendMessage(approval, appModel: appModel, appState: appState)
+            let runtimeID = self.currentAgentRuntimeID ?? self.selectedAgentID ?? "codex"
+            let approval = Self.approvedCourseGenerationPrompt(
+                brief: acceptedBrief,
+                runtimeID: runtimeID,
+                target: preparedTarget
+            )
+            _ = self.sendMessage(
+                approval,
+                visibility: .internalInstruction,
+                appModel: appModel,
+                appState: appState
+            )
         }
     }
 
@@ -2770,13 +5352,14 @@ final class CourseExperienceStore {
             for _ in 0..<3_600 {
                 guard let self, !Task.isCancelled, self.currentCourseWorkspaceID == workspaceID else { return }
                 let state = await self.courseBuildState()
+                guard !Task.isCancelled, self.currentCourseWorkspaceID == workspaceID else { return }
                 self.generationStep = state.step
                 if state.step == 4, !state.isComplete {
                     do {
                         try await self.markCourseReadyForLearning()
                     } catch {
                         self.generationError =
-                            "Chapter 1 was written, but Learnfold couldn’t finish the course: \(error.localizedDescription)"
+                            "The initial learning page was written, but Learnfold couldn’t finish the course: \(error.localizedDescription)"
                         return
                     }
                     continue
@@ -2836,7 +5419,6 @@ final class CourseExperienceStore {
         case .blocked(let message):
             return .blocked(message: message)
         }
-        courseChatDraft = nil
         messages = []
         navigationPath.append(.newCourse)
         return .opened
@@ -2844,7 +5426,6 @@ final class CourseExperienceStore {
 
     func prepareContextualCourseChat(for course: LearningCourse) -> Bool {
         guard case .configured = configureCourseAgentContext(for: course) else { return false }
-        courseChatDraft = nil
         messages = []
         return true
     }
@@ -3002,7 +5583,7 @@ final class CourseExperienceStore {
     }
 
     func selectionDiscussionModelID(id: UUID?) -> String? {
-        guard let id else { return currentAgentModelID ?? selectedModelID }
+        guard let id else { return mainDispatchTarget().modelID }
         return selectionDiscussion(id: id)?.agentModelID
     }
 
@@ -3054,6 +5635,7 @@ final class CourseExperienceStore {
         }
         scopedSources.append(source)
         selectionDiscussionSources[discussionID] = scopedSources
+        persistPendingSelectionSubmissions()
         return true
     }
 
@@ -3063,16 +5645,11 @@ final class CourseExperienceStore {
             return
         }
         selectionDiscussionSources[discussionID, default: []].removeAll(where: { $0.id == source.id })
-        if var pending = pendingSelectionSubmissions[discussionID] {
-            pending.sources.removeAll(where: { $0.id == source.id })
-            pendingSelectionSubmissions[discussionID] = pending
-            persistPendingSelectionSubmissions()
-        }
         let scopedWorkspaceID = selectionDiscussion(id: discussionID).flatMap {
             workspaceID(for: $0)
         }
         removePersistedSourceFile(source, workspaceID: scopedWorkspaceID)
-        persistDraftSources()
+        persistPendingSelectionSubmissions()
     }
 
     func connectionState(for discussionID: UUID?) -> AgentConnectionState {
@@ -3087,11 +5664,14 @@ final class CourseExperienceStore {
 
     private func selectedDiscussionTarget() -> CourseAgentExecutionTarget? {
         guard let selectedAgentID else { return nil }
-        if CourseAgentProvider.isApple(selectedAgentID) {
+        if CourseAgentProvider.usesLocalMessages(selectedAgentID) {
             return CourseAgentExecutionTarget(
                 runtimeID: selectedAgentID,
                 serverID: nil,
-                modelID: nil
+                modelID: selectedAgentID == CourseAgentProvider.hosted
+                    ? SystemHostedCourseAgentRuntime.modelID
+                    : nil,
+                reasoningEffortID: nil
             )
         }
         guard let selectedAgentServerID,
@@ -3101,7 +5681,13 @@ final class CourseExperienceStore {
         return CourseAgentExecutionTarget(
             runtimeID: selectedAgentID,
             serverID: selectedAgentServerID,
-            modelID: selectedModelID
+            modelID: selectedModelID,
+            reasoningEffortID: normalizedReasoningEffortID(
+                selectedReasoningEffortID,
+                runtimeID: selectedAgentID,
+                serverID: selectedAgentServerID,
+                modelID: selectedModelID
+            )
         )
     }
 
@@ -3111,11 +5697,14 @@ final class CourseExperienceStore {
         selectedTarget: CourseAgentExecutionTarget?
     ) throws -> CourseAgentExecutionTarget {
         if let runtimeID = discussion.agentRuntimeKind {
-            if CourseAgentProvider.isApple(runtimeID) {
+            if CourseAgentProvider.usesLocalMessages(runtimeID) {
                 return CourseAgentExecutionTarget(
                     runtimeID: runtimeID,
                     serverID: nil,
-                    modelID: nil
+                    modelID: runtimeID == CourseAgentProvider.hosted
+                        ? SystemHostedCourseAgentRuntime.modelID
+                        : nil,
+                    reasoningEffortID: nil
                 )
             }
             guard let serverID = discussion.serverID,
@@ -3127,7 +5716,19 @@ final class CourseExperienceStore {
             return CourseAgentExecutionTarget(
                 runtimeID: runtimeID,
                 serverID: serverID,
-                modelID: discussion.agentModelID
+                modelID: discussion.agentModelID,
+                reasoningEffortID: discussion.agentReasoningEffortID
+            )
+        }
+        if discussion.hostedSessionID != nil {
+            guard course.agentRuntimeKind == CourseAgentProvider.hosted else {
+                throw CourseSelectionDiscussionTargetError.unknownAppleBinding
+            }
+            return CourseAgentExecutionTarget(
+                runtimeID: CourseAgentProvider.hosted,
+                serverID: nil,
+                modelID: SystemHostedCourseAgentRuntime.modelID,
+                reasoningEffortID: nil
             )
         }
         if discussion.appleSessionID != nil {
@@ -3138,7 +5739,8 @@ final class CourseExperienceStore {
             return CourseAgentExecutionTarget(
                 runtimeID: courseRuntimeID,
                 serverID: nil,
-                modelID: nil
+                modelID: nil,
+                reasoningEffortID: nil
             )
         }
         guard let selectedTarget else {
@@ -3209,34 +5811,177 @@ final class CourseExperienceStore {
     }
 
     func localMessages(for discussionID: UUID?) -> [CourseChatMessage] {
-        guard let discussionID else { return messages }
-        return selectionLocalMessages[discussionID] ?? []
+        let scopedMessages = discussionID.map { selectionLocalMessages[$0] ?? [] } ?? messages
+        return CourseChatTranscriptPolicy.learnerVisibleMessages(scopedMessages)
     }
 
     func takeDraft(for discussionID: UUID?) -> String? {
         if let discussionID {
-            return selectionDiscussionDrafts.removeValue(forKey: discussionID)
+            return selectionDiscussionDrafts[discussionID]
         }
-        defer { courseChatDraft = nil }
         return courseChatDraft
     }
 
-    func saveDraft(_ draft: String?, for discussionID: UUID?) {
-        let normalized = draft?.trimmingCharacters(in: .whitespacesAndNewlines)
+    func submissionRecoveryState(
+        for discussionID: UUID?
+    ) -> CourseAgentSubmissionRecoveryState? {
         if let discussionID {
-            selectionDiscussionDrafts[discussionID] = normalized?.isEmpty == false ? draft : nil
-            if var pending = pendingSelectionSubmissions[discussionID] {
-                pending.text = normalized?.isEmpty == false ? (draft ?? "") : ""
-                pendingSelectionSubmissions[discussionID] = pending
-                persistPendingSelectionSubmissions()
-            }
+            return selectionSubmissionRecoveryStates[discussionID]
+        }
+        return mainSubmissionRecoveryState
+    }
+
+    private func setSubmissionRecoveryState(
+        _ state: CourseAgentSubmissionRecoveryState?,
+        for discussionID: UUID?,
+        matching attemptID: UUID? = nil
+    ) {
+        if let attemptID,
+           pendingSubmission(selectionDiscussionID: discussionID)?.id != attemptID {
+            return
+        }
+        if let discussionID {
+            selectionSubmissionRecoveryStates[discussionID] = state
+            persistPendingSelectionSubmissions()
         } else {
-            courseChatDraft = normalized?.isEmpty == false ? draft : nil
-            if pendingOutboundText != nil {
-                pendingOutboundText = normalized?.isEmpty == false ? draft : nil
-                persistDraftSources()
+            mainSubmissionRecoveryState = state
+            persistDraftSources()
+        }
+    }
+
+    func draftWorkspaceID(for discussionID: UUID?) -> String? {
+        if let discussionID {
+            return selectionDiscussion(id: discussionID).flatMap {
+                workspaceID(for: $0)
             }
         }
+        return currentCourseWorkspaceID
+    }
+
+    func saveDraft(
+        _ draft: String?,
+        for discussionID: UUID?,
+        expectedWorkspaceID: String? = nil
+    ) {
+        if let expectedWorkspaceID,
+           draftWorkspaceID(for: discussionID) != expectedWorkspaceID {
+            return
+        }
+        let normalized = draft?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let discussionID {
+            if normalized?.isEmpty != false,
+               selectionSubmissionRecoveryStates[discussionID] == .acceptanceUnknown,
+               let pending = pendingSelectionSubmissions[discussionID],
+               composerMatches(
+                   attempt: pending,
+                   selectionDiscussionID: discussionID
+               ) {
+                persistPendingSelectionSubmissions()
+                return
+            }
+            let previous = selectionDiscussionDrafts[discussionID]
+            selectionDiscussionDrafts[discussionID] =
+                normalized?.isEmpty == false ? draft : nil
+            if previous != draft,
+               selectionSubmissionRecoveryStates[discussionID] == .knownNotAccepted {
+                selectionDiscussionErrors[discussionID] = nil
+            }
+            persistPendingSelectionSubmissions()
+        } else {
+            if normalized?.isEmpty != false,
+               mainSubmissionRecoveryState == .acceptanceUnknown,
+               let pendingMainSubmission,
+               composerMatches(
+                   attempt: pendingMainSubmission,
+                   selectionDiscussionID: nil
+               ) {
+                persistDraftSources()
+                return
+            }
+            let previous = courseChatDraft
+            courseChatDraft = normalized?.isEmpty == false ? draft : nil
+            if previous != draft, mainSubmissionRecoveryState == .knownNotAccepted {
+                agentError = nil
+            }
+            persistDraftSources()
+        }
+    }
+
+    @discardableResult
+    func discardRecoveredSubmission(selectionDiscussionID: UUID?) -> Bool {
+        guard submissionRecoveryState(for: selectionDiscussionID)?.canDiscardDraft == true else {
+            return false
+        }
+        clearRecoveredSubmission(selectionDiscussionID: selectionDiscussionID)
+        return true
+    }
+
+    func canAbandonUnconfirmedSubmission(selectionDiscussionID: UUID?) -> Bool {
+        guard submissionRecoveryState(for: selectionDiscussionID) == .acceptanceUnknown else {
+            return false
+        }
+        let runtimeID = if let selectionDiscussionID {
+            selectionDiscussion(id: selectionDiscussionID)?.agentRuntimeKind
+        } else {
+            currentAgentRuntimeID
+        }
+        guard let runtimeID, !runtimeID.isEmpty else { return false }
+        return runtimeID != "hermes"
+    }
+
+    @discardableResult
+    func abandonUnconfirmedSubmission(selectionDiscussionID: UUID?) -> Bool {
+        guard canAbandonUnconfirmedSubmission(
+            selectionDiscussionID: selectionDiscussionID
+        ) else { return false }
+        clearRecoveredSubmission(selectionDiscussionID: selectionDiscussionID)
+        return true
+    }
+
+    private func clearRecoveredSubmission(selectionDiscussionID: UUID?) {
+        if let selectionDiscussionID {
+            let pending = pendingSelectionSubmissions[selectionDiscussionID]
+            let workspaceID = pending?.workspaceID
+                ?? selectionDiscussion(id: selectionDiscussionID).flatMap {
+                    self.workspaceID(for: $0)
+                }
+            if let pending,
+               composerMatches(
+                   attempt: pending,
+                   selectionDiscussionID: selectionDiscussionID
+               ) {
+                var removedSourceIDs: Set<UUID> = []
+                for source in pending.sources
+                where removedSourceIDs.insert(source.id).inserted {
+                    removePersistedSourceFile(source, workspaceID: workspaceID)
+                }
+                selectionDiscussionDrafts[selectionDiscussionID] = nil
+                selectionDiscussionSources[selectionDiscussionID] = nil
+            }
+            pendingSelectionSubmissions[selectionDiscussionID] = nil
+            selectionSubmissionRecoveryStates[selectionDiscussionID] = nil
+            selectionDiscussionErrors[selectionDiscussionID] = nil
+            persistPendingSelectionSubmissions()
+            return
+        }
+
+        if let pendingMainSubmission,
+           composerMatches(
+               attempt: pendingMainSubmission,
+               selectionDiscussionID: nil
+           ) {
+            var removedSourceIDs: Set<UUID> = []
+            for source in pendingMainSubmission.sources
+            where removedSourceIDs.insert(source.id).inserted {
+                removePersistedSourceFile(source)
+            }
+            courseChatDraft = nil
+            sources = []
+        }
+        pendingMainSubmission = nil
+        mainSubmissionRecoveryState = nil
+        agentError = nil
+        persistDraftSources()
     }
 
     func prepareSelectionDiscussionThread(
@@ -3263,6 +6008,7 @@ final class CourseExperienceStore {
         let persistedDiscussionKey = selectionDiscussionThreadKey(id: discussionID)
         var runtimeID = discussion.agentRuntimeKind ?? "unknown"
         var modelID = discussion.agentModelID
+        var reasoningEffortID = discussion.agentReasoningEffortID
         var targetServerID = persistedDiscussionKey?.serverId ?? discussion.serverID
         if persistedDiscussionKey == nil {
             do {
@@ -3273,11 +6019,13 @@ final class CourseExperienceStore {
                 )
                 runtimeID = target.runtimeID
                 modelID = target.modelID
+                reasoningEffortID = target.reasoningEffortID
                 targetServerID = target.serverID
                 if discussion.executionTarget != target,
                    let index = selectionDiscussions.firstIndex(where: { $0.id == discussionID }) {
                     selectionDiscussions[index].agentRuntimeKind = target.runtimeID
                     selectionDiscussions[index].agentModelID = target.modelID
+                    selectionDiscussions[index].agentReasoningEffortID = target.reasoningEffortID
                     selectionDiscussions[index].serverID = target.serverID
                     persistSelectionDiscussions()
                 }
@@ -3286,6 +6034,28 @@ final class CourseExperienceStore {
                 selectionConnectionStates[discussionID] = .failed(error.localizedDescription)
                 return
             }
+        }
+        if persistedDiscussionKey == nil, runtimeID == CourseAgentProvider.hosted {
+            let sessionID: UUID
+            if let persisted = discussion.hostedSessionID {
+                sessionID = persisted
+            } else {
+                sessionID = UUID()
+                if let index = selectionDiscussions.firstIndex(where: { $0.id == discussionID }) {
+                    selectionDiscussions[index].hostedSessionID = sessionID
+                    persistSelectionDiscussions()
+                }
+            }
+            do {
+                let restored = try await hostedRuntime.restoredMessages(sessionID: sessionID)
+                selectionLocalMessages[discussionID] = restored.map(Self.localMessage(from:))
+                selectionConnectionStates[discussionID] = .connected
+            } catch {
+                let message = "The Hosted discussion couldn’t be restored: \(error.localizedDescription)"
+                selectionDiscussionErrors[discussionID] = message
+                selectionConnectionStates[discussionID] = .failed(message)
+            }
+            return
         }
         if persistedDiscussionKey == nil, CourseAgentProvider.isApple(runtimeID) {
             let sessionID: UUID
@@ -3302,9 +6072,35 @@ final class CourseExperienceStore {
                 sessionID: sessionID,
                 workspaceID: workspaceID
             )
-            selectionLocalMessages[discussionID] = restored.map(Self.localMessage(from:))
+            selectionLocalMessages[discussionID] = Self.localMessages(from: restored)
             selectionConnectionStates[discussionID] = .connected
             return
+        }
+
+        let recoveryLease: HermesRecoveryLease?
+        if runtimeID == "hermes" {
+            let lease = hermesRecoveryLease(
+                workspaceID: workspaceID,
+                selectionDiscussionID: discussionID
+            )
+            do {
+                try beginHermesRecoveryLease(lease)
+                recoveryLease = lease
+            } catch {
+                return
+            }
+        } else {
+            recoveryLease = nil
+        }
+        defer {
+            if let recoveryLease {
+                endHermesRecoveryLease(recoveryLease)
+            }
+        }
+        func requireHermesLeaseIfNeeded() throws {
+            if let recoveryLease {
+                try requireCurrentHermesRecoveryLease(recoveryLease)
+            }
         }
 
         var hermesRecoveryKey: ThreadKey?
@@ -3314,6 +6110,7 @@ final class CourseExperienceStore {
                 appModel: appModel,
                 preferredServerID: persistedDiscussionKey?.serverId ?? targetServerID
             )
+            try requireHermesLeaseIfNeeded()
 
             var threadKey: ThreadKey
             if let persistedKey = persistedDiscussionKey {
@@ -3328,11 +6125,14 @@ final class CourseExperienceStore {
                         includeTurns: true
                     )
                 )
+                try requireHermesLeaseIfNeeded()
                 await appModel.refreshSnapshot()
+                try requireHermesLeaseIfNeeded()
                 threadKey = await appModel.hydrateThreadPermissions(
                     for: loadedKey,
                     appState: appState
                 ) ?? loadedKey
+                try requireHermesLeaseIfNeeded()
                 guard let snapshot = appModel.threadSnapshot(for: threadKey) else {
                     // The authoritative read above succeeded. A missing local
                     // projection is a hydration/reconciliation delay, not
@@ -3352,9 +6152,16 @@ final class CourseExperienceStore {
                     boundModelID: discussion.agentModelID,
                     authoritativeModelID: snapshot.resolvedModel
                 )
+                reasoningEffortID = normalizedReasoningEffortID(
+                    reasoningEffortID,
+                    runtimeID: runtimeID,
+                    serverID: threadKey.serverId,
+                    modelID: modelID
+                )
                 if let index = selectionDiscussions.firstIndex(where: { $0.id == discussionID }) {
                     selectionDiscussions[index].agentRuntimeKind = runtimeID
                     selectionDiscussions[index].agentModelID = modelID
+                    selectionDiscussions[index].agentReasoningEffortID = reasoningEffortID
                     selectionDiscussions[index].serverID = threadKey.serverId
                     persistSelectionDiscussions()
                 }
@@ -3371,14 +6178,15 @@ final class CourseExperienceStore {
                     runtimeID: runtimeID,
                     workspaceID: workspaceID,
                     modelID: modelID,
-                    inheritsGlobalModel: false,
                     appModel: appModel
                 )
+                try requireHermesLeaseIfNeeded()
                 bindSelectionDiscussion(
                     discussionID,
                     to: threadKey,
                     runtimeID: runtimeID,
-                    modelID: modelID
+                    modelID: modelID,
+                    reasoningEffortID: reasoningEffortID
                 )
             }
 
@@ -3399,11 +6207,13 @@ final class CourseExperienceStore {
                     workspaceID: workspaceID,
                     appModel: appModel
                 )
+                try requireHermesLeaseIfNeeded()
                 bindSelectionDiscussion(
                     discussionID,
                     to: threadKey,
                     runtimeID: runtimeID,
-                    modelID: modelID
+                    modelID: modelID,
+                    reasoningEffortID: reasoningEffortID
                 )
                 hermesRecoveryKey = threadKey
             }
@@ -3412,34 +6222,46 @@ final class CourseExperienceStore {
                 threadID: threadKey.threadId,
                 workspaceID: workspaceID
             )
+            try requireHermesLeaseIfNeeded()
 
             if runtimeID == "hermes" {
-                if let expectedTurnID = try await reconcilePendingHermesSubmissionIntent(
+                if let pendingTurn = try await reconcilePendingHermesSubmissionIntent(
                     key: threadKey,
                     workspaceID: workspaceID,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
-                )?.expectedTurnID {
+                ), let expectedTurnID = pendingTurn.expectedTurnID {
                     try await hydrateRemoteHermesResponse(
                         for: threadKey,
                         expectedTurnID: expectedTurnID,
                         workspaceID: workspaceID,
                         selectionDiscussionID: discussionID,
+                        transcriptVisibility: Self.transcriptVisibility(for: pendingTurn),
+                        recoveryLease: recoveryLease!,
                         appModel: appModel
                     )
                 }
                 try await recoverPendingRemoteHermesTool(
                     for: threadKey,
                     workspaceID: workspaceID,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
                 )
                 try await waitUntilRemoteHermesThreadIsIdle(
                     threadKey,
                     workspaceID: workspaceID,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
                 )
+                try requireHermesLeaseIfNeeded()
             }
             await appModel.loadInitialTurnsIfNeeded(threadId: threadKey)
+            try requireHermesLeaseIfNeeded()
         } catch {
+            if let recoveryLease,
+               (try? requireCurrentHermesRecoveryLease(recoveryLease)) == nil {
+                return
+            }
             if let hermesRecoveryKey {
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: hermesRecoveryKey,
@@ -3478,6 +6300,9 @@ final class CourseExperienceStore {
         if missingSelectionDiscussionThreadIDs.contains(discussionID) {
             // The remote target is already known to be gone. Resolve locally
             // so the annotation cannot trap the learner in a retry loop.
+        } else if let hostedSessionID = discussion.hostedSessionID,
+                  discussion.agentRuntimeKind == CourseAgentProvider.hosted {
+            hostedRuntime.cancel(sessionID: hostedSessionID)
         } else if let appleSessionID = discussion.appleSessionID,
            CourseAgentProvider.isApple(discussion.agentRuntimeKind ?? "") {
             appleRuntime.remove(
@@ -3502,6 +6327,7 @@ final class CourseExperienceStore {
         persistSelectionDiscussions()
         selectionLocalMessages[discussionID] = nil
         selectionDiscussionDrafts[discussionID] = nil
+        selectionSubmissionRecoveryStates[discussionID] = nil
         selectionDiscussionErrors[discussionID] = nil
         selectionDiscussionReadinessErrors[discussionID] = nil
         selectionDiscussionSources[discussionID] = nil
@@ -3514,12 +6340,29 @@ final class CourseExperienceStore {
         persistPendingSelectionSubmissions()
     }
 
+    private static func localMessages(
+        from storedMessages: [AppleCourseAgentStoredMessage]
+    ) -> [CourseChatMessage] {
+        CourseChatTranscriptPolicy.learnerVisibleMessages(storedMessages.map { stored in
+            let isInternalInstruction = stored.role == .learner
+                && CourseAgentInternalPromptPolicy.isInternalInstruction(stored.text)
+            return CourseChatMessage(
+                role: stored.role == .learner ? .learner : .agent,
+                text: stored.text,
+                transcriptVisibility: isInternalInstruction ? .internalInstruction : .learner
+            )
+        })
+    }
+
     private static func localMessage(
-        from stored: AppleCourseAgentStoredMessage
+        from storedMessage: HostedCourseAgentStoredMessage
     ) -> CourseChatMessage {
-        CourseChatMessage(
-            role: stored.role == .learner ? .learner : .agent,
-            text: stored.text
+        let isInternalInstruction = storedMessage.role == .learner
+            && CourseAgentInternalPromptPolicy.isInternalInstruction(storedMessage.text)
+        return CourseChatMessage(
+            role: storedMessage.role == .learner ? .learner : .agent,
+            text: storedMessage.text,
+            transcriptVisibility: isInternalInstruction ? .internalInstruction : .learner
         )
     }
 
@@ -3633,6 +6476,10 @@ final class CourseExperienceStore {
         runtimeID: String,
         sources: [CourseSource]
     ) -> String? {
+        if runtimeID == CourseAgentProvider.hosted,
+           sources.contains(where: { $0.kind == .document || $0.kind == .image }) {
+            return "Hosted course chat currently supports text, links, and native course tools. Remove document or image attachments to continue."
+        }
         guard runtimeID == "hermes",
               sources.contains(where: { source in
                   switch source.kind {
@@ -3713,21 +6560,72 @@ final class CourseExperienceStore {
         return UUID(uuidString: uuidText) != nil
     }
 
+    static func approvedCourseGenerationPrompt(
+        brief: CourseBrief,
+        runtimeID: String,
+        target: PreparedCourseLessonTarget
+    ) -> String {
+        let targetTitle = target.title
+            ?? CoursePlanHierarchyPolicy.firstContentLeaf(in: brief)?.title
+            ?? target.nodeID
+        let targetRole = target.courseRole ?? "learning page"
+        let editorInstruction: String
+        if CourseAgentProvider.isApple(runtimeID) {
+            editorInstruction = """
+            Use learnfold_generate_lesson once to write exactly that prepared page and mark it \
+            generated. Only if Learnfold rejects runnable code before any write may you correct it \
+            and call learnfold_generate_lesson exactly once more
+            """
+        } else {
+            editorInstruction = """
+            Use native-editor-fetch with page_id \(target.pageID), then native-editor-update-page \
+            to update only that exact page
+            """
+        }
+        let exampleInstruction = CourseLessonExamplePolicy.promptInstruction(for: brief)
+        let instruction = """
+        I approve course plan \(brief.planID), revision \(brief.revision). Learnfold has already \
+        created the learner context pages and the complete ordered course hierarchy. The only page \
+        to generate in this turn is “\(targetTitle)” (node ID: \(target.nodeID), page ID: \
+        \(target.pageID), role: \(targetRole)). \(editorInstruction) with a \
+        concise, complete beginner lesson of at most 120 words: explanation, \(exampleInstruction), \
+        and one short exercise. Set its generation_status to generated in that same update. Do not \
+        create or edit any sibling, ancestor, or later page, and do not recreate the course structure. \
+        Never create a missing planned page yourself. If this target or any planned page is missing, \
+        stop and report that the course shell must be repaired.
+        """
+        return CourseAgentInternalPromptPolicy.wrap(
+            instruction,
+            purpose: "approve_course_plan"
+        )
+    }
+
     static func agentFailureMessage(
         turnWasAccepted: Bool,
         submissionRestored: Bool,
-        agentName: String = "Codex"
+        dispatchMayHaveOccurred: Bool = false,
+        agentName: String = "Codex",
+        preservesLearnerDraft: Bool = true
     ) -> String {
         if turnWasAccepted {
             return "\(agentName) started this request, but the reply did not finish loading. Reopen the chat to check the thread."
         }
+        if dispatchMayHaveOccurred {
+            guard preservesLearnerDraft else {
+                return "Learnfold couldn’t confirm whether \(agentName) received that request. Check the course before trying again."
+            }
+            return "Learnfold couldn’t confirm whether \(agentName) received that message. Your draft and sources are preserved—check the conversation before sending again."
+        }
         if submissionRestored {
-            return "\(agentName) couldn’t send that yet. Your message and sources are still here—try again."
+            return "Message not sent. Your message and sources are restored below—edit them or try again."
         }
         return "\(agentName) couldn’t start this request. Check the connection and try again."
     }
 
-    static func appleAgentFailureMessage(_ error: any Error) -> String {
+    static func appleAgentFailureMessage(
+        _ error: any Error,
+        agentName: String = "Apple"
+    ) -> String {
         if
             let courseError = error as? AppleCourseAgentError,
             let description = courseError.errorDescription,
@@ -3736,7 +6634,7 @@ final class CourseExperienceStore {
             return description
         }
         if error is CancellationError {
-            return "Apple Private Cloud did not finish that request. Please try again."
+            return "\(agentName) did not finish that request. Please try again."
         }
         if isAppleModelAssetUnavailable(error) {
             return """
@@ -3745,6 +6643,18 @@ final class CourseExperienceStore {
             """
         }
         return "Apple’s model couldn’t complete this request. Please try again."
+    }
+
+    static func hostedAgentFailureMessage(_ error: any Error) -> String {
+        if let hostedError = error as? HostedCourseAgentRuntimeError,
+           let description = hostedError.errorDescription,
+           !description.isEmpty {
+            return description
+        }
+        if error is CancellationError {
+            return "Hosted did not finish that request. Please try again."
+        }
+        return "Hosted couldn’t complete this request. Check the connection and try again."
     }
 
     private static func isAppleModelAssetUnavailable(_ error: any Error) -> Bool {
@@ -3775,6 +6685,12 @@ final class CourseExperienceStore {
         appModel: AppModel,
         appState: AppState
     ) {
+        if mainSubmissionRecoveryState == .acceptanceUnknown
+            || mainSubmissionRecoveryState == .acceptedReplyIncomplete {
+            backgroundGenerationErrorCourseID = course.id
+            backgroundGenerationError = "Resolve the preserved course-agent message before generating another section."
+            return
+        }
         guard backgroundGeneratingNodeID == nil else {
             backgroundGenerationErrorCourseID = course.id
             backgroundGenerationError = "Another course section is already being generated. Wait for it to finish."
@@ -3791,7 +6707,7 @@ final class CourseExperienceStore {
             return
         }
 
-        guard let generationTarget = Self.directGenerationTarget(
+        guard let generationRequest = Self.directGenerationRequest(
             for: node,
             runtimeID: activeAgentID
         ) else {
@@ -3799,9 +6715,19 @@ final class CourseExperienceStore {
             backgroundGenerationError = "\(node.title) doesn’t have a lesson ready to generate yet."
             return
         }
+        let generationTarget = generationRequest.target
 
         let workspaceID = currentCourseWorkspaceID
         let prompt = Self.targetedGenerationPrompt(for: generationTarget)
+        let attempt = CourseAgentDispatchAttempt(
+            id: UUID(),
+            workspaceID: workspaceID,
+            promptText: prompt,
+            learnerText: nil,
+            sources: [],
+            target: mainDispatchTarget(),
+            optimisticMessageID: nil
+        )
 
         let scope = CourseChatScope.main
         guard let runToken = chatRuns.begin(scope) else {
@@ -3811,7 +6737,7 @@ final class CourseExperienceStore {
         }
         guard let generation = backgroundGenerations.begin(
             courseID: course.id,
-            nodeID: node.id,
+            nodeID: generationTarget.id,
             runToken: runToken
         ) else {
             chatRuns.finish(scope, token: runToken)
@@ -3820,7 +6746,7 @@ final class CourseExperienceStore {
             return
         }
         backgroundGeneratingCourseID = course.id
-        backgroundGeneratingNodeID = node.id
+        backgroundGeneratingNodeID = generationTarget.id
         backgroundGenerationError = nil
         backgroundGenerationErrorCourseID = nil
         agentError = nil
@@ -3847,7 +6773,7 @@ final class CourseExperienceStore {
                     )
                 } catch {
                     self.backgroundGenerationErrorCourseID = course.id
-                    self.backgroundGenerationError = "Couldn’t prepare \(node.title) for generation."
+                    self.backgroundGenerationError = "Couldn’t prepare \(generationTarget.title) for generation."
                     return
                 }
             }
@@ -3858,15 +6784,12 @@ final class CourseExperienceStore {
             }
 
             await self.forwardToAgent(
-                text: prompt,
-                originalText: nil,
-                submittedSources: [],
-                optimisticMessageID: nil,
+                attempt: attempt,
+                transcriptVisibility: .internalInstruction,
                 selectionContextID: nil,
                 selectionDiscussionID: nil,
                 scope: scope,
                 runToken: runToken,
-                workspaceID: workspaceID,
                 appModel: appModel,
                 appState: appState
             )
@@ -3875,7 +6798,7 @@ final class CourseExperienceStore {
             self.courseWorkspaceRefreshVersion += 1
             if let agentError = self.agentError {
                 self.backgroundGenerationErrorCourseID = course.id
-                self.backgroundGenerationError = "The course agent couldn’t generate \(node.title): \(agentError)"
+                self.backgroundGenerationError = "The course agent couldn’t generate \(generationTarget.title): \(agentError)"
             }
         }
         backgroundNodeGenerationTask = task
@@ -3900,7 +6823,29 @@ final class CourseExperienceStore {
         of node: CourseLearningNode,
         runtimeID: String
     ) -> Bool {
-        directGenerationTarget(for: node, runtimeID: runtimeID) != nil
+        directGenerationRequest(for: node, runtimeID: runtimeID) != nil
+    }
+
+    static func directGenerationRequest(
+        for node: CourseLearningNode,
+        runtimeID: String
+    ) -> CourseDirectGenerationRequest? {
+        guard let target = directGenerationTarget(for: node, runtimeID: runtimeID) else {
+            return nil
+        }
+        let resolvesDescendant = target.id != node.id
+        let role = target.role?.displayName ?? (target.kind == .folder ? "Section" : "Page")
+        let sourceRole = node.role?.displayName ?? (node.kind == .folder ? "Section" : "Page")
+        return CourseDirectGenerationRequest(
+            target: target,
+            controlTitle: resolvesDescendant ? "Generate next" : "Generate",
+            accessibilityLabel: resolvesDescendant
+                ? "Generate next in \(sourceRole) \(node.title): \(role) \(target.title)"
+                : "Generate \(role) \(target.title)",
+            accessibilityHint: resolvesDescendant
+                ? "Generates \(target.title), the first pending page in this section."
+                : "Generates this \(role.lowercased()) with your course agent."
+        )
     }
 
     static func directGenerationTarget(
@@ -3917,7 +6862,7 @@ final class CourseExperienceStore {
         }).first {
             return pendingLesson
         }
-        return node.kind == .folder && node.pageID != nil ? node : nil
+        return nil
     }
 
     func persistAppleGenerationTarget(
@@ -3935,6 +6880,7 @@ final class CourseExperienceStore {
         let page = try await repository.pageSnapshot(id: pageID)
         let target = PreparedCourseLessonTarget(
             nodeID: node.id,
+            title: node.title,
             pageID: pageID,
             revision: page.revision,
             courseRole: page.document.root.data["course_role"]?.stringValue
@@ -3945,10 +6891,128 @@ final class CourseExperienceStore {
         try JSONEncoder().encode(target).write(to: targetURL, options: .atomic)
     }
 
+    private func appleLessonTarget(
+        workspaceID: String,
+        selectionDiscussionID: UUID?
+    ) async throws -> PreparedCourseLessonTarget? {
+        guard let selectionDiscussionID else { return nil }
+        guard let discussion = selectionDiscussion(id: selectionDiscussionID),
+              discussion.status == .unresolved,
+              self.workspaceID(for: discussion) == workspaceID else {
+            throw AppleCourseAgentError.toolFailed(
+                "The selected course page is no longer available. No course content was changed."
+            )
+        }
+        guard let reference = discussion.reference else {
+            throw AppleCourseAgentError.toolFailed(
+                "The selected passage is no longer available. No course content was changed."
+            )
+        }
+        return try await prepareAppleSelectionLessonTarget(
+            reference: reference,
+            workspaceID: workspaceID
+        )
+    }
+
+    func prepareAppleSelectionLessonTarget(
+        reference: CourseTextReference,
+        workspaceID: String
+    ) async throws -> PreparedCourseLessonTarget {
+        let pageID = reference.pageID
+        let courseDirectory = courseDatabaseURL(workspaceID: workspaceID)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        guard let approvedPlan = AppleCourseApprovalPolicy.approvedPlan(
+            courseDirectory: courseDirectory
+        ) else {
+            throw AppleCourseAgentError.toolFailed(
+                "Course changes are locked until the learner approves the latest plan. No course content was changed."
+            )
+        }
+        let repository = try await CourseDocumentRegistry.shared.repository(
+            workspaceID: workspaceID,
+            databaseURL: courseDatabaseURL(workspaceID: workspaceID),
+            rootTitle: approvedPlan.title
+        )
+        let page = try await repository.pageSnapshot(id: pageID)
+        guard Self.selectionReferenceIsCurrent(reference, document: page.document) else {
+            throw AppleCourseAgentError.toolFailed(
+                "The selected passage changed before Learnfold could edit it. No course content was changed. Select the current passage and try again."
+            )
+        }
+        guard let nodeID = page.document.root.data["course_node_id"]?.stringValue,
+              !nodeID.isEmpty else {
+            throw AppleCourseAgentError.toolFailed(
+                "The selected course page no longer matches the approved hierarchy. No course content was changed."
+            )
+        }
+
+        let plannedMatches = Self.flattenLearningNodes(approvedPlan.plannedLearningPath)
+            .filter { $0.id == nodeID }
+        let outline = try await repository.outline()
+        let liveMatches = Self.flattenLearningNodes(outline.allPages)
+            .filter { $0.id == nodeID }
+        guard plannedMatches.count == 1,
+              liveMatches.count == 1,
+              liveMatches[0].pageID == pageID,
+              plannedMatches[0].role == liveMatches[0].role else {
+            throw AppleCourseAgentError.toolFailed(
+                "The selected course page no longer matches the approved hierarchy. No course content was changed."
+            )
+        }
+
+        return PreparedCourseLessonTarget(
+            nodeID: nodeID,
+            title: page.title,
+            pageID: pageID,
+            revision: page.revision,
+            courseRole: liveMatches[0].role?.rawValue
+        )
+    }
+
+    private static func selectionReferenceIsCurrent(
+        _ reference: CourseTextReference,
+        document: BlockDocument
+    ) -> Bool {
+        let blocks = document.flattenedNodes()
+        let storedPath = BlockPath(reference.pathIndices)
+        guard let block = reference.blockID.flatMap({ blockID in
+            blocks.first(where: { $0.node.stableBlockID == blockID })
+        }) ?? blocks.first(where: { $0.path == storedPath }),
+              let blockText = block.node.delta?.plainText else {
+            return false
+        }
+        let selectedText = reference.selectedText
+        let selected = selectedText as NSString
+        guard selected.length > 0 else { return false }
+        let fullText = blockText as NSString
+        let preferred = NSRange(
+            location: reference.rangeLocation,
+            length: reference.rangeLength
+        )
+        if preferred.location >= 0,
+           preferred.length > 0,
+           NSMaxRange(preferred) <= fullText.length {
+            let preferredText = fullText.substring(with: preferred)
+            if reference.wasTruncated {
+                if preferredText.hasPrefix(selectedText) {
+                    return true
+                }
+            } else if preferredText == selectedText {
+                return true
+            }
+        }
+        return fullText.range(of: selectedText).location != NSNotFound
+    }
+
     static func targetedGenerationPrompt(for node: CourseLearningNode) -> String {
         let targetKind = node.kind == .folder ? "course section" : "module"
         let pageContext = node.pageID.map { " Its native editor page ID is \($0)." } ?? ""
-        return "Generate only the \(targetKind) ‘\(node.title)’ (node ID: \(node.id)).\(pageContext) This request was started from the Learn screen, so work autonomously without asking for confirmation unless blocked. Use native-editor-fetch to reread the learner-profile, course-design, agent-notes, this page, and relevant completed lessons. Mark only this page generating with native-editor-update-page using its latest revision. Create a titled native page for every planned child lesson or subchapter, including children whose content will remain pending, so the learner can see and generate each one separately. Then generate only the requested content and mark completed pages generated. A folder must be generated when all its planned children are generated, pending_generation when all are pending, and partially_generated when their states are mixed; never leave a folder pending_generation when all of its children are generated. Apply the same rule to ancestors. Never generate siblings or later sections, and never create Markdown lesson files."
+        let instruction = "Generate only the existing approved \(targetKind) ‘\(node.title)’ (node ID: \(node.id)).\(pageContext) This request was started from the Learn screen, so work autonomously without asking for confirmation unless blocked. Learnfold already created the root, context pages, and complete approved hierarchy. Use native-editor-fetch to reread the learner-profile, course-design, agent-notes, this exact page, and relevant completed lessons. Fetch the exact target immediately before changing it, pass its latest revision as expected_revision, mark and update only that existing page, and then mark it generated. Never create, recreate, reorder, or extend the hierarchy; never update the root, context pages, ancestors, siblings, or later pages. Never create a missing planned page yourself. If this page or any planned page is missing, stop and report that the course shell must be repaired. Folder status is Learnfold-owned roll-up state; do not update a folder or ancestor yourself. Never create Markdown lesson files."
+        return CourseAgentInternalPromptPolicy.wrap(
+            instruction,
+            purpose: "generate_course_node"
+        )
     }
 
     private enum CourseAgentContextConfigurationResult {
@@ -3979,30 +7043,30 @@ final class CourseExperienceStore {
         guard let loadedBrief = courseBrief(for: course) else {
             return blocked("Learnfold could not read this course’s context. The course files may be missing or incomplete.")
         }
-        let hasRecoverableDraft = !sources.isEmpty || pendingOutboundText != nil
-        guard workspaceID == currentCourseWorkspaceID || !hasRecoverableDraft else {
-            return blocked("Send or remove the recovered draft and its sources before switching courses.")
+        let switchesWorkspace = workspaceID != currentCourseWorkspaceID
+        guard !switchesWorkspace || pendingMainSubmission == nil else {
+            return blocked("Resolve the preserved outbound message before switching courses.")
         }
-        let preservesCurrentDraft = workspaceID == currentCourseWorkspaceID && hasRecoverableDraft
+        persistCurrentMainComposerDraft()
         currentCourseWorkspaceID = workspaceID
         currentWorkspaceWasBuilt = true
         generatedCourseID = course.id
         brief = loadedBrief
         showsBrief = false
-        if !preservesCurrentDraft {
-            pendingOutboundText = nil
-            pendingOutboundSources = []
-            pendingSelectionDiscussionID = nil
-            sources = []
-            defaults.removeObject(forKey: Self.draftSourcesKey)
+        if switchesWorkspace {
+            pendingMainSubmission = nil
+            mainSubmissionRecoveryState = nil
+            restoreMainComposerDraft(workspaceID: workspaceID)
         }
         agentError = nil
         generationError = nil
         currentAgentRuntimeID = course.agentRuntimeKind ?? "codex"
         currentAgentServerID = course.agentServerID
         currentAgentModelID = course.agentModelID
+        currentAgentReasoningEffortID = course.agentReasoningEffortID
         currentAppleSessionID = course.appleSessionID
-        if !preservesCurrentDraft || agentThreadKey == nil {
+        currentHostedSessionID = course.hostedSessionID
+        if switchesWorkspace || agentThreadKey == nil {
             agentThreadKey = Self.persistedAgentThreadKey(for: course)
         }
         connectionState = .idle
@@ -4022,6 +7086,25 @@ final class CourseExperienceStore {
     }
 
     func hydrateCourseThread(appModel: AppModel, appState: AppState) async {
+        if activeAgentID == CourseAgentProvider.hosted {
+            if currentHostedSessionID == nil {
+                currentHostedSessionID = UUID()
+                persistCurrentHostedSession()
+                persistDraftSources()
+            }
+            guard let sessionID = currentHostedSessionID else { return }
+            do {
+                let restored = try await hostedRuntime.restoredMessages(sessionID: sessionID)
+                messages = restored.map(Self.localMessage(from:))
+                connectionState = .connected
+                clearMainReadinessError()
+            } catch {
+                let message = "The Hosted conversation couldn’t be restored: \(error.localizedDescription)"
+                connectionState = .failed(message)
+                recordMainReadinessError(message)
+            }
+            return
+        }
         if CourseAgentProvider.isApple(activeAgentID) {
             if currentAppleSessionID == nil {
                 currentAppleSessionID = UUID()
@@ -4033,7 +7116,7 @@ final class CourseExperienceStore {
                     sessionID: sessionID,
                     workspaceID: currentCourseWorkspaceID
                 )
-                messages = restored.map(Self.localMessage(from:))
+                messages = Self.localMessages(from: restored)
             }
             return
         }
@@ -4041,6 +7124,25 @@ final class CourseExperienceStore {
         guard Self.isValidAppServerThreadID(key.threadId) else {
             agentThreadKey = nil
             return
+        }
+        let workspaceID = currentCourseWorkspaceID
+        let recoveryLease = currentAgentRuntimeID == "hermes"
+            ? hermesRecoveryLease(
+                workspaceID: workspaceID,
+                selectionDiscussionID: nil
+            )
+            : nil
+        if let recoveryLease {
+            do {
+                try beginHermesRecoveryLease(recoveryLease)
+            } catch {
+                return
+            }
+        }
+        defer {
+            if let recoveryLease {
+                endHermesRecoveryLease(recoveryLease)
+            }
         }
         var hermesRecoveryKey = currentAgentRuntimeID == "hermes" ? key : nil
         do {
@@ -4051,38 +7153,56 @@ final class CourseExperienceStore {
                     includeTurns: true
                 )
             )
+            if let recoveryLease {
+                try requireCurrentHermesRecoveryLease(recoveryLease)
+            }
             await appModel.refreshSnapshot()
+            if let recoveryLease {
+                try requireCurrentHermesRecoveryLease(recoveryLease)
+            }
             var hydratedKey = await appModel.hydrateThreadPermissions(
                 for: loadedKey,
                 appState: appState
             ) ?? loadedKey
+            if let recoveryLease {
+                try requireCurrentHermesRecoveryLease(recoveryLease)
+            }
             if currentAgentRuntimeID == "hermes" {
                 hydratedKey = try await refreshRemoteHermesThreadProtocol(
                     key: hydratedKey,
-                    workspaceID: currentCourseWorkspaceID,
+                    workspaceID: workspaceID,
                     appModel: appModel
                 )
+                try requireCurrentHermesRecoveryLease(recoveryLease!)
                 hermesRecoveryKey = hydratedKey
             }
             agentThreadKey = hydratedKey
             await appModel.loadInitialTurnsIfNeeded(threadId: hydratedKey)
+            if let recoveryLease {
+                try requireCurrentHermesRecoveryLease(recoveryLease)
+            }
             if currentAgentRuntimeID == "hermes" {
                 installDocumentToolRouterIfNeeded(appModel: appModel)
                 await CourseDocumentRegistry.shared.register(
                     threadID: hydratedKey.threadId,
-                    workspaceID: currentCourseWorkspaceID
+                    workspaceID: workspaceID
                 )
-                if let expectedTurnID = try await reconcilePendingHermesSubmissionIntent(
+                try requireCurrentHermesRecoveryLease(recoveryLease!)
+                if let pendingTurn = try await reconcilePendingHermesSubmissionIntent(
                     key: hydratedKey,
-                    workspaceID: currentCourseWorkspaceID,
+                    workspaceID: workspaceID,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
-                )?.expectedTurnID {
+                ), let expectedTurnID = pendingTurn.expectedTurnID {
+                    try requireCurrentHermesRecoveryLease(recoveryLease!)
                     do {
                         try await hydrateRemoteHermesResponse(
                             for: hydratedKey,
                             expectedTurnID: expectedTurnID,
-                            workspaceID: currentCourseWorkspaceID,
+                            workspaceID: workspaceID,
                             selectionDiscussionID: nil,
+                            transcriptVisibility: Self.transcriptVisibility(for: pendingTurn),
+                            recoveryLease: recoveryLease!,
                             appModel: appModel
                         )
                     } catch is CancellationError {
@@ -4098,7 +7218,7 @@ final class CourseExperienceStore {
                         try persistPendingHermesExpectedTurn(
                             nil,
                             key: hydratedKey,
-                            workspaceID: currentCourseWorkspaceID,
+                            workspaceID: workspaceID,
                             terminalError: error.localizedDescription
                         )
                         throw error
@@ -4106,14 +7226,20 @@ final class CourseExperienceStore {
                 }
                 try await recoverPendingRemoteHermesTool(
                     for: hydratedKey,
-                    workspaceID: currentCourseWorkspaceID,
+                    workspaceID: workspaceID,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
                 )
+                try requireCurrentHermesRecoveryLease(recoveryLease!)
                 await reconcileGeneratedCourseIfReady(
-                    workspaceID: currentCourseWorkspaceID
+                    workspaceID: workspaceID
                 )
             }
         } catch {
+            if let recoveryLease,
+               (try? requireCurrentHermesRecoveryLease(recoveryLease)) == nil {
+                return
+            }
             if let hermesRecoveryKey {
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: hermesRecoveryKey,
@@ -4133,8 +7259,70 @@ final class CourseExperienceStore {
         }
     }
 
+    func checkSubmissionStatus(
+        selectionDiscussionID: UUID?,
+        appModel: AppModel,
+        appState: AppState
+    ) async {
+        guard let attemptID = pendingSubmission(
+            selectionDiscussionID: selectionDiscussionID
+        )?.id else { return }
+        if let selectionDiscussionID {
+            selectionDiscussionErrors[selectionDiscussionID] = nil
+            await prepareSelectionDiscussionThread(
+                id: selectionDiscussionID,
+                appModel: appModel,
+                appState: appState
+            )
+            guard pendingSubmission(
+                selectionDiscussionID: selectionDiscussionID
+            )?.id == attemptID else { return }
+            guard selectionDiscussionErrors[selectionDiscussionID] == nil else { return }
+            let refreshedState = submissionRecoveryState(for: selectionDiscussionID)
+            if refreshedState == .acceptedReplyIncomplete {
+                clearPendingOutboundSubmission(
+                    selectionDiscussionID: selectionDiscussionID,
+                    matching: attemptID
+                )
+            } else if refreshedState == .acceptanceUnknown {
+                selectionDiscussionErrors[selectionDiscussionID] =
+                    "The conversation was refreshed, but Learnfold still can’t prove whether that message was accepted. Review the thread before checking again or explicitly abandoning the local draft; sending it again could duplicate the request."
+            }
+        } else {
+            agentError = nil
+            await hydrateCourseThread(appModel: appModel, appState: appState)
+            guard pendingSubmission(selectionDiscussionID: nil)?.id == attemptID else {
+                return
+            }
+            guard agentError == nil else { return }
+            let refreshedState = submissionRecoveryState(for: nil)
+            if refreshedState == .acceptedReplyIncomplete {
+                clearPendingOutboundSubmission(
+                    selectionDiscussionID: nil,
+                    matching: attemptID
+                )
+            } else if refreshedState == .acceptanceUnknown {
+                agentError =
+                    "The conversation was refreshed, but Learnfold still can’t prove whether that message was accepted. Review the thread before checking again or explicitly abandoning the local draft; sending it again could duplicate the request."
+            }
+        }
+    }
+
     func refreshAgentReadiness(appModel: AppModel) async {
         let identity = mainCourseAgentReadinessIdentity()
+        if identity.runtimeID == CourseAgentProvider.hosted {
+            refreshHostedAvailability()
+            guard isCurrentMainAgentReadinessIdentity(identity) else { return }
+            connectionState = hostedAvailability.available
+                ? .connected
+                : .failed(hostedAvailability.reason)
+            if hostedAvailability.available {
+                clearMainReadinessError()
+            } else {
+                recordMainReadinessError(hostedAvailability.reason)
+            }
+            return
+        }
         if CourseAgentProvider.isApple(identity.runtimeID) {
             refreshAppleAvailability()
             guard isCurrentMainAgentReadinessIdentity(identity) else { return }
@@ -4320,9 +7508,13 @@ final class CourseExperienceStore {
             workspaceID: workspaceID,
             filename: "remote-hermes-tool-journal.json"
         )
+        let journalRevision = hermesRecoveryJournalRevision
         return RemoteHermesToolJournal(
             fileURL: location.url,
-            initializationError: location.error
+            initializationError: location.error,
+            onMutation: {
+                journalRevision.advance()
+            }
         )
     }
 
@@ -4333,14 +7525,27 @@ final class CourseExperienceStore {
             workspaceID: workspaceID,
             filename: "remote-hermes-submissions.json"
         )
+        let journalRevision = hermesRecoveryJournalRevision
         return RemoteHermesSubmissionJournal(
             fileURL: location.url,
-            initializationError: location.error
+            initializationError: location.error,
+            onMutation: {
+                journalRevision.advance()
+            }
         )
     }
 
     func courseControlDirectory(workspaceID: String) -> URL {
-        courseControlRootURL.appendingPathComponent(workspaceID, isDirectory: true)
+        guard CourseBashTool.isValidWorkspaceID(workspaceID) else {
+            return courseControlRootURL.appendingPathComponent(
+                ".invalid-hermes-workspace",
+                isDirectory: true
+            )
+        }
+        return courseControlRootURL.appendingPathComponent(
+            workspaceID,
+            isDirectory: true
+        )
     }
 
     private func removeCourseControlDirectory(workspaceID: String) {
@@ -4360,6 +7565,13 @@ final class CourseExperienceStore {
         workspaceID: String,
         filename: String
     ) -> (url: URL, error: String?) {
+        guard CourseBashTool.isValidWorkspaceID(workspaceID) else {
+            return (
+                courseControlDirectory(workspaceID: workspaceID)
+                    .appendingPathComponent(filename),
+                "The preserved Hermes workspace identity is invalid."
+            )
+        }
         let destination = courseControlDirectory(workspaceID: workspaceID)
             .appendingPathComponent(filename)
         guard !FileManager.default.fileExists(atPath: destination.path) else {
@@ -4461,7 +7673,8 @@ final class CourseExperienceStore {
                     agentServerID: pendingIdentity?.serverID,
                     agentThreadID: pendingIdentity?.threadID,
                     agentRuntimeKind: pendingIdentity?.runtimeID,
-                    agentModelID: pendingIdentity?.modelID
+                    agentModelID: pendingIdentity?.modelID,
+                    agentReasoningEffortID: pendingIdentity?.reasoningEffortID
                 ))
             } catch {
                 LLog.warn(
@@ -4544,7 +7757,16 @@ final class CourseExperienceStore {
         guard let metadataData = try? Data(contentsOf: metadataURL) else {
             return resolved.planID.isEmpty && resolved.title.isEmpty && resolved.chapters.isEmpty ? nil : resolved
         }
-        if let completeBrief = try? JSONDecoder().decode(CourseBrief.self, from: metadataData) {
+        if var completeBrief = try? JSONDecoder().decode(CourseBrief.self, from: metadataData) {
+            if contextualBrief != nil {
+                completeBrief.structureVersion = resolved.structureVersion
+                    ?? completeBrief.structureVersion
+                completeBrief.learningPath = resolved.learningPath
+                    ?? completeBrief.learningPath
+                if !resolved.chapters.isEmpty {
+                    completeBrief.chapters = resolved.chapters
+                }
+            }
             return completeBrief
         }
         guard let metadata = try? JSONDecoder().decode(CourseWorkspaceMetadata.self, from: metadataData) else {
@@ -4557,8 +7779,12 @@ final class CourseExperienceStore {
         resolved.summary = metadata.summary ?? resolved.summary
         resolved.outcome = metadata.outcome ?? resolved.outcome
         resolved.estimatedDuration = metadata.estimatedDuration ?? resolved.estimatedDuration
-        resolved.learningPath = metadata.learningPath ?? resolved.learningPath
-        if let workspaceChapters = metadata.chapters, !workspaceChapters.isEmpty {
+        resolved.structureVersion = resolved.structureVersion ?? metadata.structureVersion
+        resolved.learningPath = resolved.learningPath ?? metadata.learningPath
+        if let workspaceChapters = metadata.chapters,
+           !workspaceChapters.isEmpty,
+           resolved.structureVersion != CoursePlanHierarchyPolicy.currentStructureVersion
+                || resolved.learningPath?.isEmpty != false {
             let approvedByID = Dictionary(uniqueKeysWithValues: resolved.chapters.map { ($0.id, $0) })
             resolved.chapters = workspaceChapters.map { chapter in
                 approvedByID[chapter.id] ?? CourseChapter(
@@ -4754,172 +7980,432 @@ final class CourseExperienceStore {
 
     func prepareApprovedCourseShell(
         brief: CourseBrief,
-        workspaceID: String
+        workspaceID: String,
+        beforeCommit: ((Int) async throws -> Void)? = nil
     ) async throws -> PreparedCourseLessonTarget {
+        if let issue = AppleCoursePlanValidator.issue(in: brief) {
+            throw AppleCourseAgentError.toolFailed(
+                "The approved course plan is invalid: \(issue)."
+            )
+        }
+        guard !brief.plannedLearningPath.isEmpty,
+              let firstLeaf = CoursePlanHierarchyPolicy.firstContentLeaf(in: brief) else {
+            throw AppleCourseAgentError.toolFailed(
+                "The approved course plan does not contain a lesson, module, or explainer."
+            )
+        }
         let repository = try await CourseDocumentRegistry.shared.repository(
             workspaceID: workspaceID,
             databaseURL: courseDatabaseURL(workspaceID: workspaceID),
             rootTitle: brief.title
         )
-        let root = try await repository.rootPageSnapshot()
-        var outline = try await repository.outline()
-        var existingNodeIDs = Set(Self.flattenLearningNodes(outline.allPages).map(\.id))
-        var pages: [[String: Any]] = []
 
-        func appendPage(
-            nodeID: String,
+        for attempt in 0..<4 {
+            let base = try await repository.workspaceSnapshotWithGeneration()
+            let staged = try Self.stageApprovedCourseShell(
+                brief: brief,
+                firstLeaf: firstLeaf,
+                workspace: base.workspace
+            )
+            try await beforeCommit?(attempt)
+            do {
+                try await repository.replaceApprovedWorkspace(
+                    staged.workspace,
+                    expectedGeneration: base.generation
+                )
+            } catch LibraryStoreError.workspaceGenerationConflict where attempt < 3 {
+                continue
+            } catch LibraryStoreError.workspaceGenerationConflict {
+                throw AppleCourseAgentError.toolFailed(
+                    "The course changed repeatedly while Learnfold prepared its approved structure. Review the latest pages and try again."
+                )
+            }
+
+            let lesson = try await repository.pageSnapshot(id: staged.firstLeafPageID)
+            let target = PreparedCourseLessonTarget(
+                nodeID: firstLeaf.id,
+                title: firstLeaf.title,
+                pageID: staged.firstLeafPageID,
+                revision: lesson.revision,
+                courseRole: firstLeaf.role?.rawValue
+            )
+            let targetData = try JSONEncoder().encode(target)
+            try targetData.write(
+                to: courseDatabaseURL(workspaceID: workspaceID)
+                    .deletingLastPathComponent()
+                    .appendingPathComponent(AppleCourseApprovalPolicy.lessonTargetFilename),
+                options: .atomic
+            )
+            return target
+        }
+        throw AppleCourseAgentError.toolFailed(
+            "The course changed repeatedly while Learnfold prepared its approved structure. Review the latest pages and try again."
+        )
+    }
+
+    private struct StagedApprovedCourseShell {
+        let workspace: PageWorkspace
+        let firstLeafPageID: String
+    }
+
+    private static func stageApprovedCourseShell(
+        brief: CourseBrief,
+        firstLeaf: CourseLearningNode,
+        workspace originalWorkspace: PageWorkspace
+    ) throws -> StagedApprovedCourseShell {
+        typealias PageLocation = (
+            pageID: String,
+            parentPageID: String,
             title: String,
-            role: String,
-            status: String,
-            content: String
-        ) {
-            guard !existingNodeIDs.contains(nodeID) else { return }
-            existingNodeIDs.insert(nodeID)
-            pages.append([
-                "properties": [
-                    "title": title,
-                    "course_node_id": nodeID,
-                    "course_role": role,
-                    "generation_status": status,
-                ],
-                "content": content,
-            ])
+            role: String?
+        )
+        struct ContextPageSpec {
+            let nodeID: String
+            let title: String
+            let role: String
+            let content: String
         }
 
-        appendPage(
-            nodeID: "learner-profile",
-            title: "Learner profile",
-            role: "context",
-            status: "generated",
-            content: """
-            # Learner profile
+        var workspace = originalWorkspace
+        guard let originalRoot = workspace.page(id: workspace.rootPageID) else {
+            throw NativeEditorMCPError.pageNotFound(workspace.rootPageID)
+        }
+        var rootDocument = originalRoot.document
+        rootDocument.root.data["course_node_id"] = .string(brief.planID)
+        rootDocument.root.data["course_role"] = .string("course")
+        rootDocument.root.data["course_bootstrap_status"] = .string("building")
+        try workspace.renamePage(originalRoot.id, to: brief.title)
+        try workspace.saveDocument(rootDocument, for: originalRoot.id)
 
-            **Starting point:** \(brief.startingPoint)
-
-            **Focus gap:** \(brief.focusGap)
-            """
-        )
-        appendPage(
-            nodeID: "course-design",
-            title: "Course design",
-            role: "context",
-            status: "generated",
-            content: """
-            # Course design
-
-            \(brief.summary)
-
-            **Outcome:** \(brief.outcome)
-
-            **Estimated duration:** \(brief.estimatedDuration)
-            """
-        )
-        appendPage(
-            nodeID: "agent-notes",
-            title: "Agent notes",
-            role: "context",
-            status: "generated",
-            content: """
-            # Agent notes
-
-            Approved plan: \(brief.planID), revision \(brief.revision).
-
-            Generate Chapter 1 now. Keep later chapters pending so they can adapt to the learner.
-            """
-        )
-        for chapter in brief.chapters {
-            let deliverables = chapter.deliverables.map { "- \($0)" }.joined(separator: "\n")
-            appendPage(
-                nodeID: chapter.id,
-                title: chapter.title,
-                role: "chapter",
-                status: "pending_generation",
+        let contextSpecs = [
+            ContextPageSpec(
+                nodeID: "learner-profile",
+                title: "Learner profile",
+                role: "context",
                 content: """
-                # \(chapter.title)
+                # Learner profile
+
+                **Starting point:** \(brief.startingPoint)
+
+                **Focus gap:** \(brief.focusGap)
+                """
+            ),
+            ContextPageSpec(
+                nodeID: "course-design",
+                title: "Course design",
+                role: "context",
+                content: """
+                # Course design
+
+                \(brief.summary)
+
+                **Outcome:** \(brief.outcome)
+
+                **Estimated duration:** \(brief.estimatedDuration)
+                """
+            ),
+            ContextPageSpec(
+                nodeID: "agent-notes",
+                title: "Agent notes",
+                role: "agent_notes",
+                content: """
+                # Agent notes
+
+                Approved plan: \(brief.planID), revision \(brief.revision).
+
+                Generate only “\(firstLeaf.title)” (node ID: \(firstLeaf.id), role: \
+                \(firstLeaf.role?.rawValue ?? "learning page")) in the approval turn. Keep every sibling \
+                and later page pending so they can adapt to the learner.
+                """
+            ),
+        ]
+
+        func locations(in outline: CourseDocumentOutline) throws -> [String: PageLocation] {
+            var result: [String: PageLocation] = [:]
+            func collect(_ nodes: [CourseLearningNode], parentPageID: String) throws {
+                for node in nodes {
+                    guard let pageID = node.pageID else { continue }
+                    guard result[node.id] == nil else {
+                        throw AppleCourseAgentError.toolFailed(
+                            "The existing course contains duplicate course_node_id \(node.id)."
+                        )
+                    }
+                    result[node.id] = (pageID, parentPageID, node.title, node.role?.rawValue)
+                    try collect(node.children, parentPageID: pageID)
+                }
+            }
+            try collect(outline.allPages, parentPageID: outline.rootPageID)
+            return result
+        }
+
+        let initialOutline = try CourseDocumentRepository.outline(from: originalWorkspace)
+        let initialLocations = try locations(in: initialOutline)
+        if initialLocations[brief.planID] != nil {
+            throw AppleCourseAgentError.toolFailed(
+                "The existing course reuses the reserved plan ID as a child course_node_id."
+            )
+        }
+
+        for spec in contextSpecs {
+            guard let existing = initialLocations[spec.nodeID] else { continue }
+            guard let page = originalWorkspace.page(id: existing.pageID) else {
+                throw NativeEditorMCPError.pageNotFound(existing.pageID)
+            }
+            let existingRole = page.document.root.data["course_role"]?.stringValue
+            let preservesLegacyAgentNotesIdentity = spec.nodeID == "agent-notes"
+                && existing.parentPageID == originalWorkspace.rootPageID
+                && existing.title == spec.title
+                && existingRole == "context"
+            guard existing.parentPageID == originalWorkspace.rootPageID,
+                  existing.title == spec.title,
+                  existingRole == spec.role || preservesLegacyAgentNotesIdentity else {
+                throw AppleCourseAgentError.toolFailed(
+                    "Reserved course node \(spec.nodeID) has conflicting title, parent, or role."
+                )
+            }
+        }
+
+        let rootParentKey = "__learnfold_root__"
+        var expectedNodesByID: [String: CourseLearningNode] = [:]
+        var expectedParentNodeIDByID: [String: String] = [:]
+        var expectedChildrenByParentKey: [String: [String]] = [:]
+        func collectExpectedNodes(_ nodes: [CourseLearningNode], parentNodeID: String?) {
+            let parentKey = parentNodeID ?? rootParentKey
+            expectedChildrenByParentKey[parentKey] = nodes.map(\.id)
+            for node in nodes {
+                expectedNodesByID[node.id] = node
+                if let parentNodeID {
+                    expectedParentNodeIDByID[node.id] = parentNodeID
+                }
+                collectExpectedNodes(node.children, parentNodeID: node.id)
+            }
+        }
+        collectExpectedNodes(brief.plannedLearningPath, parentNodeID: nil)
+
+        func preflightExistingHierarchy(
+            _ existingNodes: [CourseLearningNode],
+            parentPageID: String,
+            parentKey: String
+        ) throws {
+            let expectedSiblingIDs = expectedChildrenByParentKey[parentKey] ?? []
+            let expectedSiblingIDSet = Set(expectedSiblingIDs)
+            let existingExpectedIDs = existingNodes.map(\.id).filter(expectedSiblingIDSet.contains)
+            guard existingExpectedIDs == Array(expectedSiblingIDs.prefix(existingExpectedIDs.count)) else {
+                throw AppleCourseAgentError.toolFailed(
+                    "The existing course hierarchy conflicts with the approved sibling order."
+                )
+            }
+
+            for existingNode in existingNodes {
+                guard let pageID = existingNode.pageID else { continue }
+                if let expectedNode = expectedNodesByID[existingNode.id] {
+                    let expectedParentPageID: String
+                    if let expectedParentNodeID = expectedParentNodeIDByID[existingNode.id] {
+                        guard let expectedParent = initialLocations[expectedParentNodeID] else {
+                            throw AppleCourseAgentError.toolFailed(
+                                "Course node \(existingNode.id) already exists with a different title, parent, or role."
+                            )
+                        }
+                        expectedParentPageID = expectedParent.pageID
+                    } else {
+                        expectedParentPageID = originalWorkspace.rootPageID
+                    }
+                    guard parentPageID == expectedParentPageID,
+                          existingNode.title == expectedNode.title,
+                          existingNode.role == expectedNode.role else {
+                        throw AppleCourseAgentError.toolFailed(
+                            "Course node \(existingNode.id) already exists with a different title, parent, or role."
+                        )
+                    }
+                } else {
+                    guard parentPageID == originalWorkspace.rootPageID,
+                          let page = originalWorkspace.page(id: pageID) else {
+                        throw AppleCourseAgentError.toolFailed(
+                            "The existing course hierarchy contains pages outside the approved plan."
+                        )
+                    }
+                    let role = page.document.root.data["course_role"]?.stringValue
+                    guard role == "context" || role == "agent_notes" else {
+                        throw AppleCourseAgentError.toolFailed(
+                            "The existing course hierarchy contains pages outside the approved plan."
+                        )
+                    }
+                }
+                try preflightExistingHierarchy(
+                    existingNode.children,
+                    parentPageID: pageID,
+                    parentKey: existingNode.id
+                )
+            }
+        }
+        try preflightExistingHierarchy(
+            initialOutline.allPages,
+            parentPageID: initialOutline.rootPageID,
+            parentKey: rootParentKey
+        )
+
+        func addPage(
+            title: String,
+            nodeID: String,
+            role: String,
+            status: String,
+            content: String,
+            parentPageID: String
+        ) throws -> PageRecord {
+            var document = try AppFlowyMarkdownCodec().decode(content)
+            document.root.data["course_node_id"] = .string(nodeID)
+            document.root.data["course_role"] = .string(role)
+            document.root.data["course_generation_status"] = .string(status)
+            let icon = role == "chapter" || role == "subchapter" ? "folder.fill" : "doc.text"
+            let page = try workspace.createPage(
+                title: title,
+                parentID: parentPageID,
+                icon: icon,
+                document: document
+            )
+            if var parentDocument = workspace.page(id: parentPageID)?.document {
+                parentDocument.root.children.append(
+                    .childPage(pageID: page.id, title: page.title, icon: page.icon)
+                )
+                try workspace.saveDocument(parentDocument, for: parentPageID)
+            }
+            return page
+        }
+
+        for spec in contextSpecs where initialLocations[spec.nodeID] == nil {
+            _ = try addPage(
+                title: spec.title,
+                nodeID: spec.nodeID,
+                role: spec.role,
+                status: "generated",
+                content: spec.content,
+                parentPageID: workspace.rootPageID
+            )
+        }
+
+        func pageContent(for node: CourseLearningNode) -> String {
+            if node.role == .chapter,
+               let chapter = brief.chapters.first(where: { $0.id == node.id }) {
+                let deliverables = chapter.deliverables.map { "- \($0)" }.joined(separator: "\n")
+                return """
+                # \(node.title)
 
                 \(chapter.objective)
 
-                ## Planned deliverables
+                ## Planned outcomes
                 \(deliverables)
                 """
-            )
-        }
-        if !pages.isEmpty {
-            try await callDocumentTool(
-                repository,
-                name: NativeEditorMCPToolCatalog.createPages,
-                object: [
-                    "parent": ["page_id": root.id],
-                    "pages": pages,
-                ]
-            )
+            }
+            if node.role?.isFolder == true {
+                return """
+                # \(node.title)
+
+                This planned subchapter contains the pages shown below.
+                """
+            }
+            return """
+            # \(node.title)
+
+            This planned \(node.role?.rawValue ?? "lesson") is ready for the course agent to write.
+            """
         }
 
-        outline = try await repository.outline()
-        var refreshedNodeIDs = Set(Self.flattenLearningNodes(outline.allPages).map(\.id))
-        for (chapterIndex, chapter) in brief.chapters.enumerated() {
-            guard let chapterPageID = Self.flattenLearningNodes(outline.learningPages)
-                .first(where: { $0.id == chapter.id })?.pageID else {
-                throw CocoaError(.fileReadCorruptFile)
+        func ensurePages(_ nodes: [CourseLearningNode], parentPageID: String) throws {
+            var outline = try CourseDocumentRepository.outline(from: workspace)
+            var pageLocations = try locations(in: outline)
+            let expectedIDs = nodes.map(\.id)
+            let expectedIDSet = Set(expectedIDs)
+            let existingChildren: [CourseLearningNode]
+            if parentPageID == outline.rootPageID {
+                existingChildren = outline.allPages
+            } else {
+                func find(_ candidates: [CourseLearningNode]) -> [CourseLearningNode]? {
+                    for candidate in candidates {
+                        if candidate.pageID == parentPageID { return candidate.children }
+                        if let match = find(candidate.children) { return match }
+                    }
+                    return nil
+                }
+                existingChildren = find(outline.allPages) ?? []
             }
-            let plannedLessons = chapter.deliverables.isEmpty
-                ? [chapter.title]
-                : chapter.deliverables
-            let lessonPages: [[String: Any]] = plannedLessons.enumerated().compactMap { lessonIndex, item in
-                let lessonTitle = item.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !lessonTitle.isEmpty else { return nil }
-                let lessonNodeID = "\(chapter.id)-lesson-\(lessonIndex + 1)"
-                guard !refreshedNodeIDs.contains(lessonNodeID) else { return nil }
-                refreshedNodeIDs.insert(lessonNodeID)
-                let numberedTitle = "\(chapterIndex + 1).\(lessonIndex + 1) · \(lessonTitle)"
-                return [
-                    "properties": [
-                        "title": numberedTitle,
-                        "course_node_id": lessonNodeID,
-                        "course_role": "lesson",
-                        "generation_status": "pending_generation",
-                    ],
-                    "content": """
-                    # \(lessonTitle)
+            let unexpectedChildren = existingChildren.filter { !expectedIDSet.contains($0.id) }
+            for unexpected in unexpectedChildren {
+                guard parentPageID == outline.rootPageID,
+                      let pageID = unexpected.pageID,
+                      let page = workspace.page(id: pageID) else {
+                    throw AppleCourseAgentError.toolFailed(
+                        "The existing course hierarchy contains pages outside the approved plan."
+                    )
+                }
+                let role = page.document.root.data["course_role"]?.stringValue
+                guard role == "context" || role == "agent_notes" else {
+                    throw AppleCourseAgentError.toolFailed(
+                        "The existing course hierarchy contains pages outside the approved plan."
+                    )
+                }
+            }
+            let existingOrderedIDs = existingChildren.map(\.id).filter(expectedIDSet.contains)
+            guard existingOrderedIDs == Array(expectedIDs.prefix(existingOrderedIDs.count)) else {
+                throw AppleCourseAgentError.toolFailed(
+                    "The existing course hierarchy conflicts with the approved sibling order."
+                )
+            }
 
-                    This planned lesson is ready for the course agent to write.
-                    """,
-                ]
+            for node in nodes {
+                guard let role = node.role else {
+                    throw AppleCourseAgentError.toolFailed(
+                        "The approved course hierarchy contains an untyped node."
+                    )
+                }
+                if let existing = pageLocations[node.id] {
+                    guard existing.parentPageID == parentPageID,
+                          existing.title == node.title,
+                          existing.role == role.rawValue else {
+                        throw AppleCourseAgentError.toolFailed(
+                            "Course node \(node.id) already exists with a different title, parent, or role."
+                        )
+                    }
+                } else {
+                    _ = try addPage(
+                        title: node.title,
+                        nodeID: node.id,
+                        role: role.rawValue,
+                        status: "pending_generation",
+                        content: pageContent(for: node),
+                        parentPageID: parentPageID
+                    )
+                }
             }
-            guard !lessonPages.isEmpty else { continue }
-            try await callDocumentTool(
-                repository,
-                name: NativeEditorMCPToolCatalog.createPages,
-                object: [
-                    "parent": ["page_id": chapterPageID],
-                    "pages": lessonPages,
-                ]
+
+            outline = try CourseDocumentRepository.outline(from: workspace)
+            pageLocations = try locations(in: outline)
+            for node in nodes {
+                guard let location = pageLocations[node.id],
+                      location.parentPageID == parentPageID,
+                      location.title == node.title,
+                      location.role == node.role?.rawValue else {
+                    throw AppleCourseAgentError.toolFailed(
+                        "Learnfold could not verify the approved course hierarchy after staging it."
+                    )
+                }
+                try ensurePages(node.children, parentPageID: location.pageID)
+            }
+        }
+
+        try ensurePages(brief.plannedLearningPath, parentPageID: workspace.rootPageID)
+        let verifiedOutline = try CourseDocumentRepository.outline(from: workspace)
+        let verifiedLocations = try locations(in: verifiedOutline)
+        guard let firstLeafLocation = verifiedLocations[firstLeaf.id],
+              firstLeafLocation.title == firstLeaf.title,
+              firstLeafLocation.role == firstLeaf.role?.rawValue else {
+            throw AppleCourseAgentError.toolFailed(
+                "Learnfold could not locate the first approved learning page."
             )
         }
-        outline = try await repository.outline()
-        guard let firstChapter = brief.chapters.first else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        let lessonNodeID = "\(firstChapter.id)-lesson-1"
-        guard let lessonPageID = Self.flattenLearningNodes(outline.learningPages)
-            .first(where: { $0.id == lessonNodeID })?.pageID else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        let lesson = try await repository.pageSnapshot(id: lessonPageID)
-        let target = PreparedCourseLessonTarget(
-            nodeID: lessonNodeID,
-            pageID: lessonPageID,
-            revision: lesson.revision,
-            courseRole: "lesson"
+        return StagedApprovedCourseShell(
+            workspace: workspace,
+            firstLeafPageID: firstLeafLocation.pageID
         )
-        let targetData = try JSONEncoder().encode(target)
-        try targetData.write(
-            to: courseDatabaseURL(workspaceID: workspaceID)
-                .deletingLastPathComponent()
-                .appendingPathComponent(AppleCourseApprovalPolicy.lessonTargetFilename),
-            options: .atomic
-        )
-        return target
     }
 
     private func markCourseReadyForLearning() async throws {
@@ -5224,31 +8710,52 @@ final class CourseExperienceStore {
     }
 
     private func forwardToAgent(
-        text: String,
-        originalText: String?,
-        submittedSources: [CourseSource],
-        optimisticMessageID: UUID?,
+        attempt: CourseAgentDispatchAttempt,
+        transcriptVisibility: CourseAgentTranscriptVisibility,
         selectionContextID: UUID?,
         selectionDiscussionID: UUID?,
         scope: CourseChatScope,
         runToken: UUID,
-        workspaceID: String,
         appModel: AppModel,
         appState: AppState
     ) async {
+        let workspaceID = attempt.workspaceID
+        let originalText = attempt.learnerText
+        let submittedSources = attempt.sources
+        let optimisticMessageID = attempt.optimisticMessageID
+        let runtimeID = attempt.target.runtimeID
+        let recoveryLease: HermesRecoveryLease?
+        if runtimeID == "hermes" {
+            let lease = hermesRecoveryLease(
+                workspaceID: workspaceID,
+                selectionDiscussionID: selectionDiscussionID
+            )
+            do {
+                try beginHermesRecoveryLease(lease)
+                recoveryLease = lease
+            } catch {
+                return
+            }
+        } else {
+            recoveryLease = nil
+        }
+        func requireHermesLeaseIfNeeded() throws {
+            if let recoveryLease {
+                try requireCurrentHermesRecoveryLease(recoveryLease)
+            }
+        }
         var turnWasAccepted = false
+        var turnDispatchStarted = false
         var hermesSubmissionIntentPersisted = false
         var acceptedHermesTurn: (key: ThreadKey, turnID: String)?
         var hermesThreadKey: ThreadKey?
         var ingestionReceipts: [CourseSourceIngestionReceipt] = []
-        var preparedAgentText = text
-        let discussionTarget = selectionDiscussionID
-            .flatMap { selectionDiscussion(id: $0)?.executionTarget }
-        let runtimeID = discussionTarget?.runtimeID
-            ?? currentAgentRuntimeID
-            ?? selectedAgentID
-            ?? "codex"
+        var preparedAgentText = attempt.promptText
+        let isLearnerSubmission = originalText != nil && optimisticMessageID != nil
         defer {
+            if let recoveryLease {
+                endHermesRecoveryLease(recoveryLease)
+            }
             if chatRuns.token(for: scope) == runToken {
                 switch chatRuns.phase(for: scope) {
                 case .stopping, .failed:
@@ -5269,9 +8776,44 @@ final class CourseExperienceStore {
                       workspaceID: workspaceID,
                       selectionDiscussionID: selectionDiscussionID
                   ) else { return }
+            if runtimeID == CourseAgentProvider.hosted {
+                let sessionID = try await prepareHostedAgentSubmission(
+                    workspaceID: workspaceID,
+                    selectionDiscussionID: selectionDiscussionID
+                )
+                chatRuns.transition(scope, token: runToken, to: .running)
+                turnDispatchStarted = true
+                if isLearnerSubmission {
+                    setSubmissionRecoveryState(
+                        .acceptanceUnknown,
+                        for: selectionDiscussionID,
+                        matching: attempt.id
+                    )
+                }
+                try await forwardToHostedAgent(
+                    text: attempt.promptText,
+                    workspaceID: workspaceID,
+                    sessionID: sessionID,
+                    transcriptVisibility: transcriptVisibility,
+                    selectionContextID: selectionContextID,
+                    selectionDiscussionID: selectionDiscussionID
+                )
+                turnWasAccepted = true
+                if isLearnerSubmission {
+                    clearPendingOutboundSubmission(
+                        selectionDiscussionID: selectionDiscussionID,
+                        matching: attempt.id
+                    )
+                }
+                return
+            }
             if CourseAgentProvider.isApple(runtimeID) {
                 let sessionID = try await prepareAppleAgentSubmission(
                     runtimeID: runtimeID,
+                    workspaceID: workspaceID,
+                    selectionDiscussionID: selectionDiscussionID
+                )
+                let lessonTarget = try await appleLessonTarget(
                     workspaceID: workspaceID,
                     selectionDiscussionID: selectionDiscussionID
                 )
@@ -5285,39 +8827,58 @@ final class CourseExperienceStore {
                     selectionDiscussionID: selectionDiscussionID
                 ) else { throw CancellationError() }
                 preparedAgentText = Self.agentTextForRuntime(
-                    text: text,
+                    text: attempt.promptText,
                     receipts: ingestionReceipts,
                     runtimeID: runtimeID
                 )
                 chatRuns.transition(scope, token: runToken, to: .running)
+                turnDispatchStarted = true
+                if isLearnerSubmission {
+                    setSubmissionRecoveryState(
+                        .acceptanceUnknown,
+                        for: selectionDiscussionID,
+                        matching: attempt.id
+                    )
+                }
                 try await forwardToAppleAgent(
                     text: preparedAgentText,
                     runtimeID: runtimeID,
                     workspaceID: workspaceID,
                     sessionID: sessionID,
+                    lessonTarget: lessonTarget,
+                    transcriptVisibility: transcriptVisibility,
                     onAccepted: {
                         turnWasAccepted = true
-                        self.clearPendingOutboundSubmission(
-                            selectionDiscussionID: selectionDiscussionID
-                        )
+                        if isLearnerSubmission {
+                            self.setSubmissionRecoveryState(
+                                .acceptedReplyIncomplete,
+                                for: selectionDiscussionID,
+                                matching: attempt.id
+                            )
+                        }
                     },
                     selectionContextID: selectionContextID,
                     selectionDiscussionID: selectionDiscussionID
                 )
+                if isLearnerSubmission {
+                    clearPendingOutboundSubmission(
+                        selectionDiscussionID: selectionDiscussionID,
+                        matching: attempt.id
+                    )
+                }
                 return
             }
 
             let serverID = try await connectedCourseServerID(
                 appModel: appModel,
-                preferredServerID: discussionTarget?.serverID
+                preferredServerID: attempt.target.serverID
             )
+            try requireHermesLeaseIfNeeded()
             if runtimeID == .codex {
                 guard try await appModel.ensureLocalAuthForThreadStart(serverId: serverID) else {
-                    if let originalText, let optimisticMessageID {
+                    if isLearnerSubmission {
                         restoreUnacceptedSubmission(
-                            text: originalText,
-                            submittedSources: submittedSources,
-                            optimisticMessageID: optimisticMessageID,
+                            attempt: attempt,
                             selectionDiscussionID: selectionDiscussionID
                         )
                     }
@@ -5329,6 +8890,13 @@ final class CourseExperienceStore {
                         agentNeedsAuthentication = true
                     }
                     let message = "Codex authentication was cancelled. Reconnect the agent to continue."
+                    if isLearnerSubmission {
+                        setSubmissionRecoveryState(
+                            .knownNotAccepted,
+                            for: selectionDiscussionID,
+                            matching: attempt.id
+                        )
+                    }
                     chatRuns.transition(scope, token: runToken, to: .failed(message))
                     if let selectionDiscussionID {
                         selectionDiscussionErrors[selectionDiscussionID] = message
@@ -5371,10 +8939,10 @@ final class CourseExperienceStore {
                     serverID: serverID,
                     runtimeID: runtimeID,
                     workspaceID: workspaceID,
-                    modelID: discussionTarget?.modelID,
-                    inheritsGlobalModel: selectionDiscussionID == nil,
+                    modelID: attempt.target.modelID,
                     appModel: appModel
                 )
+                try requireHermesLeaseIfNeeded()
                 guard !Task.isCancelled,
                       discussionWorkspaceIsAvailable(
                           workspaceID: workspaceID,
@@ -5386,7 +8954,8 @@ final class CourseExperienceStore {
                         selectionDiscussionID,
                         to: startedThreadKey,
                         runtimeID: runtimeID,
-                        modelID: discussionTarget?.modelID
+                        modelID: attempt.target.modelID,
+                        reasoningEffortID: attempt.target.reasoningEffortID
                     )
                 } else {
                     agentThreadKey = startedThreadKey
@@ -5407,6 +8976,7 @@ final class CourseExperienceStore {
                     workspaceID: workspaceID,
                     appModel: appModel
                 )
+                try requireHermesLeaseIfNeeded()
                 if selectionDiscussionID == nil {
                     agentThreadKey = threadKey
                     persistAgentThread(threadKey, workspaceID: workspaceID)
@@ -5422,16 +8992,19 @@ final class CourseExperienceStore {
                 databaseURL: courseDatabaseURL(workspaceID: workspaceID),
                 rootTitle: brief.title.isEmpty ? "New Course" : brief.title
             )
+            try requireHermesLeaseIfNeeded()
             _ = repository
             await CourseDocumentRegistry.shared.register(
                 threadID: threadKey.threadId,
                 workspaceID: workspaceID
             )
+            try requireHermesLeaseIfNeeded()
 
             if runtimeID == "hermes" {
                 if let pendingTurn = try await reconcilePendingHermesSubmissionIntent(
                     key: threadKey,
                     workspaceID: workspaceID,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
                 ), let pendingTurnID = pendingTurn.expectedTurnID {
                     try await hydrateRemoteHermesResponse(
@@ -5439,12 +9012,15 @@ final class CourseExperienceStore {
                         expectedTurnID: pendingTurnID,
                         workspaceID: workspaceID,
                         selectionDiscussionID: pendingTurn.selectionDiscussionID,
+                        transcriptVisibility: Self.transcriptVisibility(for: pendingTurn),
+                        recoveryLease: recoveryLease!,
                         appModel: appModel
                     )
                 }
                 try await recoverPendingRemoteHermesTool(
                     for: threadKey,
                     workspaceID: workspaceID,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
                 )
                 guard !hasPendingHermesRecovery(
@@ -5457,8 +9033,10 @@ final class CourseExperienceStore {
                 try await waitUntilRemoteHermesThreadIsIdle(
                     threadKey,
                     workspaceID: workspaceID,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
                 )
+                try requireHermesLeaseIfNeeded()
             }
 
             try Task.checkCancellation()
@@ -5470,13 +9048,14 @@ final class CourseExperienceStore {
                 submittedSources,
                 workspaceID: workspaceID
             )
+            try requireHermesLeaseIfNeeded()
             try Task.checkCancellation()
             guard discussionWorkspaceIsAvailable(
                 workspaceID: workspaceID,
                 selectionDiscussionID: selectionDiscussionID
             ) else { throw CancellationError() }
             preparedAgentText = Self.agentTextForRuntime(
-                text: text,
+                text: attempt.promptText,
                 receipts: ingestionReceipts,
                 runtimeID: runtimeID
             )
@@ -5494,25 +9073,25 @@ final class CourseExperienceStore {
                     isDirectory: true
                 )
             )
+            try requireHermesLeaseIfNeeded()
             let imageInputs = submittedSources.compactMap { source in
                 let image = source.image ?? restoredImageData[source.id].flatMap(UIImage.init(data:))
                 return image.flatMap(ConversationAttachmentSupport.prepareImage)?.userInput
             }
             let previousResponseTurnID = appModel.snapshot?.sessionSummaries
                 .first(where: { $0.key == threadKey })?.lastResponseTurnId
+            let newThreadModelID = startsNewThread ? attempt.target.modelID : nil
+            let newThreadReasoningEffortID = startsNewThread
+                ? attempt.target.reasoningEffortID
+                : nil
             let payload = AppComposerPayload(
                 text: preparedAgentText,
                 additionalInputs: imageInputs,
                 fileAttachments: fileAttachments,
                 approvalPolicy: .never,
                 sandboxPolicy: Self.courseTurnSandboxPolicy(runtimeID: runtimeID),
-                model: startsNewThread ? Self.modelForNewThread(
-                    scopedModelID: discussionTarget?.modelID,
-                    inheritsGlobalModel: selectionDiscussionID == nil,
-                    currentModelID: currentAgentModelID,
-                    selectedModelID: selectedModelID
-                ) : nil,
-                effort: startsNewThread ? ReasoningEffort(wireValue: selectedReasoningEffortID) : nil,
+                model: newThreadModelID,
+                effort: ReasoningEffort(wireValue: newThreadReasoningEffortID),
                 serviceTier: nil
             )
             try Task.checkCancellation()
@@ -5530,9 +9109,11 @@ final class CourseExperienceStore {
                         sortDirection: .descending
                     )
                 )
+                try requireHermesLeaseIfNeeded()
                 try persistPendingHermesSubmissionIntent(
                     key: threadKey,
                     workspaceID: workspaceID,
+                    attemptID: attempt.id,
                     previousTurnID: baselinePage.turnStates.first?.turnId,
                     selectionDiscussionID: selectionDiscussionID,
                     submittedText: preparedAgentText,
@@ -5542,15 +9123,51 @@ final class CourseExperienceStore {
                 )
                 hermesSubmissionIntentPersisted = true
             }
+            turnDispatchStarted = true
+            if isLearnerSubmission {
+                setSubmissionRecoveryState(
+                    .acceptanceUnknown,
+                    for: selectionDiscussionID,
+                    matching: attempt.id
+                )
+            }
             let submissionReceipt = try await appModel.startTurn(
                 key: threadKey,
                 payload: payload,
-                backgroundAgentName: runtimeID == "hermes" ? "Hermes" : "Codex",
+                backgroundAgentName: runtimeID.displayLabel,
                 keepsBackgroundAliveAcrossTurns: runtimeID == "hermes",
                 mayCreateBackgroundContinuation: true
             )
+            if submissionReceipt.kind == .queued, runtimeID != "hermes" {
+                throw NSError(
+                    domain: "LearnfoldCourseQueuedSubmission",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "The message entered the local send queue. Learnfold cannot prove whether it was dispatched, so check the conversation before sending it again."]
+                )
+            }
+            let acceptedHermesTurnID: String?
+            if runtimeID == "hermes" {
+                let turnID = try commitAcceptedHermesTurnReceipt(
+                    submissionReceipt,
+                    key: threadKey,
+                    workspaceID: workspaceID,
+                    selectionDiscussionID: selectionDiscussionID,
+                    recoveryLease: recoveryLease!
+                )
+                acceptedHermesTurn = (threadKey, turnID)
+                acceptedHermesTurnID = turnID
+            } else {
+                acceptedHermesTurnID = nil
+            }
             turnWasAccepted = true
-            clearPendingOutboundSubmission(selectionDiscussionID: selectionDiscussionID)
+            if isLearnerSubmission {
+                setSubmissionRecoveryState(
+                    .acceptedReplyIncomplete,
+                    for: selectionDiscussionID,
+                    matching: attempt.id
+                )
+            }
             chatRuns.transition(scope, token: runToken, to: .running)
             if let selectionDiscussionID,
                let index = selectionDiscussions.firstIndex(where: {
@@ -5561,19 +9178,18 @@ final class CourseExperienceStore {
             }
             lastAcceptedSelectionContextID = selectionContextID
             if runtimeID == "hermes" {
-                let acceptedTurnID = try Self.acceptedRemoteHermesTurnID(submissionReceipt)
-                acceptedHermesTurn = (threadKey, acceptedTurnID)
-                try persistPendingHermesExpectedTurn(
-                    acceptedTurnID,
-                    key: threadKey,
-                    workspaceID: workspaceID,
-                    selectionDiscussionID: selectionDiscussionID
-                )
+                guard let acceptedTurnID = acceptedHermesTurnID else {
+                    throw Self.remoteHermesRecoveryError(
+                        "Hermes accepted a turn without a durable correlation identifier."
+                    )
+                }
                 try await hydrateRemoteHermesResponse(
                     for: threadKey,
                     expectedTurnID: acceptedTurnID,
                     workspaceID: workspaceID,
                     selectionDiscussionID: selectionDiscussionID,
+                    transcriptVisibility: transcriptVisibility,
+                    recoveryLease: recoveryLease!,
                     appModel: appModel
                 )
                 if selectionDiscussionID == nil {
@@ -5585,7 +9201,14 @@ final class CourseExperienceStore {
                     previousResponseTurnID: previousResponseTurnID,
                     workspaceID: workspaceID,
                     selectionDiscussionID: selectionDiscussionID,
+                    transcriptVisibility: transcriptVisibility,
                     appModel: appModel
+                )
+            }
+            if isLearnerSubmission {
+                clearPendingOutboundSubmission(
+                    selectionDiscussionID: selectionDiscussionID,
+                    matching: attempt.id
                 )
             }
         } catch {
@@ -5598,20 +9221,37 @@ final class CourseExperienceStore {
                     )
                 )
             }
+            if let recoveryLease,
+               (try? requireCurrentHermesRecoveryLease(recoveryLease)) == nil {
+                return
+            }
             let submissionWasRestored = discussionWorkspaceIsAvailable(
                 workspaceID: workspaceID,
                 selectionDiscussionID: selectionDiscussionID
             )
                 && !turnWasAccepted
                 && !hermesSubmissionIntentPersisted
-                && originalText != nil
-                && optimisticMessageID != nil
-            if submissionWasRestored, let originalText, let optimisticMessageID {
-                restoreUnacceptedSubmission(
-                    text: originalText,
-                    submittedSources: submittedSources,
-                    optimisticMessageID: optimisticMessageID,
+                && isLearnerSubmission
+                && restoreUnacceptedSubmission(
+                    attempt: attempt,
                     selectionDiscussionID: selectionDiscussionID
+                )
+            let recoveryState: CourseAgentSubmissionRecoveryState? = if !isLearnerSubmission {
+                nil
+            } else if turnWasAccepted {
+                .acceptedReplyIncomplete
+            } else if turnDispatchStarted || hermesSubmissionIntentPersisted {
+                .acceptanceUnknown
+            } else if submissionWasRestored {
+                .knownNotAccepted
+            } else {
+                nil
+            }
+            if isLearnerSubmission {
+                setSubmissionRecoveryState(
+                    recoveryState,
+                    for: selectionDiscussionID,
+                    matching: attempt.id
                 )
             }
             guard !Task.isCancelled,
@@ -5649,12 +9289,23 @@ final class CourseExperienceStore {
             )
             let failureMessage = nsError.domain == "LearnfoldRemoteCourseTool"
                 ? nsError.localizedDescription
+                : runtimeID == CourseAgentProvider.hosted
+                    && !turnWasAccepted
+                    && !turnDispatchStarted
+                    ? Self.hostedAgentFailureMessage(error)
                 : CourseAgentProvider.isApple(runtimeID)
-                    ? Self.appleAgentFailureMessage(error)
+                    && !turnWasAccepted
+                    && !turnDispatchStarted
+                    ? Self.appleAgentFailureMessage(
+                        error,
+                        agentName: runtimeID.displayLabel
+                    )
                     : Self.agentFailureMessage(
                     turnWasAccepted: turnWasAccepted,
                     submissionRestored: submissionWasRestored,
-                    agentName: runtimeID == "hermes" ? "Hermes" : "Codex"
+                    dispatchMayHaveOccurred: turnDispatchStarted || hermesSubmissionIntentPersisted,
+                    agentName: runtimeID.displayLabel,
+                    preservesLearnerDraft: isLearnerSubmission
                 )
             chatRuns.transition(scope, token: runToken, to: .failed(failureMessage))
             if let selectionDiscussionID {
@@ -5767,16 +9418,118 @@ final class CourseExperienceStore {
         return sessionID
     }
 
+    private func prepareHostedAgentSubmission(
+        workspaceID: String,
+        selectionDiscussionID: UUID?
+    ) async throws -> UUID {
+        let availability = hostedRuntime.availability()
+        guard availability.available else {
+            throw HostedCourseAgentRuntimeError.unavailable(availability.reason)
+        }
+        _ = try await CourseDocumentRegistry.shared.repository(
+            workspaceID: workspaceID,
+            databaseURL: courseDatabaseURL(workspaceID: workspaceID),
+            rootTitle: brief.title.isEmpty ? "New Course" : brief.title
+        )
+
+        if let selectionDiscussionID {
+            guard let index = selectionDiscussions.firstIndex(where: {
+                $0.id == selectionDiscussionID && $0.status == .unresolved
+            }) else {
+                throw HostedCourseAgentRuntimeError.unavailable(
+                    "This focused discussion is no longer open."
+                )
+            }
+            if let existing = selectionDiscussions[index].hostedSessionID {
+                return existing
+            }
+            let sessionID = UUID()
+            selectionDiscussions[index].hostedSessionID = sessionID
+            persistSelectionDiscussions()
+            return sessionID
+        }
+        if let currentHostedSessionID { return currentHostedSessionID }
+        let sessionID = UUID()
+        currentHostedSessionID = sessionID
+        persistCurrentHostedSession()
+        persistDraftSources()
+        return sessionID
+    }
+
+    private func forwardToHostedAgent(
+        text: String,
+        workspaceID: String,
+        sessionID: UUID,
+        transcriptVisibility: CourseAgentTranscriptVisibility,
+        selectionContextID: UUID?,
+        selectionDiscussionID: UUID?
+    ) async throws {
+        let responseMessage = CourseChatMessage(
+            role: .agent,
+            text: "",
+            transcriptVisibility: transcriptVisibility
+        )
+        if let selectionDiscussionID {
+            selectionLocalMessages[selectionDiscussionID, default: []].append(responseMessage)
+        } else {
+            messages.append(responseMessage)
+        }
+
+        do {
+            try await hostedRuntime.send(
+                sessionID: sessionID,
+                workspaceID: workspaceID,
+                courseDirectory: nativeCourseDirectory(),
+                prompt: text,
+                onPartialResponse: { [weak self] partial in
+                    self?.updateLocalAgentMessage(
+                        id: responseMessage.id,
+                        text: partial,
+                        discussionID: selectionDiscussionID
+                    )
+                },
+                onCoursePlan: { [weak self] plan in
+                    guard let self else {
+                        throw HostedCourseAgentRuntimeError.toolFailed(
+                            "The course screen closed before the plan could be presented."
+                        )
+                    }
+                    try await self.acceptPresentedCoursePlan(plan)
+                    self.persistCurrentHostedSession()
+                }
+            )
+        } catch {
+            removeEmptyLocalAgentMessage(
+                id: responseMessage.id,
+                discussionID: selectionDiscussionID
+            )
+            throw error
+        }
+
+        if let selectionDiscussionID,
+           let index = selectionDiscussions.firstIndex(where: { $0.id == selectionDiscussionID }) {
+            selectionDiscussions[index].hasSubmittedQuestion = true
+            persistSelectionDiscussions()
+        }
+        lastAcceptedSelectionContextID = selectionContextID
+    }
+
     private func forwardToAppleAgent(
         text: String,
         runtimeID: String,
         workspaceID: String,
         sessionID: UUID,
+        lessonTarget: PreparedCourseLessonTarget?,
+        transcriptVisibility: CourseAgentTranscriptVisibility,
         onAccepted: @escaping @MainActor () -> Void,
         selectionContextID: UUID?,
         selectionDiscussionID: UUID?
     ) async throws {
-        let responseMessage = CourseChatMessage(role: .agent, text: "")
+        let responseMessage = CourseChatMessage(
+            role: .agent,
+            text: "",
+            transcriptVisibility: transcriptVisibility
+        )
         if let selectionDiscussionID {
             selectionLocalMessages[selectionDiscussionID, default: []].append(responseMessage)
         } else {
@@ -5789,6 +9542,7 @@ final class CourseExperienceStore {
                 providerID: runtimeID,
                 workspaceID: workspaceID,
                 prompt: text,
+                lessonTarget: lessonTarget,
                 onAccepted: onAccepted,
                 onPartialResponse: { [weak self] partial in
                     self?.updateLocalAgentMessage(
@@ -5841,54 +9595,104 @@ final class CourseExperienceStore {
         }
     }
 
-    private func restoreUnacceptedSubmission(
-        text: String,
-        submittedSources: [CourseSource],
-        optimisticMessageID: UUID,
+    private func pendingSubmission(
         selectionDiscussionID: UUID?
-    ) {
+    ) -> CourseAgentDispatchAttempt? {
         if let selectionDiscussionID {
-            selectionLocalMessages[selectionDiscussionID]?.removeAll {
-                $0.id == optimisticMessageID
-            }
-            selectionDiscussionDrafts[selectionDiscussionID] = text
-            selectionDiscussionSources[selectionDiscussionID] = Self.recoveredSources(
-                submitted: submittedSources,
-                current: selectionDiscussionSources[selectionDiscussionID] ?? []
-            )
-            if let discussion = selectionDiscussion(id: selectionDiscussionID),
-               let workspaceID = workspaceID(for: discussion) {
-                pendingSelectionSubmissions[selectionDiscussionID] = PendingSelectionSubmission(
-                    workspaceID: workspaceID,
-                    text: text,
-                    sources: submittedSources
-                )
-                persistPendingSelectionSubmissions()
-            }
-        } else {
-            messages.removeAll(where: { $0.id == optimisticMessageID })
-            courseChatDraft = text
-            sources = Self.recoveredSources(submitted: submittedSources, current: sources)
+            return pendingSelectionSubmissions[selectionDiscussionID]
         }
-        // The runtime did not accept this submission. Keep the same durable
-        // pre-accept journal that backed the attempt until a later resend is
-        // accepted, including across another process termination.
-        if selectionDiscussionID == nil {
-            pendingOutboundText = text
-            pendingOutboundSources = submittedSources
-            pendingSelectionDiscussionID = nil
-            persistDraftSources()
-        }
+        return pendingMainSubmission
     }
 
-    private func clearPendingOutboundSubmission(selectionDiscussionID: UUID?) {
+    private func composerMatches(
+        attempt: CourseAgentDispatchAttempt,
+        selectionDiscussionID: UUID?
+    ) -> Bool {
+        let currentText: String?
+        let currentSources: [CourseSource]
         if let selectionDiscussionID {
+            currentText = selectionDiscussionDrafts[selectionDiscussionID]
+            currentSources = selectionDiscussionSources[selectionDiscussionID] ?? []
+        } else {
+            currentText = courseChatDraft
+            currentSources = sources
+        }
+        return (currentText ?? "") == (attempt.learnerText ?? "")
+            && currentSources == attempt.sources
+    }
+
+    @discardableResult
+    private func restoreUnacceptedSubmission(
+        attempt: CourseAgentDispatchAttempt,
+        selectionDiscussionID: UUID?
+    ) -> Bool {
+        guard pendingSubmission(selectionDiscussionID: selectionDiscussionID)?.id
+                == attempt.id,
+              let learnerText = attempt.learnerText else { return false }
+        if let selectionDiscussionID {
+            if let optimisticMessageID = attempt.optimisticMessageID {
+                selectionLocalMessages[selectionDiscussionID]?.removeAll {
+                    $0.id == optimisticMessageID
+                }
+            }
+            let currentText = selectionDiscussionDrafts[selectionDiscussionID]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let currentSources = selectionDiscussionSources[selectionDiscussionID] ?? []
+            if currentText?.isEmpty != false, currentSources.isEmpty {
+                selectionDiscussionDrafts[selectionDiscussionID] = learnerText
+                selectionDiscussionSources[selectionDiscussionID] = attempt.sources
+            }
+        } else {
+            if let optimisticMessageID = attempt.optimisticMessageID {
+                messages.removeAll(where: { $0.id == optimisticMessageID })
+            }
+            let currentText = courseChatDraft?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if currentText?.isEmpty != false, sources.isEmpty {
+                courseChatDraft = learnerText
+                sources = attempt.sources
+            }
+        }
+        persistPendingSelectionSubmissions()
+        persistDraftSources()
+        return true
+    }
+
+    private func restorePreDispatchCancellation(
+        attempt: CourseAgentDispatchAttempt,
+        selectionDiscussionID: UUID?
+    ) {
+        guard pendingSubmission(selectionDiscussionID: selectionDiscussionID)?.id
+                == attempt.id,
+              submissionRecoveryState(for: selectionDiscussionID) == .preparing else {
+            return
+        }
+        restoreUnacceptedSubmission(
+            attempt: attempt,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        setSubmissionRecoveryState(
+            .knownNotAccepted,
+            for: selectionDiscussionID,
+            matching: attempt.id
+        )
+    }
+
+    private func clearPendingOutboundSubmission(
+        selectionDiscussionID: UUID?,
+        matching attemptID: UUID
+    ) {
+        if let selectionDiscussionID {
+            guard pendingSelectionSubmissions[selectionDiscussionID]?.id == attemptID else {
+                return
+            }
             pendingSelectionSubmissions[selectionDiscussionID] = nil
+            selectionSubmissionRecoveryStates[selectionDiscussionID] = nil
             persistPendingSelectionSubmissions()
         } else {
-            pendingOutboundText = nil
-            pendingOutboundSources = []
-            pendingSelectionDiscussionID = nil
+            guard pendingMainSubmission?.id == attemptID else { return }
+            pendingMainSubmission = nil
+            mainSubmissionRecoveryState = nil
             persistDraftSources()
         }
     }
@@ -5897,8 +9701,20 @@ final class CourseExperienceStore {
         submitted: [CourseSource],
         current: [CourseSource]
     ) -> [CourseSource] {
-        let currentSourceIDs = Set(current.map(\.id))
-        return submitted.filter { !currentSourceIDs.contains($0.id) } + current
+        var recovered: [CourseSource] = []
+        for source in submitted {
+            let alreadyPresent = (recovered + current).contains { candidate in
+                candidate.id == source.id
+                    || (candidate.name == source.name
+                        && candidate.detail == source.detail
+                        && candidate.kind == source.kind
+                        && candidate.runtimePath == source.runtimePath)
+            }
+            if !alreadyPresent {
+                recovered.append(source)
+            }
+        }
+        return recovered + current
     }
 
     static func modelForNewThread(
@@ -5910,6 +9726,20 @@ final class CourseExperienceStore {
         inheritsGlobalModel
             ? (scopedModelID ?? currentModelID ?? selectedModelID)
             : scopedModelID
+    }
+
+    static func reasoningEffortForNewThread(
+        scopedModelID: String?,
+        scopedReasoningEffortID: String?,
+        inheritsGlobalModel: Bool,
+        currentModelID: String?,
+        currentReasoningEffortID: String?,
+        selectedReasoningEffortID: String?
+    ) -> String? {
+        guard inheritsGlobalModel else { return scopedReasoningEffortID }
+        if scopedModelID != nil { return scopedReasoningEffortID }
+        if currentModelID != nil { return currentReasoningEffortID }
+        return selectedReasoningEffortID
     }
 
     static func reconciledDiscussionModelID(
@@ -5951,8 +9781,16 @@ final class CourseExperienceStore {
         expectedTurnID initialExpectedTurnID: String,
         workspaceID: String,
         selectionDiscussionID: UUID?,
+        transcriptVisibility: CourseAgentTranscriptVisibility = .learner,
+        recoveryLease suppliedRecoveryLease: HermesRecoveryLease? = nil,
         appModel: AppModel
     ) async throws {
+        let recoveryLease = suppliedRecoveryLease ?? hermesRecoveryLease(
+            workspaceID: workspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        try beginHermesRecoveryLease(recoveryLease)
+        defer { endHermesRecoveryLease(recoveryLease) }
         var expectedTurnID = initialExpectedTurnID
         let journal = remoteHermesToolJournal(workspaceID: workspaceID)
         let initialEntries = try journal.load()
@@ -5967,16 +9805,20 @@ final class CourseExperienceStore {
             .compactMap(\.chainStep)
             .max() ?? 0
         while true {
-            guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
+            try Task.checkCancellation()
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             let response: (text: String, turnID: String)
             do {
                 response = try await waitForRemoteHermesResponse(
                     for: key,
                     expectedTurnID: expectedTurnID,
                     workspaceID: workspaceID,
+                    recoveryLease: recoveryLease,
                     appModel: appModel
                 )
+                try requireCurrentHermesRecoveryLease(recoveryLease)
             } catch {
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 let nsError = error as NSError
                 if nsError.domain == "LearnfoldRemoteCourseTool",
                    nsError.code == 6,
@@ -6012,11 +9854,13 @@ final class CourseExperienceStore {
             }) {
                 consumedEntry.phase = .completed
                 consumedEntry.updatedAt = Date()
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 try journal.save(consumedEntry)
             }
             guard let call = Self.remoteCourseToolCall(from: response.text) else {
                 if Self.looksLikeMalformedRemoteCourseToolEnvelope(response.text) {
                     let message = "Hermes returned malformed native-tool JSON. Learnfold did not execute it and preserved the course recovery state. Explicitly abandon this failed response, then ask Hermes to continue from the saved course."
+                    try requireCurrentHermesRecoveryLease(recoveryLease)
                     try persistPendingHermesExpectedTurn(
                         nil,
                         key: key,
@@ -6026,13 +9870,18 @@ final class CourseExperienceStore {
                     )
                     throw Self.remoteHermesRecoveryError(message)
                 }
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 try persistPendingHermesExpectedTurn(
                     nil,
                     key: key,
                     workspaceID: workspaceID,
                     selectionDiscussionID: selectionDiscussionID
                 )
-                appendCourseAgentMessage(response.text, discussionID: selectionDiscussionID)
+                appendCourseAgentMessage(
+                    response.text,
+                    discussionID: selectionDiscussionID,
+                    transcriptVisibility: transcriptVisibility
+                )
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: key,
                     success: true
@@ -6040,7 +9889,11 @@ final class CourseExperienceStore {
                 return
             }
             if !call.visibleText.isEmpty {
-                appendCourseAgentMessage(call.visibleText, discussionID: selectionDiscussionID)
+                appendCourseAgentMessage(
+                    call.visibleText,
+                    discussionID: selectionDiscussionID,
+                    transcriptVisibility: transcriptVisibility
+                )
             }
 
             let priorEntry = try journal.entry(sourceTurnID: response.turnID, toolName: call.name)
@@ -6088,6 +9941,7 @@ final class CourseExperienceStore {
             let result: AppPlatformDynamicToolResult
             switch entry.phase {
             case .executing where priorEntry == nil:
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 try journal.save(entry)
                 try persistPendingHermesToolLifecycleOwnership(
                     key: key,
@@ -6095,18 +9949,16 @@ final class CourseExperienceStore {
                     selectionDiscussionID: selectionDiscussionID
                 )
                 result = await executeRemoteHermesTool(call, key: key, workspaceID: workspaceID)
-                if generatedCourseID == nil, selectionDiscussionID == nil {
-                    try refreshPendingHermesDurableCourseIdentity(
-                        key: key,
-                        workspaceID: workspaceID
-                    )
-                }
-                entry.success = result.success
-                entry.output = result.output
-                entry.phase = .executed
-                entry.updatedAt = Date()
-                try journal.save(entry)
+                entry = try commitRemoteHermesToolExecutionResult(
+                    result,
+                    entry: entry,
+                    journal: journal,
+                    key: key,
+                    workspaceID: workspaceID,
+                    recoveryLease: recoveryLease
+                )
             case .executed, .resultSubmitting:
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 try persistPendingHermesToolLifecycleOwnership(
                     key: key,
                     workspaceID: workspaceID,
@@ -6119,6 +9971,7 @@ final class CourseExperienceStore {
                 }
                 result = AppPlatformDynamicToolResult(success: success, output: output)
             case .resultSubmitted:
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 try persistPendingHermesExpectedTurn(
                     entry.resultTurnID,
                     key: key,
@@ -6137,6 +9990,7 @@ final class CourseExperienceStore {
                     "Hermes repeated a native tool call whose delivery lifecycle is already terminal. The app stopped to prevent duplicate execution."
                 )
             case .executing:
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 try persistPendingHermesToolLifecycleOwnership(
                     key: key,
                     workspaceID: workspaceID,
@@ -6149,17 +10003,14 @@ final class CourseExperienceStore {
                         workspaceID: workspaceID,
                         recoveringInterruptedExecution: true
                     )
-                    if generatedCourseID == nil, selectionDiscussionID == nil {
-                        try refreshPendingHermesDurableCourseIdentity(
-                            key: key,
-                            workspaceID: workspaceID
-                        )
-                    }
-                    entry.success = repeated.success
-                    entry.output = repeated.output
-                    entry.phase = .executed
-                    entry.updatedAt = Date()
-                    try journal.save(entry)
+                    entry = try commitRemoteHermesToolExecutionResult(
+                        repeated,
+                        entry: entry,
+                        journal: journal,
+                        key: key,
+                        workspaceID: workspaceID,
+                        recoveryLease: recoveryLease
+                    )
                     continue
                 }
                 let abandoned = Self.ambiguousRemoteHermesMutationResult(callID: entry.id)
@@ -6167,13 +10018,13 @@ final class CourseExperienceStore {
                 entry.output = abandoned.output
                 entry.phase = .executed
                 entry.updatedAt = Date()
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 try journal.save(entry)
                 continue
             }
 
-            guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else {
-                throw CancellationError()
-            }
+            try Task.checkCancellation()
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             let toolResultPrompt = try Self.remoteHermesToolResultPrompt(
                 call: call,
                 result: result,
@@ -6184,6 +10035,7 @@ final class CourseExperienceStore {
             entry.phase = .resultSubmitting
             entry.resultSubmissionAttempts = (entry.resultSubmissionAttempts ?? 0) + 1
             entry.updatedAt = Date()
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             try journal.save(entry)
             let receipt = try await appModel.startTurn(
                 key: key,
@@ -6212,6 +10064,7 @@ final class CourseExperienceStore {
                 workspaceID: workspaceID,
                 selectionDiscussionID: selectionDiscussionID
             )
+            try requireCurrentHermesRecoveryLease(recoveryLease)
         }
     }
 
@@ -6221,6 +10074,14 @@ final class CourseExperienceStore {
         workspaceID: String,
         recoveringInterruptedExecution: Bool = false
     ) async -> AppPlatformDynamicToolResult {
+        if let remoteHermesToolExecutor {
+            return await remoteHermesToolExecutor(
+                call,
+                key,
+                workspaceID,
+                recoveringInterruptedExecution
+            )
+        }
         if Self.remoteToolWorkspaceID(argumentsJSON: call.argumentsJSON) != workspaceID {
             return AppPlatformDynamicToolResult(
                 success: false,
@@ -6233,6 +10094,14 @@ final class CourseExperienceStore {
                     throw CocoaError(.coderInvalidValue)
                 }
                 let plan = try JSONDecoder().decode(CourseBrief.self, from: data)
+                if let issue = AppleCoursePlanValidator.issue(
+                    in: plan,
+                    requiresTypedHierarchy: true
+                ) {
+                    throw AppleCourseAgentError.toolFailed(
+                        "The generated course plan is invalid: \(issue)."
+                    )
+                }
                 try await acceptPresentedCoursePlan(
                     plan,
                     recoveringInterruptedPresentation: recoveringInterruptedExecution
@@ -6303,11 +10172,44 @@ final class CourseExperienceStore {
         )
     }
 
+    private func commitRemoteHermesToolExecutionResult(
+        _ result: AppPlatformDynamicToolResult,
+        entry: RemoteHermesToolJournalEntry,
+        journal: RemoteHermesToolJournal,
+        key: ThreadKey,
+        workspaceID: String,
+        recoveryLease: HermesRecoveryLease
+    ) throws -> RemoteHermesToolJournalEntry {
+        var committed = entry
+        committed.success = result.success
+        committed.output = result.output
+        committed.phase = .executed
+        committed.updatedAt = Date()
+        // This save is the controlled closing commit: abandonment drains the
+        // active lease, so an already-returned native mutation result becomes
+        // durable before any fallible identity refresh or workspace cleanup.
+        try journal.save(committed)
+        try requireCurrentHermesRecoveryLease(recoveryLease)
+        if generatedCourseID == nil, committed.selectionDiscussionID == nil {
+            try refreshPendingHermesDurableCourseIdentity(
+                key: key,
+                workspaceID: workspaceID
+            )
+        }
+        return committed
+    }
+
     private func recoverPendingRemoteHermesTool(
         for key: ThreadKey,
         workspaceID: String,
+        recoveryLease: HermesRecoveryLease,
         appModel: AppModel
     ) async throws {
+        try requireCurrentHermesRecoveryLease(recoveryLease)
+        let transcriptVisibility = try pendingHermesAcceptedTurn(
+            workspaceID: workspaceID,
+            threadID: key.threadId
+        ).map(Self.transcriptVisibility(for:)) ?? .learner
         let journal = remoteHermesToolJournal(workspaceID: workspaceID)
         guard var entry = try journal.pendingEntry(
             workspaceID: workspaceID,
@@ -6327,20 +10229,18 @@ final class CourseExperienceStore {
                     workspaceID: workspaceID,
                     recoveringInterruptedExecution: true
                 )
-                if generatedCourseID == nil, entry.selectionDiscussionID == nil {
-                    try refreshPendingHermesDurableCourseIdentity(
-                        key: key,
-                        workspaceID: workspaceID
-                    )
-                }
-                entry.success = repeated.success
-                entry.output = repeated.output
-                entry.phase = .executed
-                entry.updatedAt = Date()
-                try journal.save(entry)
+                entry = try commitRemoteHermesToolExecutionResult(
+                    repeated,
+                    entry: entry,
+                    journal: journal,
+                    key: key,
+                    workspaceID: workspaceID,
+                    recoveryLease: recoveryLease
+                )
                 try await recoverPendingRemoteHermesTool(
                     for: key,
                     workspaceID: workspaceID,
+                    recoveryLease: recoveryLease,
                     appModel: appModel
                 )
                 return
@@ -6351,9 +10251,11 @@ final class CourseExperienceStore {
             entry.phase = .executed
             entry.updatedAt = Date()
             try journal.save(entry)
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             try await recoverPendingRemoteHermesTool(
                 for: key,
                 workspaceID: workspaceID,
+                recoveryLease: recoveryLease,
                 appModel: appModel
             )
             return
@@ -6376,8 +10278,10 @@ final class CourseExperienceStore {
             try await waitUntilRemoteHermesThreadIsIdle(
                 key,
                 workspaceID: workspaceID,
+                recoveryLease: recoveryLease,
                 appModel: appModel
             )
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             entry.phase = .resultSubmitting
             entry.resultSubmissionAttempts = (entry.resultSubmissionAttempts ?? 0) + 1
             entry.updatedAt = Date()
@@ -6409,11 +10313,14 @@ final class CourseExperienceStore {
                 workspaceID: workspaceID,
                 selectionDiscussionID: entry.selectionDiscussionID
             )
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             try await hydrateRemoteHermesResponse(
                 for: key,
                 expectedTurnID: resultTurnID,
                 workspaceID: workspaceID,
                 selectionDiscussionID: entry.selectionDiscussionID,
+                transcriptVisibility: transcriptVisibility,
+                recoveryLease: recoveryLease,
                 appModel: appModel
             )
         case .resultSubmitted:
@@ -6425,6 +10332,8 @@ final class CourseExperienceStore {
                 expectedTurnID: resultTurnID,
                 workspaceID: workspaceID,
                 selectionDiscussionID: entry.selectionDiscussionID,
+                transcriptVisibility: transcriptVisibility,
+                recoveryLease: recoveryLease,
                 appModel: appModel
             )
         case .completed, .abandoned:
@@ -6468,15 +10377,35 @@ final class CourseExperienceStore {
         return turnID
     }
 
+    private func commitAcceptedHermesTurnReceipt(
+        _ receipt: AppTurnSubmissionReceipt,
+        key: ThreadKey,
+        workspaceID: String,
+        selectionDiscussionID: UUID?,
+        recoveryLease: HermesRecoveryLease
+    ) throws -> String {
+        let turnID = try Self.acceptedRemoteHermesTurnID(receipt)
+        try persistPendingHermesExpectedTurn(
+            turnID,
+            key: key,
+            workspaceID: workspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        try requireCurrentHermesRecoveryLease(recoveryLease)
+        return turnID
+    }
+
     private func waitUntilRemoteHermesThreadIsIdle(
         _ key: ThreadKey,
         workspaceID: String,
+        recoveryLease: HermesRecoveryLease,
         appModel: AppModel
     ) async throws {
         for poll in 0..<1_200 {
             guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else {
                 throw CancellationError()
             }
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             let localHasActiveTurn = appModel.threadSnapshot(for: key)?.hasActiveTurn
             if localHasActiveTurn == false {
                 return
@@ -6491,6 +10420,7 @@ final class CourseExperienceStore {
                         sortDirection: .descending
                     )
                 )
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 if RemoteHermesThreadIdlePolicy.isIdle(
                     localHasActiveTurn: localHasActiveTurn,
                     authoritativeTurns: page.turnStates
@@ -6499,8 +10429,10 @@ final class CourseExperienceStore {
                 }
             }
             try await Task.sleep(for: .milliseconds(250))
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             if poll > 0, poll.isMultiple(of: 40) {
                 await appModel.refreshSnapshot()
+                try requireCurrentHermesRecoveryLease(recoveryLease)
             }
         }
         throw Self.remoteHermesRecoveryError(
@@ -6512,15 +10444,19 @@ final class CourseExperienceStore {
         for key: ThreadKey,
         expectedTurnID: String,
         workspaceID: String,
+        recoveryLease: HermesRecoveryLease,
         appModel: AppModel
     ) async throws -> (text: String, turnID: String) {
         for poll in 0..<1_200 {
             guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else {
                 throw CancellationError()
             }
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             try await Task.sleep(for: .milliseconds(250))
+            try requireCurrentHermesRecoveryLease(recoveryLease)
             if poll > 0, poll.isMultiple(of: 40) {
                 await appModel.refreshSnapshot()
+                try requireCurrentHermesRecoveryLease(recoveryLease)
             }
             let fullText = Self.remoteHermesAssistantText(
                 in: appModel.threadSnapshot(for: key)?.hydratedConversationItems ?? [],
@@ -6543,6 +10479,7 @@ final class CourseExperienceStore {
                         sortDirection: .descending
                     )
                 )
+                try requireCurrentHermesRecoveryLease(recoveryLease)
                 guard let state = page.turnStates.first(where: { $0.turnId == expectedTurnID }) else {
                     continue
                 }
@@ -6614,8 +10551,16 @@ final class CourseExperienceStore {
         }
     }
 
-    private func appendCourseAgentMessage(_ text: String, discussionID: UUID?) {
-        let message = CourseChatMessage(role: .agent, text: text)
+    private func appendCourseAgentMessage(
+        _ text: String,
+        discussionID: UUID?,
+        transcriptVisibility: CourseAgentTranscriptVisibility = .learner
+    ) {
+        let message = CourseChatMessage(
+            role: .agent,
+            text: text,
+            transcriptVisibility: transcriptVisibility
+        )
         if let discussionID {
             selectionLocalMessages[discussionID, default: []].append(message)
         } else {
@@ -6636,6 +10581,7 @@ final class CourseExperienceStore {
         previousResponseTurnID: String?,
         workspaceID: String,
         selectionDiscussionID: UUID?,
+        transcriptVisibility: CourseAgentTranscriptVisibility,
         appModel: AppModel
     ) async {
         var receivedCoursePlan = false
@@ -6650,7 +10596,11 @@ final class CourseExperienceStore {
             if let response,
                !response.isEmpty,
                summary.lastResponseTurnId != previousResponseTurnID {
-                let responseMessage = CourseChatMessage(role: .agent, text: response)
+                let responseMessage = CourseChatMessage(
+                    role: .agent,
+                    text: response,
+                    transcriptVisibility: transcriptVisibility
+                )
                 if let selectionDiscussionID {
                     selectionLocalMessages[selectionDiscussionID, default: []].append(responseMessage)
                 } else {
@@ -6860,7 +10810,6 @@ final class CourseExperienceStore {
         runtimeID: String,
         workspaceID: String,
         modelID: String? = nil,
-        inheritsGlobalModel: Bool = true,
         appModel: AppModel
     ) async throws -> ThreadKey {
         let usesCourseMCP = runtimeID == .codex
@@ -6892,12 +10841,7 @@ final class CourseExperienceStore {
         }
         let launch = AppThreadLaunchConfig(
             agentRuntimeKind: runtimeID,
-            model: Self.modelForNewThread(
-                scopedModelID: modelID,
-                inheritsGlobalModel: inheritsGlobalModel,
-                currentModelID: currentAgentModelID,
-                selectedModelID: selectedModelID
-            ),
+            model: modelID,
             approvalPolicy: .never,
             // Hermes tools run on the VPS and cannot enforce Codex's local
             // workspace sandbox. The phone-owned course tools remain gated by
@@ -7062,20 +11006,28 @@ final class CourseExperienceStore {
     private func finishGeneratedCourse(brief: CourseBrief, workspaceID: String) {
         guard currentCourseWorkspaceID == workspaceID else { return }
         currentWorkspaceWasBuilt = true
+        let runtimeID = currentAgentRuntimeID ?? selectedAgentID ?? "codex"
+        let target = scopedMainExecutionTarget(
+            runtimeID: runtimeID,
+            serverID: agentThreadKey?.serverId ?? currentAgentServerID
+        )
         let course = makeLearningCourse(
             brief: brief,
             workspaceID: workspaceID,
             agentServerID: agentThreadKey?.serverId,
             agentThreadID: agentThreadKey?.threadId,
-            agentRuntimeKind: currentAgentRuntimeID ?? selectedAgentID ?? "codex",
-            agentModelID: currentAgentModelID ?? selectedModelID,
-            appleSessionID: currentAppleSessionID
+            agentRuntimeKind: target.runtimeID,
+            agentModelID: target.modelID,
+            agentReasoningEffortID: target.reasoningEffortID,
+            appleSessionID: currentAppleSessionID,
+            hostedSessionID: currentHostedSessionID
         )
         generatedCourseID = course.id
         courses.removeAll(where: { $0.id == course.id || $0.workspaceID == workspaceID })
         courses.insert(course, at: 0)
         persistCourses()
         clearPendingHermesCourseIdentity(workspaceID: workspaceID)
+        clearPendingHostedCourseIdentity(workspaceID: workspaceID)
         Task {
             guard await CourseCloudSyncEngine.shared.availability == .available else { return }
             do {
@@ -7108,7 +11060,9 @@ final class CourseExperienceStore {
         agentThreadID: String? = nil,
         agentRuntimeKind: String? = nil,
         agentModelID: String? = nil,
-        appleSessionID: UUID? = nil
+        agentReasoningEffortID: String? = nil,
+        appleSessionID: UUID? = nil,
+        hostedSessionID: UUID? = nil
     ) -> LearningCourse {
         let titleParts = brief.title.split(separator: ":", maxSplits: 1).map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7128,9 +11082,11 @@ final class CourseExperienceStore {
             workspaceID: workspaceID,
             agentServerID: agentServerID,
             agentThreadID: agentThreadID,
-            agentRuntimeKind: agentRuntimeKind ?? selectedAgentID ?? "codex",
-            agentModelID: agentModelID ?? selectedModelID,
-            appleSessionID: appleSessionID
+            agentRuntimeKind: agentRuntimeKind ?? "codex",
+            agentModelID: agentModelID,
+            agentReasoningEffortID: agentReasoningEffortID,
+            appleSessionID: appleSessionID,
+            hostedSessionID: hostedSessionID
         )
     }
 
@@ -7149,6 +11105,10 @@ final class CourseExperienceStore {
         key: ThreadKey,
         workspaceID: String
     ) {
+        let target = scopedMainExecutionTarget(
+            runtimeID: "hermes",
+            serverID: key.serverId
+        )
         let existing = pendingHermesCourseIdentity(
             workspaceID: workspaceID,
             threadID: key.threadId
@@ -7158,7 +11118,8 @@ final class CourseExperienceStore {
             serverID: key.serverId,
             threadID: key.threadId,
             runtimeID: "hermes",
-            modelID: currentAgentModelID ?? selectedModelID,
+            modelID: target.modelID,
+            reasoningEffortID: target.reasoningEffortID,
             brief: brief,
             showsBrief: showsBrief,
             expectedTurnID: existing?.expectedTurnID,
@@ -7179,6 +11140,25 @@ final class CourseExperienceStore {
         return pending
     }
 
+    /// Retires an invalid persisted locator without deriving a filesystem path
+    /// from it. The raw payload is retained once under a fixed app-owned key
+    /// for support diagnosis, while the live key and presentation are cleared
+    /// so the learner can return to normal main-chat submission.
+    private func resolveInvalidPersistedHermesRecoveryIdentityIfNeeded() {
+        guard invalidPersistedHermesRecoveryProvenance != nil else { return }
+        if let rawIdentity = defaults.data(forKey: Self.pendingHermesCourseKey) {
+            let quarantineKey = Self.persistenceQuarantineKey(
+                for: Self.pendingHermesCourseKey
+            )
+            if defaults.object(forKey: quarantineKey) == nil {
+                defaults.set(rawIdentity, forKey: quarantineKey)
+            }
+        }
+        defaults.removeObject(forKey: Self.pendingHermesCourseKey)
+        invalidPersistedHermesRecoveryProvenance = nil
+        agentError = nil
+    }
+
     private func pendingHermesCourseIdentity(
         workspaceID: String
     ) -> PendingHermesCourseIdentity? {
@@ -7187,6 +11167,342 @@ final class CourseExperienceStore {
               pending.workspaceID == workspaceID else { return nil }
         return pending
     }
+
+    private func pendingHermesRecoveryCleanup(
+        workspaceID: String
+    ) -> PendingHermesRecoveryCleanup? {
+        guard let data = defaults.data(
+            forKey: Self.pendingHermesRecoveryCleanupKey
+        ), let pending = try? JSONDecoder().decode(
+            PendingHermesRecoveryCleanup.self,
+            from: data
+        ), pending.workspaceID == workspaceID else { return nil }
+        return pending
+    }
+
+    private func persistPendingHermesRecoveryCleanup(
+        workspaceID: String,
+        threadID: String?
+    ) {
+        let pending = PendingHermesRecoveryCleanup(
+            workspaceID: workspaceID,
+            threadID: threadID
+        )
+        guard let data = try? JSONEncoder().encode(pending) else { return }
+        defaults.set(data, forKey: Self.pendingHermesRecoveryCleanupKey)
+        hermesRecoveryJournalRevision.advance()
+    }
+
+    private func clearPendingHermesRecoveryCleanup(workspaceID: String) {
+        guard pendingHermesRecoveryCleanup(workspaceID: workspaceID) != nil else {
+            return
+        }
+        defaults.removeObject(forKey: Self.pendingHermesRecoveryCleanupKey)
+        hermesRecoveryJournalRevision.advance()
+    }
+
+    private func hermesRecoveryLease(
+        workspaceID: String,
+        selectionDiscussionID: UUID?
+    ) -> HermesRecoveryLease {
+        let scope = HermesRecoveryScope(
+            workspaceID: workspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        if hermesRecoveryGenerations[scope] == nil {
+            hermesRecoveryGenerations[scope] = 0
+        }
+        return HermesRecoveryLease(
+            scope: scope,
+            generation: hermesRecoveryGenerations[scope, default: 0]
+        )
+    }
+
+    private func invalidateHermesRecovery(
+        workspaceID: String,
+        selectionDiscussionID: UUID?
+    ) {
+        let scope = HermesRecoveryScope(
+            workspaceID: workspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        hermesRecoveryGenerations[scope, default: 0] &+= 1
+    }
+
+    private func invalidateHermesRecoveryWorkspace(workspaceID: String) {
+        let scopes = Set(
+            hermesRecoveryGenerations.keys.filter { $0.workspaceID == workspaceID }
+                + activeHermesRecoveryLeaseCounts.keys.filter {
+                    $0.workspaceID == workspaceID
+                }
+        ).union([
+            HermesRecoveryScope(
+                workspaceID: workspaceID,
+                selectionDiscussionID: nil
+            ),
+        ])
+        for scope in scopes {
+            hermesRecoveryGenerations[scope, default: 0] &+= 1
+        }
+    }
+
+    private func requireCurrentHermesRecoveryLease(
+        _ lease: HermesRecoveryLease
+    ) throws {
+        guard currentCourseWorkspaceID == lease.scope.workspaceID,
+              !closingHermesRecoveryScopes.contains(lease.scope),
+              pendingHermesRecoveryCleanup(
+                workspaceID: lease.scope.workspaceID
+              ) == nil,
+              hermesRecoveryGenerations[lease.scope, default: 0]
+                == lease.generation else {
+            throw CancellationError()
+        }
+    }
+
+    private func beginHermesRecoveryLease(
+        _ lease: HermesRecoveryLease
+    ) throws {
+        try requireCurrentHermesRecoveryLease(lease)
+        activeHermesRecoveryLeaseCounts[lease.scope, default: 0] += 1
+    }
+
+    private func endHermesRecoveryLease(_ lease: HermesRecoveryLease) {
+        let remaining = max(
+            0,
+            activeHermesRecoveryLeaseCounts[lease.scope, default: 0] - 1
+        )
+        if remaining == 0 {
+            activeHermesRecoveryLeaseCounts[lease.scope] = nil
+            let waiters = hermesRecoveryDrainWaiters.removeValue(
+                forKey: lease.scope
+            ) ?? []
+            waiters.forEach { $0.resume() }
+        } else {
+            activeHermesRecoveryLeaseCounts[lease.scope] = remaining
+        }
+    }
+
+    private func waitForHermesRecoveryDrain(
+        workspaceID: String,
+        selectionDiscussionID: UUID?
+    ) async {
+        let scope = HermesRecoveryScope(
+            workspaceID: workspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        guard activeHermesRecoveryLeaseCounts[scope, default: 0] > 0 else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            hermesRecoveryDrainWaiters[scope, default: []].append(continuation)
+        }
+    }
+
+    private func waitForHermesRecoveryWorkspaceDrain(
+        workspaceID: String
+    ) async {
+        let scopes = activeHermesRecoveryLeaseCounts.keys.filter {
+            $0.workspaceID == workspaceID
+        }
+        for scope in scopes {
+            await waitForHermesRecoveryDrain(
+                workspaceID: scope.workspaceID,
+                selectionDiscussionID: scope.selectionDiscussionID
+            )
+        }
+    }
+
+#if DEBUG
+    func installGenerationDrainForTesting(
+        barrier: any CourseHermesRecoveryTestSuspending
+    ) {
+        generationTask = Task { @MainActor in
+            await barrier.wait()
+        }
+    }
+
+    func runHermesRecoveryOperationForTesting(
+        selectionDiscussionID: UUID?,
+        barrier: any CourseHermesRecoveryTestSuspending,
+        commitPolicy: CourseHermesRecoveryTestCommitPolicy,
+        onCommit: @MainActor @escaping () -> Void
+    ) async {
+        let lease = hermesRecoveryLease(
+            workspaceID: currentCourseWorkspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        do {
+            try beginHermesRecoveryLease(lease)
+        } catch {
+            return
+        }
+        defer { endHermesRecoveryLease(lease) }
+        await barrier.wait()
+        switch commitPolicy {
+        case .onlyWhileOpen:
+            guard (try? requireCurrentHermesRecoveryLease(lease)) != nil else {
+                return
+            }
+            onCommit()
+        case .commitBeforeClosingExit:
+            onCommit()
+            _ = try? requireCurrentHermesRecoveryLease(lease)
+        }
+    }
+
+    func runAcceptedHermesReceiptCommitForTesting(
+        barrier: any CourseHermesRecoveryTestSuspending,
+        receipt: AppTurnSubmissionReceipt,
+        key: ThreadKey,
+        selectionDiscussionID: UUID? = nil
+    ) async {
+        let workspaceID = currentCourseWorkspaceID
+        let lease = hermesRecoveryLease(
+            workspaceID: workspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        guard (try? beginHermesRecoveryLease(lease)) != nil else { return }
+        defer { endHermesRecoveryLease(lease) }
+        await barrier.wait()
+        _ = try? commitAcceptedHermesTurnReceipt(
+            receipt,
+            key: key,
+            workspaceID: workspaceID,
+            selectionDiscussionID: selectionDiscussionID,
+            recoveryLease: lease
+        )
+    }
+
+    func runHermesToolResultCommitForTesting(
+        barrier: any CourseHermesRecoveryTestSuspending,
+        result: AppPlatformDynamicToolResult,
+        entry: RemoteHermesToolJournalEntry,
+        key: ThreadKey
+    ) async {
+        let workspaceID = currentCourseWorkspaceID
+        let lease = hermesRecoveryLease(
+            workspaceID: workspaceID,
+            selectionDiscussionID: entry.selectionDiscussionID
+        )
+        guard (try? beginHermesRecoveryLease(lease)) != nil else { return }
+        defer { endHermesRecoveryLease(lease) }
+        await barrier.wait()
+        _ = try? commitRemoteHermesToolExecutionResult(
+            result,
+            entry: entry,
+            journal: remoteHermesToolJournal(workspaceID: workspaceID),
+            key: key,
+            workspaceID: workspaceID,
+            recoveryLease: lease
+        )
+    }
+
+    func reconcilePendingHermesSubmissionIntentForTesting(
+        key: ThreadKey,
+        selectionDiscussionID: UUID? = nil,
+        appModel: AppModel
+    ) async {
+        let workspaceID = currentCourseWorkspaceID
+        let lease = hermesRecoveryLease(
+            workspaceID: workspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        guard (try? beginHermesRecoveryLease(lease)) != nil else { return }
+        defer { endHermesRecoveryLease(lease) }
+        _ = try? await reconcilePendingHermesSubmissionIntent(
+            key: key,
+            workspaceID: workspaceID,
+            recoveryLease: lease,
+            appModel: appModel
+        )
+    }
+
+    func waitUntilRemoteHermesThreadIsIdleForTesting(
+        key: ThreadKey,
+        appModel: AppModel
+    ) async throws {
+        let workspaceID = currentCourseWorkspaceID
+        let lease = hermesRecoveryLease(
+            workspaceID: workspaceID,
+            selectionDiscussionID: nil
+        )
+        try beginHermesRecoveryLease(lease)
+        defer { endHermesRecoveryLease(lease) }
+        try await waitUntilRemoteHermesThreadIsIdle(
+            key,
+            workspaceID: workspaceID,
+            recoveryLease: lease,
+            appModel: appModel
+        )
+    }
+
+    func waitForRemoteHermesResponseForTesting(
+        key: ThreadKey,
+        expectedTurnID: String,
+        appModel: AppModel
+    ) async throws -> (text: String, turnID: String) {
+        let workspaceID = currentCourseWorkspaceID
+        let lease = hermesRecoveryLease(
+            workspaceID: workspaceID,
+            selectionDiscussionID: nil
+        )
+        try beginHermesRecoveryLease(lease)
+        defer { endHermesRecoveryLease(lease) }
+        return try await waitForRemoteHermesResponse(
+            for: key,
+            expectedTurnID: expectedTurnID,
+            workspaceID: workspaceID,
+            recoveryLease: lease,
+            appModel: appModel
+        )
+    }
+
+    func hermesRecoveryIsClosingForTesting(
+        selectionDiscussionID: UUID?
+    ) -> Bool {
+        let scope = HermesRecoveryScope(
+            workspaceID: currentCourseWorkspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        return closingHermesRecoveryScopes.contains(scope)
+            || activeHermesWorkspaceDeletions.contains(currentCourseWorkspaceID)
+    }
+
+    func waitForHermesRecoveryClosingForTesting(
+        selectionDiscussionID: UUID?
+    ) async {
+        let scope = HermesRecoveryScope(
+            workspaceID: currentCourseWorkspaceID,
+            selectionDiscussionID: selectionDiscussionID
+        )
+        guard !closingHermesRecoveryScopes.contains(scope),
+              !activeHermesWorkspaceDeletions.contains(scope.workspaceID) else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            hermesRecoveryClosingTestWaiters[scope, default: []]
+                .append(continuation)
+        }
+    }
+
+    private func signalHermesRecoveryClosingForTesting(
+        scope: HermesRecoveryScope,
+        workspaceWide: Bool
+    ) {
+        let matchingScopes = hermesRecoveryClosingTestWaiters.keys.filter {
+            workspaceWide
+                ? $0.workspaceID == scope.workspaceID
+                : $0 == scope
+        }
+        for matchingScope in matchingScopes {
+            let waiters = hermesRecoveryClosingTestWaiters.removeValue(
+                forKey: matchingScope
+            ) ?? []
+            waiters.forEach { $0.resume() }
+        }
+    }
+#endif
 
     private func persistPendingHermesExpectedTurn(
         _ turnID: String?,
@@ -7242,6 +11558,7 @@ final class CourseExperienceStore {
     private func persistPendingHermesSubmissionIntent(
         key: ThreadKey,
         workspaceID: String,
+        attemptID: UUID,
         previousTurnID: String?,
         selectionDiscussionID: UUID?,
         submittedText: String,
@@ -7256,13 +11573,19 @@ final class CourseExperienceStore {
             expectedTurnID: nil,
             selectionDiscussionID: selectionDiscussionID,
             terminalError: nil,
-            submissionIntentID: UUID().uuidString.lowercased(),
+            submissionIntentID: attemptID.uuidString.lowercased(),
             previousTurnID: previousTurnID,
             submittedText: submittedText,
             learnerText: learnerText,
             linkedSources: linkedSources.compactMap { source in
-                guard source.kind == .link else { return nil }
-                return PendingHermesLinkedSource(name: source.name, detail: source.detail)
+                guard source.kind != .image else { return nil }
+                return PendingHermesLinkedSource(
+                    id: source.id,
+                    name: source.name,
+                    detail: source.detail,
+                    kind: source.kind,
+                    runtimePath: source.runtimePath
+                )
             },
             optimisticMessageID: optimisticMessageID,
             courseIdentity: generatedCourseID == nil && selectionDiscussionID == nil
@@ -7347,12 +11670,17 @@ final class CourseExperienceStore {
         expectedTurnID: String?,
         terminalError: String?
     ) -> PendingHermesCourseIdentity {
-        PendingHermesCourseIdentity(
+        let target = scopedMainExecutionTarget(
+            runtimeID: "hermes",
+            serverID: key.serverId
+        )
+        return PendingHermesCourseIdentity(
             workspaceID: workspaceID,
             serverID: key.serverId,
             threadID: key.threadId,
             runtimeID: "hermes",
-            modelID: currentAgentModelID ?? selectedModelID,
+            modelID: target.modelID,
+            reasoningEffortID: target.reasoningEffortID,
             brief: brief,
             showsBrief: showsBrief,
             expectedTurnID: expectedTurnID,
@@ -7363,6 +11691,7 @@ final class CourseExperienceStore {
     private func reconcilePendingHermesSubmissionIntent(
         key: ThreadKey,
         workspaceID: String,
+        recoveryLease: HermesRecoveryLease,
         appModel: AppModel
     ) async throws -> PendingHermesAcceptedTurn? {
         guard let pending = try pendingHermesAcceptedTurn(
@@ -7382,46 +11711,95 @@ final class CourseExperienceStore {
                 sortDirection: .descending
             )
         )
+        try requireCurrentHermesRecoveryLease(recoveryLease)
+        return try reconcilePendingHermesSubmissionIntent(
+            key: key,
+            workspaceID: workspaceID,
+            authoritativeTurnIDsDescending: page.turnStates.map(\.turnId)
+        )
+    }
+
+    func reconcilePendingHermesSubmissionIntent(
+        key: ThreadKey,
+        workspaceID: String,
+        authoritativeTurnIDsDescending: [String]
+    ) throws -> PendingHermesAcceptedTurn? {
+        guard let pending = try pendingHermesAcceptedTurn(
+            workspaceID: workspaceID,
+            threadID: key.threadId
+        ) else { return nil }
+        if pending.expectedTurnID?.isEmpty == false {
+            return pending
+        }
+        guard pending.submissionIntentID != nil else { return pending }
         guard let acceptedTurnID = try Self.acceptedTurnAfterSubmissionBaseline(
-            turnIDsDescending: page.turnStates.map(\.turnId),
+            turnIDsDescending: authoritativeTurnIDsDescending,
             previousTurnID: pending.previousTurnID
         ) else {
-            if let learnerText = pending.learnerText {
-                let restoredSources = (pending.linkedSources ?? []).map {
-                    CourseSource(name: $0.name, detail: $0.detail, kind: .link)
-                }
-                if let optimisticMessageID = pending.optimisticMessageID {
-                    restoreUnacceptedSubmission(
-                        text: learnerText,
-                        submittedSources: restoredSources,
-                        optimisticMessageID: optimisticMessageID,
-                        selectionDiscussionID: pending.selectionDiscussionID
-                    )
-                } else if let discussionID = pending.selectionDiscussionID {
-                    selectionDiscussionDrafts[discussionID] = learnerText
-                    selectionDiscussionSources[discussionID] = Self.recoveredSources(
-                        submitted: restoredSources,
-                        current: selectionDiscussionSources[discussionID] ?? []
-                    )
-                    if let discussion = selectionDiscussion(id: discussionID),
-                       let workspaceID = self.workspaceID(for: discussion) {
-                        pendingSelectionSubmissions[discussionID] = PendingSelectionSubmission(
-                            workspaceID: workspaceID,
-                            text: learnerText,
-                            sources: restoredSources
+            if let learnerText = CourseAgentInternalPromptPolicy.recoverableLearnerText(
+                learnerText: pending.learnerText,
+                legacySubmittedText: pending.submittedText
+            ) {
+                let restoredSources = restoredSources(
+                    from: (pending.linkedSources ?? []).compactMap { source in
+                        let kind = source.kind ?? .link
+                        guard kind != .image else { return nil }
+                        return PersistedDraftSource(
+                            id: source.id ?? UUID(),
+                            name: source.name,
+                            detail: source.detail,
+                            kind: kind,
+                            runtimePath: source.runtimePath
                         )
-                        persistPendingSelectionSubmissions()
-                    }
-                } else {
-                    courseChatDraft = learnerText
-                    sources = Self.recoveredSources(submitted: restoredSources, current: sources)
-                }
-            } else if let submittedText = pending.submittedText {
+                    },
+                    workspaceID: workspaceID
+                )
+                let courseIdentity = pending.courseIdentity
+                    ?? pendingHermesCourseIdentity(
+                        workspaceID: workspaceID,
+                        threadID: key.threadId
+                    )
+                let currentTarget = scopedMainExecutionTarget(
+                    runtimeID: "hermes",
+                    serverID: key.serverId
+                )
+                let target = pending.selectionDiscussionID
+                    .flatMap { selectionDiscussion(id: $0)?.executionTarget }
+                    ?? CourseAgentExecutionTarget(
+                        runtimeID: "hermes",
+                        serverID: key.serverId,
+                        modelID: courseIdentity?.modelID ?? currentTarget.modelID,
+                        reasoningEffortID: courseIdentity?.reasoningEffortID
+                            ?? currentTarget.reasoningEffortID
+                    )
+                let attempt = CourseAgentDispatchAttempt(
+                    id: pending.submissionIntentID.flatMap(UUID.init(uuidString:)) ?? UUID(),
+                    workspaceID: workspaceID,
+                    promptText: pending.submittedText ?? learnerText,
+                    learnerText: learnerText,
+                    sources: restoredSources,
+                    target: target,
+                    optimisticMessageID: pending.optimisticMessageID
+                )
                 if let discussionID = pending.selectionDiscussionID {
-                    selectionDiscussionDrafts[discussionID] = submittedText
+                    pendingSelectionSubmissions[discussionID] = attempt
                 } else {
-                    courseChatDraft = submittedText
+                    pendingMainSubmission = attempt
                 }
+                restoreUnacceptedSubmission(
+                    attempt: attempt,
+                    selectionDiscussionID: pending.selectionDiscussionID
+                )
+                setSubmissionRecoveryState(
+                    .knownNotAccepted,
+                    for: pending.selectionDiscussionID,
+                    matching: attempt.id
+                )
+            }
+            if let discussionID = pending.selectionDiscussionID {
+                selectionDiscussionErrors[discussionID] = nil
+            } else {
+                agentError = nil
             }
             AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                 key: key,
@@ -7445,6 +11823,16 @@ final class CourseExperienceStore {
             workspaceID: workspaceID,
             threadID: key.threadId
         )
+    }
+
+    private static func transcriptVisibility(
+        for pending: PendingHermesAcceptedTurn
+    ) -> CourseAgentTranscriptVisibility {
+        if let submittedText = pending.submittedText,
+           CourseAgentInternalPromptPolicy.isInternalInstruction(submittedText) {
+            return .internalInstruction
+        }
+        return .learner
     }
 
     static func acceptedTurnAfterSubmissionBaseline(
@@ -7489,7 +11877,9 @@ final class CourseExperienceStore {
         selectionDiscussionID: UUID?
     ) -> String? {
         do {
-            return try pendingHermesAcceptedTurns().last(where: {
+            return try remoteHermesSubmissionJournal(
+                workspaceID: currentCourseWorkspaceID
+            ).load().last(where: {
                 $0.workspaceID == currentCourseWorkspaceID
                     && $0.selectionDiscussionID == selectionDiscussionID
                     && $0.terminalError?.isEmpty == false
@@ -7549,7 +11939,9 @@ final class CourseExperienceStore {
 
     private func hasUnresolvedPendingHermesWork(workspaceID: String) -> Bool {
         do {
-            if try pendingHermesAcceptedTurns().contains(where: {
+            if try remoteHermesSubmissionJournal(
+                workspaceID: workspaceID
+            ).load().contains(where: {
                 $0.workspaceID == workspaceID
                     && ($0.expectedTurnID?.isEmpty == false
                         || $0.submissionIntentID != nil
@@ -7581,16 +11973,61 @@ final class CourseExperienceStore {
         persistCourses()
     }
 
+    private func persistCurrentHostedSession() {
+        guard let sessionID = currentHostedSessionID,
+              currentAgentRuntimeID == CourseAgentProvider.hosted else { return }
+        guard let index = courses.firstIndex(where: {
+            $0.id == generatedCourseID || $0.workspaceID == currentCourseWorkspaceID
+        }) else {
+            let identity = PendingHostedCourseIdentity(
+                workspaceID: currentCourseWorkspaceID,
+                sessionID: sessionID,
+                runtimeID: CourseAgentProvider.hosted,
+                modelID: SystemHostedCourseAgentRuntime.modelID,
+                brief: brief,
+                showsBrief: showsBrief
+            )
+            guard let data = try? JSONEncoder().encode(identity) else { return }
+            defaults.set(data, forKey: Self.pendingHostedCourseKey)
+            return
+        }
+        courses[index].hostedSessionID = sessionID
+        courses[index].agentRuntimeKind = CourseAgentProvider.hosted
+        courses[index].agentModelID = SystemHostedCourseAgentRuntime.modelID
+        courses[index].agentReasoningEffortID = nil
+        persistCourses()
+        clearPendingHostedCourseIdentity(workspaceID: currentCourseWorkspaceID)
+    }
+
+    private func pendingHostedCourseIdentity(
+        workspaceID: String
+    ) -> PendingHostedCourseIdentity? {
+        guard let data = defaults.data(forKey: Self.pendingHostedCourseKey),
+              let pending = try? JSONDecoder().decode(
+                  PendingHostedCourseIdentity.self,
+                  from: data
+              ),
+              pending.workspaceID == workspaceID else { return nil }
+        return pending
+    }
+
+    private func clearPendingHostedCourseIdentity(workspaceID: String) {
+        guard pendingHostedCourseIdentity(workspaceID: workspaceID) != nil else { return }
+        defaults.removeObject(forKey: Self.pendingHostedCourseKey)
+    }
+
     private func bindSelectionDiscussion(
         _ discussionID: UUID,
         to key: ThreadKey,
         runtimeID: String,
-        modelID: String?
+        modelID: String?,
+        reasoningEffortID: String?
     ) {
         guard let index = selectionDiscussions.firstIndex(where: { $0.id == discussionID }),
               selectionDiscussions[index].status == .unresolved else { return }
         selectionDiscussions[index].agentRuntimeKind = runtimeID
         selectionDiscussions[index].agentModelID = modelID
+        selectionDiscussions[index].agentReasoningEffortID = reasoningEffortID
         selectionDiscussions[index].serverID = key.serverId
         selectionDiscussions[index].threadID = key.threadId
         persistSelectionDiscussions()
@@ -7616,10 +12053,19 @@ final class CourseExperienceStore {
             )
             return
         }
+        let runtimeID = currentAgentRuntimeID
+            ?? (selectedAgentServerID == key.serverId ? selectedAgentID : nil)
+            ?? courses[index].agentRuntimeKind
+            ?? "codex"
+        let target = scopedMainExecutionTarget(
+            runtimeID: runtimeID,
+            serverID: key.serverId
+        )
         courses[index].agentServerID = key.serverId
         courses[index].agentThreadID = key.threadId
-        courses[index].agentRuntimeKind = currentAgentRuntimeID ?? selectedAgentID ?? "codex"
-        courses[index].agentModelID = currentAgentModelID ?? selectedModelID
+        courses[index].agentRuntimeKind = target.runtimeID
+        courses[index].agentModelID = target.modelID
+        courses[index].agentReasoningEffortID = target.reasoningEffortID
         persistCourses()
         LLog.info(
             "course-agent",
@@ -7633,18 +12079,49 @@ final class CourseExperienceStore {
         )
     }
 
-    private func refreshAgentCatalog(appModel: AppModel, serverID: String) {
-        guard let server = appModel.snapshot?.serverSnapshot(for: serverID) else { return }
+    @discardableResult
+    func requestAgentCatalogPresentation(for serverID: String) -> UUID {
+        let requestID = UUID()
+        agentCatalogPresentationRequest = (requestID, serverID)
+        return requestID
+    }
+
+    @discardableResult
+    private func refreshAgentCatalog(
+        appModel: AppModel,
+        serverID: String,
+        presentationRequestID: UUID? = nil
+    ) -> [CourseAgentOption] {
+        guard let server = appModel.snapshot?.serverSnapshot(for: serverID) else {
+            return []
+        }
+        return applyAgentCatalog(
+            serverID: serverID,
+            runtimeInfos: server.agentRuntimes,
+            models: appModel.availableModels(for: serverID),
+            presentationRequestID: presentationRequestID
+        )
+    }
+
+    @discardableResult
+    func applyAgentCatalog(
+        serverID: String,
+        runtimeInfos: [AgentRuntimeInfo],
+        models: [ModelInfo],
+        presentationRequestID: UUID? = nil
+    ) -> [CourseAgentOption] {
         let metadataIDs = AgentRuntimeKind.presentationOrder
         let knownIDs = metadataIDs.isEmpty ? Self.coldStartRuntimeIDs : metadataIDs
         let runtimeOptions = CourseAgentOption.catalog(
-            from: server.agentRuntimes,
+            from: runtimeInfos,
             knownRuntimeIDs: knownIDs
         )
-        agentOptions = Self.appleOptions(availability: appleAvailability) + runtimeOptions
+        var options = Self.hostedOptions(availability: hostedAvailability)
+            + Self.appleOptions(availability: appleAvailability)
+            + runtimeOptions
         if metadataIDs.isEmpty {
-            agentOptions = agentOptions.map { option in
-                guard !CourseAgentProvider.isApple(option.id) else { return option }
+            options = options.map { option in
+                guard CourseAgentProvider.usesAppServer(option.id) else { return option }
                 return CourseAgentOption(
                     id: option.id,
                     title: option.available ? option.title : CourseAgentOption.coldStartTitle(for: option.id),
@@ -7652,13 +12129,45 @@ final class CourseExperienceStore {
                 )
             }
         }
-        courseModels = appModel.availableModels(for: serverID)
+        courseModelsByServerID[serverID] = models
+        normalizeReasoningEffortsAgainstCatalog(serverID: serverID)
+        if let presentationRequestID,
+           agentCatalogPresentationRequest?.id == presentationRequestID,
+           agentCatalogPresentationRequest?.serverID == serverID {
+            agentOptions = options
+            presentedAgentCatalogServerID = serverID
+            agentCatalogPresentationRequest = nil
+        }
+        return options
     }
 
-    private func refreshAppleAvailability() {
+    func refreshAppleAvailability() {
         appleAvailability = appleRuntime.availability()
-        let runtimeOptions = agentOptions.filter { !CourseAgentProvider.isApple($0.id) }
-        agentOptions = Self.appleOptions(availability: appleAvailability) + runtimeOptions
+        let runtimeOptions = agentOptions.filter { CourseAgentProvider.usesAppServer($0.id) }
+        agentOptions = Self.hostedOptions(availability: hostedAvailability)
+            + Self.appleOptions(availability: appleAvailability)
+            + runtimeOptions
+    }
+
+    func refreshHostedAvailability() {
+        hostedAvailability = hostedRuntime.availability()
+        let runtimeOptions = agentOptions.filter { CourseAgentProvider.usesAppServer($0.id) }
+        agentOptions = Self.hostedOptions(availability: hostedAvailability)
+            + Self.appleOptions(availability: appleAvailability)
+            + runtimeOptions
+    }
+
+    private static func hostedOptions(
+        availability: HostedCourseAgentAvailability
+    ) -> [CourseAgentOption] {
+        [
+            CourseAgentOption(
+                id: CourseAgentProvider.hosted,
+                title: "Hosted",
+                available: availability.available,
+                availabilityDescription: availability.reason
+            ),
+        ]
     }
 
     private static func appleOptions(
@@ -7681,11 +12190,122 @@ final class CourseExperienceStore {
     }
 
     private func persistAgentSelection() {
+        if CourseAgentProvider.usesLocalMessages(selectedAgentID ?? "") {
+            selectedReasoningEffortID = nil
+        } else if let selectedAgentServerID,
+                  modelInfo(
+                      runtimeID: selectedAgentID,
+                      serverID: selectedAgentServerID,
+                      modelID: selectedModelID
+                  ) != nil {
+            selectedReasoningEffortID = normalizedReasoningEffortID(
+                selectedReasoningEffortID,
+                runtimeID: selectedAgentID,
+                serverID: selectedAgentServerID,
+                modelID: selectedModelID
+            )
+        }
         defaults.set(selectedAgentID, forKey: Self.agentKey)
         defaults.set(selectedAgentServerID, forKey: Self.agentServerKey)
         defaults.set(selectedModelID, forKey: Self.modelKey)
         defaults.set(selectedReasoningEffortID, forKey: Self.effortKey)
         defaults.set(true, forKey: Self.setupKey)
+    }
+
+    private func normalizeReasoningEffortsAgainstCatalog(serverID: String) {
+        var coursesChanged = false
+        var discussionsChanged = false
+
+        if CourseAgentProvider.usesLocalMessages(selectedAgentID ?? "") {
+            selectedReasoningEffortID = nil
+        } else if selectedAgentServerID == serverID,
+                  modelInfo(
+                      runtimeID: selectedAgentID,
+                      serverID: serverID,
+                      modelID: selectedModelID
+                  ) != nil {
+            selectedReasoningEffortID = normalizedReasoningEffortID(
+                selectedReasoningEffortID,
+                runtimeID: selectedAgentID,
+                serverID: serverID,
+                modelID: selectedModelID
+            )
+        }
+
+        let effectiveCurrentServerID = effectiveMainCourseServerID()
+        if CourseAgentProvider.usesLocalMessages(currentAgentRuntimeID ?? "") {
+            currentAgentReasoningEffortID = nil
+        } else if effectiveCurrentServerID == serverID,
+                  modelInfo(
+            runtimeID: currentAgentRuntimeID,
+            serverID: serverID,
+            modelID: currentAgentModelID
+        ) != nil {
+            currentAgentReasoningEffortID = normalizedReasoningEffortID(
+                currentAgentReasoningEffortID,
+                runtimeID: currentAgentRuntimeID,
+                serverID: serverID,
+                modelID: currentAgentModelID
+            )
+        }
+
+        for index in courses.indices {
+            let runtimeID = courses[index].agentRuntimeKind
+            let normalized: String?
+            if CourseAgentProvider.usesLocalMessages(runtimeID ?? "") {
+                normalized = nil
+            } else if courses[index].agentServerID != serverID {
+                continue
+            } else if modelInfo(
+                runtimeID: runtimeID,
+                serverID: serverID,
+                modelID: courses[index].agentModelID
+            ) != nil {
+                normalized = normalizedReasoningEffortID(
+                    courses[index].agentReasoningEffortID,
+                    runtimeID: runtimeID,
+                    serverID: serverID,
+                    modelID: courses[index].agentModelID
+                )
+            } else {
+                continue
+            }
+            if courses[index].agentReasoningEffortID != normalized {
+                courses[index].agentReasoningEffortID = normalized
+                coursesChanged = true
+            }
+        }
+
+        for index in selectionDiscussions.indices {
+            let runtimeID = selectionDiscussions[index].agentRuntimeKind
+            let normalized: String?
+            if CourseAgentProvider.usesLocalMessages(runtimeID ?? "") {
+                normalized = nil
+            } else if selectionDiscussions[index].serverID != serverID {
+                continue
+            } else if modelInfo(
+                runtimeID: runtimeID,
+                serverID: serverID,
+                modelID: selectionDiscussions[index].agentModelID
+            ) != nil {
+                normalized = normalizedReasoningEffortID(
+                    selectionDiscussions[index].agentReasoningEffortID,
+                    runtimeID: runtimeID,
+                    serverID: serverID,
+                    modelID: selectionDiscussions[index].agentModelID
+                )
+            } else {
+                continue
+            }
+            if selectionDiscussions[index].agentReasoningEffortID != normalized {
+                selectionDiscussions[index].agentReasoningEffortID = normalized
+                discussionsChanged = true
+            }
+        }
+
+        if coursesChanged { persistCourses() }
+        if discussionsChanged { persistSelectionDiscussions() }
+        defaults.set(selectedReasoningEffortID, forKey: Self.effortKey)
     }
 
     /// Preserve the last legacy proposal as review context, but deliberately
@@ -7745,12 +12365,10 @@ final class CourseExperienceStore {
 
     Do not build until the learner explicitly approves a plan ID and revision. After approval:
     1. Use the exact plan arguments/result that Learnfold presented and the learner explicitly approved; never treat a workspace plan mirror as proof of approval.
-    2. Call `native-editor-fetch` with `self` to discover the connected root page, then fetch that root and retain its returned revision.
-    3. Update the root page title and metadata using `native-editor-update-page` with `course_role: course`, `course_node_id` equal to the stable plan ID, `bootstrap_status: building`, and the exact expected_revision from fetch.
-    4. Under the root, create editable pages for `Learner profile`, `Course design`, and `Agent notes`. Give them roles `context`, `context`, and `agent_notes`. The learner profile must separate demonstrated evidence from inference. Agent notes should be concise continuity notes.
-    5. Create the complete ordered chapter, subchapter, and lesson page hierarchy. Every planned item, including future content, must exist as its own clearly titled native page so the learner can see what is planned and generate that item separately; never leave planned descendants represented only in a folder's prose or outline. Give every page a stable `course_node_id` and a `course_role` of `chapter`, `subchapter`, `lesson`, `module`, or `explainer`. Mark Chapter 1 and its completed lesson pages `generated`; mark every later chapter and planned lesson `pending_generation`.
-    6. Generate full learning content ONLY for Chapter 1, including explanations, examples, and practice. Later chapter pages may contain a short objective and planned outline but not full lessons.
-    7. Fetch the root again and update `bootstrap_status` to `ready_for_learning` using its newest revision only after the whole hierarchy and Chapter 1 are ready.
+    2. Learnfold preflights and creates the connected root metadata, `Learner profile`, `Course design`, `Agent notes`, and the complete ordered chapter, subchapter, lesson, module, and explainer hierarchy before sending the approval instruction. Every planned item already exists as its own clearly titled native page with a stable `course_node_id` and typed `course_role`.
+    3. Generate full learning content ONLY for the exact initial leaf named by node ID, page ID, title, and role in Learnfold's approval instruction. Fetch that exact page immediately before changing it, pass its returned revision as `expected_revision`, update only that page, and mark it generated.
+    4. In the approval turn, do not update the root; create or edit context pages; recreate, reorder, or extend the hierarchy; or edit any ancestor, sibling, or later page. Keep every other planned page pending.
+    5. Learnfold owns the root `bootstrap_status` transition to `ready_for_learning` after it validates the exact initial leaf. Never set the root ready yourself.
 
     Tool discipline:
     - Fetch a page immediately before changing it and pass the returned `revision` as `expected_revision`.
@@ -7759,7 +12377,7 @@ final class CourseExperienceStore {
     - Child-page references are protected. Do not set `allow_deleting_content` unless the learner explicitly asked to remove that structure.
     - Use `allow_async` for large page creation or updates and poll `native-editor-get-async-task` until complete.
 
-    Folder status is a strict roll-up of its planned children: use `generated` when every child is generated, `pending_generation` when every child is pending, and `partially_generated` when child states are mixed. Never leave a folder `pending_generation` when all of its children are generated. Before finishing a generation turn, create titled native pages for any still-planned child lessons or subchapters and mark those pages `pending_generation`, so they appear individually in the Learn screen.
+    Folder status is a strict roll-up of its planned children: use `generated` when every child is generated, `pending_generation` when every child is pending, and `partially_generated` when child states are mixed. Never leave a folder `pending_generation` when all of its children are generated. Learnfold creates the full approved hierarchy; never create a missing planned page yourself. If a planned page is missing, stop and report that the course shell must be repaired.
 
     On later turns, reread Learner profile, Course design, Agent notes, and relevant completed pages with the native editor tools. For a requested pending node, mark only that page `generating`, generate only its required content and descendants, then reconcile that folder and every ancestor using the strict child-status roll-up above. Do not generate siblings or later sections. If the learner gives feedback without asking to generate, update durable notes only when helpful and otherwise reply conversationally.
 

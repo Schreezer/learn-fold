@@ -1,6 +1,30 @@
 import Foundation
 import SwiftUI
 
+extension AppConnectionStepSnapshot {
+    var connectionProgressPresentationDetail: String? {
+        if let detail,
+           !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return detail
+        }
+        guard state == .inProgress else { return nil }
+        return switch kind {
+        case .connectingToSsh:
+            nil
+        case .findingCodex:
+            "Finding Codex on the remote server."
+        case .installingCodex:
+            "Installing Codex on the remote server."
+        case .startingAppServer:
+            "Starting the Codex app server."
+        case .openingTunnel:
+            "Opening a secure tunnel."
+        case .connected:
+            "Finishing the server connection."
+        }
+    }
+}
+
 extension AppServerSnapshot {
     var isConnected: Bool {
         transportState == .connected
@@ -47,7 +71,8 @@ extension AppServerSnapshot {
     }
 
     var connectionProgressDetail: String? {
-        currentConnectionStep?.detail ?? connectionProgress?.terminalMessage
+        currentConnectionStep?.connectionProgressPresentationDetail
+            ?? connectionProgress?.terminalMessage
     }
 
     var statusLabel: String {

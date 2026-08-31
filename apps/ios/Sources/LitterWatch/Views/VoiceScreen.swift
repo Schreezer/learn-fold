@@ -158,6 +158,7 @@ struct VoiceScreen: View {
 
 /// Bridge from SwiftUI to watchOS's `presentTextInputController` — the only
 /// API that gives us the real Scribble / Dictate / Emoji picker.
+@MainActor
 enum WatchDictation {
     enum Result {
         case text(String)
@@ -175,9 +176,9 @@ enum WatchDictation {
             allowedInputMode: .plain
         ) { results in
             if let string = results?.compactMap({ $0 as? String }).first, !string.isEmpty {
-                DispatchQueue.main.async { completion(.text(string)) }
+                completion(.text(string))
             } else {
-                DispatchQueue.main.async { completion(.cancelled) }
+                completion(.cancelled)
             }
         }
     }

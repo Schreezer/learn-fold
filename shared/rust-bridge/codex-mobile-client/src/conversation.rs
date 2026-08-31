@@ -24,6 +24,9 @@ use codex_shell_command::parse_command::extract_shell_command;
 use serde::Serialize;
 
 const MOBILE_COMMAND_TEXT_CAP_BYTES: usize = 4 * 1024;
+// Strict-v2 plans are bounded to 48 nodes and capped text fields on iOS; this generous
+// envelope preserves valid plans without making arbitrary tool arguments unbounded.
+const MOBILE_COURSE_PLAN_ARGUMENT_CAP_BYTES: usize = 512 * 1024;
 const MOBILE_COMMAND_OUTPUT_CAP_BYTES: usize = 128 * 1024;
 const MOBILE_COMMAND_ACTION_FIELD_CAP_BYTES: usize = 1024;
 const MOBILE_COMMAND_ACTION_COUNT_CAP: usize = 32;
@@ -178,6 +181,25 @@ pub(crate) fn truncate_command_display_text(value: &str) -> String {
         MOBILE_COMMAND_TEXT_CAP_BYTES,
         MOBILE_COMMAND_TEXT_TRUNCATION_SUFFIX,
     )
+}
+
+fn hydrated_tool_arguments_json(
+    value: &impl Serialize,
+    preserves_bounded_course_plan: bool,
+) -> Option<String> {
+    let json = pretty_json(value)?;
+    if preserves_bounded_course_plan && json.len() <= MOBILE_COURSE_PLAN_ARGUMENT_CAP_BYTES {
+        return Some(json);
+    }
+    Some(truncate_command_display_text(&json))
+}
+
+fn is_learnfold_course_plan_mcp(server: &str, tool: &str) -> bool {
+    server == "learnfold_course" && tool == "present_course_plan"
+}
+
+fn is_learnfold_course_plan_dynamic(namespace: Option<&str>, tool: &str) -> bool {
+    tool == "present_course_plan" && matches!(namespace, None | Some("learnfold_course"))
 }
 
 pub(crate) fn truncate_command_output_text(value: &str) -> String {
@@ -366,8 +388,10 @@ fn convert_thread_item(
                     tool: tool.clone(),
                     status: convert_mcp_status(status),
                     duration_ms: *duration_ms,
-                    arguments_json: pretty_json(arguments)
-                        .map(|json| truncate_command_display_text(&json)),
+                    arguments_json: hydrated_tool_arguments_json(
+                        arguments,
+                        is_learnfold_course_plan_mcp(server, tool),
+                    ),
                     content_summary,
                     structured_content_json: structured_json,
                     raw_output_json,
@@ -423,8 +447,10 @@ fn convert_thread_item(
                     duration_ms: *duration_ms,
                     success: *success,
                     namespace: namespace.clone(),
-                    arguments_json: pretty_json(arguments)
-                        .map(|json| truncate_command_display_text(&json)),
+                    arguments_json: hydrated_tool_arguments_json(
+                        arguments,
+                        is_learnfold_course_plan_dynamic(namespace.as_deref(), tool),
+                    ),
                     display: build_dynamic_tool_display(
                         namespace.as_deref(),
                         tool,
@@ -2391,6 +2417,200 @@ diff --git a/parser.rs b/parser.rs\n\
         assert_eq!(display.summary, "Check bridge mapping");
         assert!(display.metadata.iter().any(|entry| entry.key == "Message"
             && entry.value == "Please verify the shared Rust hydration path."));
+    }
+
+    #[test]
+    fn test_bounded_course_plan_arguments_remain_lossless_beyond_display_cap() {
+        let narrative = "Detailed course narrative ".repeat(45);
+        let objective = "Build mathematical understanding ".repeat(35);
+        let practice_deliverable = "Complete a bounded calculus practice exercise ".repeat(10);
+        let explanation_deliverable =
+            "Explain a derivative using a realistic rate-of-change example. ".repeat(7);
+        let comparison_deliverable =
+            "Compare graphical and symbolic derivative interpretations. ".repeat(8);
+        let modeling_deliverable =
+            "Model accumulation with a bounded integral application. ".repeat(8);
+        let analysis_deliverable =
+            "Analyze a calculus solution and correct each reasoning error. ".repeat(8);
+        let reflection_deliverable =
+            "Reflect on when each calculus strategy is appropriate. ".repeat(8);
+        let arguments = serde_json::json!({
+            "workspace_id": "bounded-course-workspace",
+            "plan_id": "lossless-course-plan",
+            "revision": 1,
+            "structure_version": 2,
+            "title": "Calculus",
+            "summary": narrative,
+            "outcome": "Apply calculus concepts to realistic mathematical problems.",
+            "starting_point": "Comfortable with algebra and graph interpretation.",
+            "focus_gap": "Connecting derivatives to rates of change and accumulation.",
+            "estimated_duration": "Adaptive",
+            "chapters": [{
+                "id": "foundations",
+                "title": "Foundations",
+                "objective": objective,
+                "deliverables": [
+                    practice_deliverable,
+                    explanation_deliverable,
+                    comparison_deliverable,
+                    modeling_deliverable,
+                    analysis_deliverable,
+                    reflection_deliverable
+                ]
+            }],
+            "learning_path": [{
+                "id": "foundations",
+                "title": "Foundations",
+                "role": "chapter",
+                "children": [{
+                    "id": "derivative-intuition",
+                    "title": "Derivative Intuition",
+                    "role": "lesson",
+                    "children": []
+                }]
+            }]
+        });
+        let turns = vec![make_turn(
+            "t-lossless-tool-arguments",
+            vec![
+                ThreadItem::McpToolCall {
+                    id: "mcp-plan".into(),
+                    server: "learnfold_course".into(),
+                    tool: "present_course_plan".into(),
+                    status: McpToolCallStatus::Completed,
+                    arguments: arguments.clone(),
+                    app_context: None,
+                    mcp_app_resource_uri: None,
+                    plugin_id: None,
+                    result: None,
+                    error: None,
+                    duration_ms: Some(42),
+                },
+                ThreadItem::DynamicToolCall {
+                    id: "dynamic-plan".into(),
+                    namespace: None,
+                    tool: "present_course_plan".into(),
+                    arguments: arguments.clone(),
+                    status: DynamicToolCallStatus::Completed,
+                    content_items: None,
+                    success: Some(true),
+                    duration_ms: Some(42),
+                },
+            ],
+        )];
+
+        let items = hydrate_turns(&turns, &HydrationOptions::default());
+        assert_eq!(items.len(), 2);
+
+        let HydratedConversationItemContent::McpToolCall(mcp) = &items[0].content else {
+            panic!("expected McpToolCall");
+        };
+        let mcp_arguments = mcp.arguments_json.as_deref().expect("MCP arguments");
+        assert!(mcp_arguments.len() > MOBILE_COMMAND_TEXT_CAP_BYTES);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(mcp_arguments).expect("valid MCP JSON"),
+            arguments
+        );
+
+        let HydratedConversationItemContent::DynamicToolCall(dynamic) = &items[1].content else {
+            panic!("expected DynamicToolCall");
+        };
+        let dynamic_arguments = dynamic
+            .arguments_json
+            .as_deref()
+            .expect("dynamic tool arguments");
+        assert!(dynamic_arguments.len() > MOBILE_COMMAND_TEXT_CAP_BYTES);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(dynamic_arguments)
+                .expect("valid dynamic tool JSON"),
+            arguments
+        );
+    }
+
+    #[test]
+    fn test_oversized_generic_tool_arguments_remain_display_capped() {
+        let arguments = serde_json::json!({
+            "untrusted_detail": "generic tool argument ".repeat(500),
+        });
+        let turns = vec![make_turn(
+            "t-capped-generic-tool-arguments",
+            vec![
+                ThreadItem::McpToolCall {
+                    id: "mcp-generic".into(),
+                    server: "generic-server".into(),
+                    tool: "present_course_plan".into(),
+                    status: McpToolCallStatus::Completed,
+                    arguments: arguments.clone(),
+                    app_context: None,
+                    mcp_app_resource_uri: None,
+                    plugin_id: None,
+                    result: None,
+                    error: None,
+                    duration_ms: None,
+                },
+                ThreadItem::DynamicToolCall {
+                    id: "dynamic-generic".into(),
+                    namespace: Some("generic".into()),
+                    tool: "present_course_plan".into(),
+                    arguments,
+                    status: DynamicToolCallStatus::Completed,
+                    content_items: None,
+                    success: Some(true),
+                    duration_ms: None,
+                },
+            ],
+        )];
+
+        let items = hydrate_turns(&turns, &HydrationOptions::default());
+        let HydratedConversationItemContent::McpToolCall(mcp) = &items[0].content else {
+            panic!("expected McpToolCall");
+        };
+        let HydratedConversationItemContent::DynamicToolCall(dynamic) = &items[1].content else {
+            panic!("expected DynamicToolCall");
+        };
+        for display in [
+            mcp.arguments_json.as_deref().expect("MCP arguments"),
+            dynamic
+                .arguments_json
+                .as_deref()
+                .expect("dynamic arguments"),
+        ] {
+            assert!(display.len() <= MOBILE_COMMAND_TEXT_CAP_BYTES);
+            assert!(display.ends_with(MOBILE_COMMAND_TEXT_TRUNCATION_SUFFIX));
+            assert!(display.starts_with('{'));
+        }
+    }
+
+    #[test]
+    fn test_course_plan_arguments_above_explicit_ceiling_fall_back_to_display_cap() {
+        let arguments = serde_json::json!({
+            "plan_id": "oversized-course-plan",
+            "summary": "x".repeat(MOBILE_COURSE_PLAN_ARGUMENT_CAP_BYTES + 1),
+        });
+        let turns = vec![make_turn(
+            "t-oversized-course-plan-arguments",
+            vec![ThreadItem::McpToolCall {
+                id: "mcp-oversized-plan".into(),
+                server: "learnfold_course".into(),
+                tool: "present_course_plan".into(),
+                status: McpToolCallStatus::Completed,
+                arguments,
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                result: None,
+                error: None,
+                duration_ms: None,
+            }],
+        )];
+
+        let items = hydrate_turns(&turns, &HydrationOptions::default());
+        let HydratedConversationItemContent::McpToolCall(mcp) = &items[0].content else {
+            panic!("expected McpToolCall");
+        };
+        let display = mcp.arguments_json.as_deref().expect("MCP arguments");
+        assert!(display.len() <= MOBILE_COMMAND_TEXT_CAP_BYTES);
+        assert!(display.ends_with(MOBILE_COMMAND_TEXT_TRUNCATION_SUFFIX));
     }
 
     #[test]

@@ -3,6 +3,66 @@ import XCTest
 
 @MainActor
 final class HermesPairingLifecycleCoordinatorTests: XCTestCase {
+    func testCheckpointParserFailsClosed() {
+        XCTAssertEqual(
+            HermesLinkCheckpointConfiguration.parse(
+                arguments: ["Litter", "--ui-test-hermes-link-checkpoint", "waiting"],
+                environment: ["LEARNFOLD_UI_TESTING": "1"]
+            ),
+            .scenario(.waiting)
+        )
+        for arguments in [
+            ["Litter", "--ui-test-hermes-link-checkpoint"],
+            ["Litter", "--ui-test-hermes-link-checkpoint", "unknown"],
+            ["Litter", "--ui-test-hermes-link-checkpoint", "waiting", "--ui-test-hermes-link-checkpoint", "copied"],
+            ["Litter", "waiting"],
+            ["Litter", "--ui-test-hermes-link-checkpoin", "waiting"],
+            ["Litter", "--ui-test-hermes-link-checkpoint", "waiting", "bare-extra"],
+            ["Litter", "--unrelated", "--ui-test-hermes-link-checkpoint", "waiting"],
+        ] {
+            XCTAssertEqual(
+                HermesLinkCheckpointConfiguration.parse(arguments: arguments, environment: ["LEARNFOLD_UI_TESTING": "1"]),
+                .invalid
+            )
+        }
+        XCTAssertEqual(
+            HermesLinkCheckpointConfiguration.parse(
+                arguments: ["Litter", "--ui-test-hermes-link-checkpoint", "waiting"],
+                environment: [:]
+            ),
+            .invalid
+        )
+    }
+
+    func testCheckpointCancelAndCompletionDoNotCallInjectedBrokerOrStore() async {
+        let broker = HermesPairingBrokerStub()
+        let store = HermesPairingMemoryStore()
+        let coordinator = HermesPairingLifecycleCoordinator(
+            broker: broker,
+            store: store,
+            checkpointScenario: .waiting,
+            checkpointIsolated: true
+        )
+        coordinator.restoreAndResume()
+        _ = try? await coordinator.createRequest(installationId: "REDACTED-INSTALLATION")
+        _ = await coordinator.claim()
+        coordinator.cancel()
+        XCTAssertTrue(coordinator.completeConnection(requestID: "REDACTED-REQUEST"))
+        XCTAssertNil(store.saved)
+        XCTAssertEqual(store.callCounts, .zero)
+        let brokerCallCounts = await broker.callCounts()
+        XCTAssertEqual(brokerCallCounts, .zero)
+    }
+
+    func testExpiredCheckpointUsesTypedRenewalState() async throws {
+        let coordinator = HermesPairingLifecycleCoordinator(
+            checkpointScenario: .expired,
+            checkpointIsolated: true
+        )
+        XCTAssertTrue(coordinator.shouldCopyNewSetupPrompt)
+        _ = try await coordinator.createRequest(installationId: "REDACTED-INSTALLATION")
+        XCTAssertFalse(coordinator.shouldCopyNewSetupPrompt)
+    }
     func testTransientPollFailureRetainsRequestAndRetriesWithBoundedBackoff() async throws {
         let now = Date(timeIntervalSince1970: 1_000)
         let request = makeRequest(id: "request-1", now: now)
@@ -85,6 +145,7 @@ final class HermesPairingLifecycleCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.request)
         XCTAssertNil(store.saved)
         XCTAssertEqual(statusCallCount, 0)
+        XCTAssertTrue(coordinator.shouldCopyNewSetupPrompt)
     }
 
     func testBrokerTerminalExpiryClearsPersistedRequest() async throws {
@@ -107,6 +168,57 @@ final class HermesPairingLifecycleCoordinatorTests: XCTestCase {
 
         XCTAssertNil(store.saved)
         XCTAssertEqual(coordinator.phase, .idle)
+        XCTAssertTrue(coordinator.shouldCopyNewSetupPrompt)
+    }
+
+    func testFailedRenewalKeepsTypedNewPromptAffordance() async {
+        let now = Date(timeIntervalSince1970: 3_750)
+        let expired = HermesPairingRequest(
+            requestId: "expired-before-failed-renewal",
+            submitURL: URL(string: "https://example.com/expired-before-failed-renewal")!,
+            claimToken: "expired-secret",
+            expiresAt: now.addingTimeInterval(-1)
+        )
+        let coordinator = HermesPairingLifecycleCoordinator(
+            broker: HermesPairingBrokerStub(),
+            store: HermesPairingMemoryStore(saved: expired),
+            now: { now }
+        )
+
+        coordinator.restoreAndResume()
+        XCTAssertTrue(coordinator.shouldCopyNewSetupPrompt)
+
+        do {
+            _ = try await coordinator.createRequest(installationId: "installation")
+            XCTFail("Expected renewal creation to fail")
+        } catch {}
+
+        XCTAssertTrue(coordinator.shouldCopyNewSetupPrompt)
+    }
+
+    func testSuccessfulRenewalClearsTypedNewPromptAffordance() async throws {
+        let now = Date(timeIntervalSince1970: 3_900)
+        let expired = HermesPairingRequest(
+            requestId: "expired-before-renewal",
+            submitURL: URL(string: "https://example.com/expired-before-renewal")!,
+            claimToken: "expired-secret",
+            expiresAt: now.addingTimeInterval(-1)
+        )
+        let replacement = makeRequest(id: "replacement", now: now)
+        let coordinator = HermesPairingLifecycleCoordinator(
+            broker: HermesPairingBrokerStub(created: [replacement]),
+            store: HermesPairingMemoryStore(saved: expired),
+            now: { now }
+        )
+
+        coordinator.restoreAndResume()
+        XCTAssertTrue(coordinator.shouldCopyNewSetupPrompt)
+        coordinator.pause()
+
+        _ = try await coordinator.createRequest(installationId: "installation")
+
+        XCTAssertFalse(coordinator.shouldCopyNewSetupPrompt)
+        XCTAssertEqual(coordinator.request, replacement)
     }
 
     func testReplacementRejectsStaleCompletionIdentity() async throws {
@@ -180,7 +292,7 @@ final class HermesPairingLifecycleCoordinatorTests: XCTestCase {
         XCTAssertEqual(cancelledRequestIDs, [request.requestId])
     }
 
-    func testClaimedAndPausedReadyRequestRemainReviewableForRecovery() async throws {
+    func testOnlyReadyPhaseExposesReviewAction() async throws {
         let now = Date(timeIntervalSince1970: 5_500)
         let request = makeRequest(id: "recoverable-claim", now: now)
         let host = HermesPairingStatus.Host(name: "Hermes Mac", nodeId: "node")
@@ -204,13 +316,14 @@ final class HermesPairingLifecycleCoordinatorTests: XCTestCase {
 
         coordinator.pause()
         XCTAssertEqual(coordinator.phase, .paused)
-        XCTAssertTrue(coordinator.canReviewReadyPairing)
+        XCTAssertFalse(coordinator.canReviewReadyPairing)
 
         coordinator.resume()
         XCTAssertEqual(coordinator.phase, .ready)
+        XCTAssertTrue(coordinator.canReviewReadyPairing)
         _ = await coordinator.claim()
         XCTAssertEqual(coordinator.phase, .claimed)
-        XCTAssertTrue(coordinator.canReviewReadyPairing)
+        XCTAssertFalse(coordinator.canReviewReadyPairing)
     }
 
     func testDelayedConnectionAAndQRCompletionCannotClearReplacementB() async throws {
@@ -406,10 +519,11 @@ private enum HermesPairingTestStoreError: Error {
 }
 
 private actor HermesPairingBrokerStub: HermesPairingBrokerServing {
+    struct CallCounts: Equatable { var create = 0; var status = 0; var claim = 0; var cancel = 0; static let zero = Self() }
     private var created: [HermesPairingRequest]
     private var statuses: [HermesPairingStatusStep]
     private var claims: [HermesPairingClaimStep]
-    private var statusCalls = 0
+    private var counts = CallCounts.zero
     private var cancelled: [String] = []
 
     init(
@@ -423,12 +537,13 @@ private actor HermesPairingBrokerStub: HermesPairingBrokerServing {
     }
 
     func createRequest(installationId: String) async throws -> HermesPairingRequest {
+        counts.create += 1
         guard !created.isEmpty else { throw HermesPairingStubError.server }
         return created.removeFirst()
     }
 
     func status(for pairing: HermesPairingRequest) async throws -> HermesPairingStatus {
-        statusCalls += 1
+        counts.status += 1
         guard !statuses.isEmpty else { throw HermesPairingStubError.offline }
         switch statuses.removeFirst() {
         case let .success(status):
@@ -441,6 +556,7 @@ private actor HermesPairingBrokerStub: HermesPairingBrokerServing {
     }
 
     func claim(_ pairing: HermesPairingRequest) async throws -> String {
+        counts.claim += 1
         guard !claims.isEmpty else { throw HermesPairingStubError.server }
         switch claims.removeFirst() {
         case let .success(payload):
@@ -451,19 +567,23 @@ private actor HermesPairingBrokerStub: HermesPairingBrokerServing {
     }
 
     func cancel(_ pairing: HermesPairingRequest) async {
+        counts.cancel += 1
         cancelled.append(pairing.requestId)
     }
 
     func statusCallCount() -> Int {
-        statusCalls
+        counts.status
     }
 
     func cancelledRequestIDs() -> [String] {
         cancelled
     }
+    func callCounts() -> CallCounts { counts }
 }
 
 private final class HermesPairingMemoryStore: HermesPairingPendingStoring {
+    struct CallCounts: Equatable { var load = 0; var save = 0; var clear = 0; static let zero = Self() }
+    var callCounts = CallCounts.zero
     var saved: HermesPairingRequest?
     var failSaveRequestIDs: Set<String> = []
     var failClear = false
@@ -473,10 +593,12 @@ private final class HermesPairingMemoryStore: HermesPairingPendingStoring {
     }
 
     func load() throws -> HermesPairingRequest? {
-        saved
+        callCounts.load += 1
+        return saved
     }
 
     func save(_ request: HermesPairingRequest) throws {
+        callCounts.save += 1
         if failSaveRequestIDs.contains(request.requestId) {
             throw HermesPairingTestStoreError.writeFailed
         }
@@ -484,6 +606,7 @@ private final class HermesPairingMemoryStore: HermesPairingPendingStoring {
     }
 
     func clear() throws {
+        callCounts.clear += 1
         if failClear {
             throw HermesPairingTestStoreError.clearFailed
         }

@@ -19,10 +19,13 @@ private struct VideoTransferable: Transferable {
     }
 }
 
+@MainActor
 struct WallpaperSelectionView: View {
     @Environment(WallpaperManager.self) private var wallpaperManager
     @Environment(ThemeManager.self) private var themeManager
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.textScale) private var textScale
+    @Environment(\.litterFontFamilyOverride) private var fontFamilyOverride
 
     let threadKey: ThreadKey?
     var serverId: String? = nil
@@ -242,7 +245,17 @@ struct WallpaperSelectionView: View {
     }
 
     private var backgroundTabContent: some View {
-        ScrollView(.vertical, showsIndicators: false) {
+        // PhotosPicker's label closure is nonisolated. Resolve the
+        // environment-dependent font and processing state before entering it
+        // so the closure only captures value snapshots.
+        let pickerFont = LitterFont.styled(
+            size: 14,
+            scale: textScale,
+            familyOverride: fontFamilyOverride
+        )
+        let videoIsProcessing = isProcessingVideo
+
+        return ScrollView(.vertical, showsIndicators: false) {
             VStack(spacing: 16) {
                 // Theme thumbnails
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -264,7 +277,7 @@ struct WallpaperSelectionView: View {
                             .font(.system(size: 16))
                             .foregroundStyle(LitterTheme.accent)
                         Text("Choose Wallpaper from Photos")
-                            .litterFont(size: 14)
+                            .font(pickerFont)
                             .foregroundStyle(LitterTheme.textPrimary)
                         Spacer()
                         Image(systemName: "chevron.right")
@@ -284,10 +297,10 @@ struct WallpaperSelectionView: View {
                             .font(.system(size: 16))
                             .foregroundStyle(LitterTheme.accent)
                         Text("Choose Video from Photos")
-                            .litterFont(size: 14)
+                            .font(pickerFont)
                             .foregroundStyle(LitterTheme.textPrimary)
                         Spacer()
-                        if isProcessingVideo {
+                        if videoIsProcessing {
                             ProgressView()
                                 .tint(LitterTheme.accent)
                         } else {
@@ -298,7 +311,7 @@ struct WallpaperSelectionView: View {
                     }
                     .padding(.horizontal, 16)
                 }
-                .disabled(isProcessingVideo)
+                .disabled(videoIsProcessing)
                 .onChange(of: selectedVideoItem) { _, newItem in
                     Task { await loadVideo(newItem) }
                 }
@@ -373,7 +386,13 @@ struct WallpaperSelectionView: View {
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .stroke(selectedThemeSlug == nil && previewConfig?.type == .none ? LitterTheme.accent : LitterTheme.border, lineWidth: 2)
+                        .stroke(
+                            selectedThemeSlug == nil
+                                && previewConfig.explicitlySelectsNoWallpaper
+                                ? LitterTheme.accent
+                                : LitterTheme.border,
+                            lineWidth: 2
+                        )
                 )
 
                 Text("None")
@@ -700,6 +719,7 @@ private enum WallpaperTab: String, CaseIterable, Identifiable {
 
 // MARK: - Streaming Effect Preview
 
+@MainActor
 private struct StreamingEffectPreview: View {
     var config: TypingEffectConfig
     @State private var renderer: StreamingMarkdownRenderer
@@ -768,4 +788,3 @@ private struct StreamingEffectPreview: View {
         }
     }
 }
-

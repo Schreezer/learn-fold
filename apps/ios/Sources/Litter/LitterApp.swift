@@ -4,6 +4,1132 @@ import UserNotifications
 import Combine
 import os
 
+enum LearnfoldStrictHarnessRoot: Equatable {
+    case courseRecovery
+    case serverLifecycle
+    case providerSettingsSource
+    case courseGeneration
+    case courseEditor
+    case hermesLink
+    case courseRouteFallback
+    case configurationError
+}
+
+#if DEBUG
+enum StrictUITestSuiteID: String, Equatable {
+    case courseRecovery = "course-recovery"
+    case serverLifecycle = "server-lifecycle"
+    case providerSettingsSource = "provider-settings-source"
+    case courseGeneration = "course-generation"
+    case courseEditor = "course-editor"
+    case hermesLink = "hermes-link"
+    case courseRouteFallback = "course-route-fallback"
+}
+
+/// Debug-only control that holds the genuine launch splash on one branded
+/// frame long enough for paired pixel and accessibility capture. The symbol
+/// and behavior do not exist in Release builds.
+enum LearnfoldSplashAcceptanceFreezePolicy {
+    static let launchArgument = "--lf-01-splash-freeze-hook"
+
+    static func isEnabled(
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) -> Bool {
+        arguments.contains(launchArgument)
+    }
+}
+
+struct StrictUITestSuiteDescriptor {
+    let id: StrictUITestSuiteID
+    let routes: [String: Set<String>]
+    let scenarioShapePrefixes: [String]
+    let suiteSignalPrefixes: [String]
+    let detectsOrphanScenarioArguments: Bool
+    let auxiliaryCheckpointArguments: Set<String>
+
+    init(
+        id: StrictUITestSuiteID,
+        routes: [String: Set<String>],
+        scenarioShapePrefixes: [String],
+        suiteSignalPrefixes: [String] = [],
+        detectsOrphanScenarioArguments: Bool = true,
+        auxiliaryCheckpointArguments: Set<String> = []
+    ) {
+        self.id = id
+        self.routes = routes
+        self.scenarioShapePrefixes = scenarioShapePrefixes
+        self.suiteSignalPrefixes = suiteSignalPrefixes
+        self.detectsOrphanScenarioArguments = detectsOrphanScenarioArguments
+        self.auxiliaryCheckpointArguments = auxiliaryCheckpointArguments
+    }
+
+    var allScenarioArguments: Set<String> {
+        routes.values.reduce(into: Set<String>()) { result, values in
+            result.formUnion(values)
+        }
+    }
+
+    func isRouteShaped(_ argument: String) -> Bool {
+        routes.keys.contains { route in
+            argument == route
+                || argument.hasPrefix("\(route)-")
+                || argument.hasPrefix("\(route)=")
+        }
+    }
+
+    func isScenarioShaped(_ argument: String) -> Bool {
+        scenarioShapePrefixes.contains { argument.hasPrefix($0) }
+    }
+
+    func isScenarioToken(_ argument: String) -> Bool {
+        allScenarioArguments.contains(argument) || isScenarioShaped(argument)
+    }
+
+    func containsSignal(_ argument: String) -> Bool {
+        isRouteShaped(argument)
+            || isScenarioShaped(argument)
+            || (detectsOrphanScenarioArguments && allScenarioArguments.contains(argument))
+            || suiteSignalPrefixes.contains { argument.hasPrefix($0) }
+            || auxiliaryCheckpointArguments.contains(argument)
+    }
+
+    /// The one registration surface for every deterministic checkpoint route.
+    /// A registered suite may still be explicitly quarantined after its typed
+    /// configuration parses if its current view construction is not isolated.
+    static var registered: [StrictUITestSuiteDescriptor] {
+        let serverRoutes = Dictionary(
+            grouping: ServerLifecycleCheckpointScenario.allCases,
+            by: \.route
+        ).mapValues { Set($0.map(\.rawValue)) }
+        let courseGenerationRoutes = Dictionary(
+            grouping: CourseGenerationCheckpointScenario.allCases,
+            by: \.route
+        ).mapValues { Set($0.map(\.rawValue)) }
+        return [
+            StrictUITestSuiteDescriptor(
+                id: .courseRecovery,
+                routes: [
+                    LearnfoldStrictHarnessPolicy.recoveryCheckpointBaseArgument:
+                        Set(CourseRecoveryCheckpointUITestScenario.allCases.map(\.rawValue)),
+                ],
+                scenarioShapePrefixes: [
+                    "--ui-test-lf34-",
+                    "--ui-test-lf35-",
+                    "--ui-test-lf36-",
+                    "--ui-test-lf53-",
+                ]
+            ),
+            StrictUITestSuiteDescriptor(
+                id: .serverLifecycle,
+                routes: serverRoutes,
+                scenarioShapePrefixes:
+                    LearnfoldStrictHarnessPolicy.serverLifecycleCheckpointStatePrefixes
+            ),
+            StrictUITestSuiteDescriptor(
+                id: .providerSettingsSource,
+                routes: [
+                    ProviderSettingsSourceCheckpointScenario.launchArgument:
+                        Set(ProviderSettingsSourceCheckpointScenario.allCases.map(\.rawValue)),
+                ],
+                scenarioShapePrefixes: [
+                    "--ui-test-lf03-",
+                    "--ui-test-lf05-",
+                    "--ui-test-lf06-",
+                    "--ui-test-lf27-",
+                    "--ui-test-lf28-",
+                    "--ui-test-lf30-",
+                ]
+            ),
+            StrictUITestSuiteDescriptor(
+                id: .courseGeneration,
+                routes: courseGenerationRoutes,
+                scenarioShapePrefixes: [
+                    "--ui-test-lf39-",
+                    "--ui-test-lf40-",
+                    "--ui-test-lf44-",
+                ]
+            ),
+            StrictUITestSuiteDescriptor(
+                id: .courseEditor,
+                routes: [
+                    CourseEditorCheckpointUITestConfigurationParser.baseFlag:
+                        Set(CourseEditorCheckpointUITestScenario.allCases.map(\.rawValue)),
+                ],
+                scenarioShapePrefixes: [
+                    "--checkpoint-lf45-",
+                    "--checkpoint-lf47-",
+                    "--checkpoint-lf48-",
+                    "--checkpoint-lf49-",
+                    "--checkpoint-lf50-",
+                    "--checkpoint-lf51-",
+                ],
+                auxiliaryCheckpointArguments: [
+                    CourseEditorCheckpointUITestConfigurationParser.runTokenFlag,
+                ]
+            ),
+            StrictUITestSuiteDescriptor(
+                id: .hermesLink,
+                routes: [
+                    HermesLinkCheckpointScenario.argument:
+                        Set(HermesLinkCheckpointScenario.allCases.map(\.rawValue)),
+                ],
+                scenarioShapePrefixes: [],
+                suiteSignalPrefixes: ["--ui-test-hermes-link"],
+                // Link's raw states are ordinary words such as "initial" and
+                // "waiting". They are only checkpoint signals after its route
+                // selects the suite; globally quarantining those words would
+                // capture unrelated Debug launches.
+                detectsOrphanScenarioArguments: false
+            ),
+            StrictUITestSuiteDescriptor(
+                id: .courseRouteFallback,
+                routes: [
+                    CourseRouteFallbackUITestScenario.argument:
+                        Set(CourseRouteFallbackUITestScenario.allCases.map(\.rawValue)),
+                ],
+                scenarioShapePrefixes: [],
+                suiteSignalPrefixes: [CourseRouteFallbackUITestScenario.argument]
+            ),
+        ]
+    }
+}
+
+enum DebugLaunchSignalAuthorityCategory: String, Equatable {
+    case registeredStrict = "registered-strict"
+    case liveOnly = "live-only"
+    case retiredWaiver = "retired-waiver"
+    case explicitlyQuarantined = "explicitly-quarantined"
+    case strictAuxiliary = "strict-auxiliary"
+}
+
+/// One code-level authority inventory for Debug launch controls that remain
+/// outside the typed strict suites. Legacy regressions may still run alone,
+/// but a strict route must never silently absorb one of their controls.
+enum DebugLaunchSignalAuthorityInventory {
+    static let legacyPrimaryArguments: Set<String> = [
+        "--ui-test-course-draft-recovery",
+        "--ui-test-course-generation-control",
+        "--ui-test-course-retry",
+        "--ui-test-course-save-recovery",
+        "--ui-test-course-chat-continuity",
+        "--ui-test-conversation-display",
+    ]
+
+    static let legacyModifierArguments: Set<String> = [
+        "--ui-test-dynamic-type-default",
+        "--ui-test-dynamic-type-ax3xl",
+        "--ui-test-generation-recovery-acceptance-unknown",
+        "--ui-test-generation-recovery-accepted-reply-incomplete",
+        "--ui-test-open-settings",
+    ]
+
+    /// These spellings are deliberately not fixtures. They document controls
+    /// whose evidence must still come from the genuine live product.
+    static let liveOnlyArguments: Set<String> = [
+        LearnfoldSplashAcceptanceFreezePolicy.launchArgument,
+        LF05LiveAcceptanceControl.launchArgument,
+        LF05LiveAcceptanceControl.saving.rawValue,
+        LF05LiveAcceptanceControl.error.rawValue,
+        LF06LiveAcceptanceControl.launchArgument,
+        LF06LiveAcceptanceControl.connecting.rawValue,
+        LF06LiveAcceptanceControl.failed.rawValue,
+        "--ui-test-lf32-optimistic",
+        "--ui-test-lf41-completion",
+        "--ui-test-lf52-answer",
+    ]
+
+    static let legacyControllingEnvironmentKeys: Set<String> = [
+        "LEARNFOLD_MARKETING_SCREEN",
+        "SNAPPY_RESET_ONBOARDING",
+        "SNAPPY_APPLE_ON_DEVICE_AVAILABLE",
+        "SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE",
+        "CODEXIOS_UI_TEST_REASONING_MODE",
+        "CODEXIOS_UI_TEST_COMMAND_MODE",
+        "CODEXIOS_UI_TEST_TOOL_MODE",
+        "CODEXIOS_SIM_AUTO_SSH",
+        "CODEXIOS_SIM_AUTO_SSH_HOST",
+        "CODEXIOS_SIM_AUTO_SSH_USER",
+        "CODEXIOS_SIM_AUTO_SSH_PASS",
+        "CODEXIOS_SIM_AUTO_SSH_KEY_PATH",
+        "CODEXIOS_SIM_AUTO_SSH_PASSPHRASE",
+    ]
+
+    /// Existing strict suites intentionally set these. They select no fixture
+    /// root and therefore remain compatible with typed strict dispatch.
+    static let strictAuxiliaryEnvironmentKeys: Set<String> = [
+        "LEARNFOLD_UI_TESTING",
+        "SNAPPY_SKIP_AGENT_SETUP",
+        "CODEXIOS_UI_TEST_FORCE_DISCOVERY",
+    ]
+
+    static let liveOnlyEvidenceMarkers: Set<String> = [
+        "course-request-lifecycle",
+        "course-building-state",
+        "course-building-open-course",
+        "course-detail-root",
+        "focused-qa-state",
+        "focused-qa-open-reader",
+        "focused-qa-reader",
+        "course-chat-resolve",
+    ]
+
+    static let retiredWaiverCheckpoints: Set<String> = ["LF-08", "LF-10"]
+
+    static func category(
+        forArgument argument: String,
+        suites: [StrictUITestSuiteDescriptor] = StrictUITestSuiteDescriptor.registered
+    ) -> DebugLaunchSignalAuthorityCategory? {
+        if suites.contains(where: { suite in
+            suite.containsSignal(argument)
+                || suite.routes.keys.contains(argument)
+                || suite.allScenarioArguments.contains(argument)
+                || suite.auxiliaryCheckpointArguments.contains(argument)
+        }) {
+            return .registeredStrict
+        }
+        if liveOnlyArguments.contains(argument) {
+            return .liveOnly
+        }
+        if legacyPrimaryArguments.contains(argument)
+            || legacyModifierArguments.contains(argument) {
+            return .explicitlyQuarantined
+        }
+        return nil
+    }
+
+    static func category(
+        forEnvironmentKey key: String
+    ) -> DebugLaunchSignalAuthorityCategory? {
+        if strictAuxiliaryEnvironmentKeys.contains(key) {
+            return .strictAuxiliary
+        }
+        if legacyControllingEnvironmentKeys.contains(key) {
+            return .explicitlyQuarantined
+        }
+        return nil
+    }
+
+    static func category(
+        forEvidenceMarker marker: String
+    ) -> DebugLaunchSignalAuthorityCategory? {
+        liveOnlyEvidenceMarkers.contains(marker) ? .liveOnly : nil
+    }
+
+    static func category(
+        forCheckpoint checkpoint: String
+    ) -> DebugLaunchSignalAuthorityCategory? {
+        retiredWaiverCheckpoints.contains(checkpoint) ? .retiredWaiver : nil
+    }
+
+    static func conflictingSignals(
+        arguments: [String],
+        environment: [String: String]
+    ) -> [String] {
+        let conflictingArguments = arguments.filter {
+            legacyPrimaryArguments.contains($0)
+                || legacyModifierArguments.contains($0)
+                || liveOnlyArguments.contains($0)
+        }
+        let conflictingEnvironment = environment.keys
+            .filter(legacyControllingEnvironmentKeys.contains)
+            .map { "env:\($0)" }
+        return Array(Set(conflictingArguments + conflictingEnvironment)).sorted()
+    }
+}
+
+enum StrictUITestFixture: Equatable {
+    case courseRecovery(CourseRecoveryCheckpointUITestScenario)
+    case serverLifecycle(ServerLifecycleCheckpointScenario)
+    case providerSettingsSource(ProviderSettingsSourceCheckpointScenario)
+    case courseGeneration(CourseGenerationCheckpointScenario)
+    case courseEditor(CourseEditorCheckpointUITestConfiguration)
+    case hermesLink(HermesLinkCheckpointScenario)
+    case courseRouteFallback(CourseRouteFallbackUITestScenario)
+
+    var suiteID: StrictUITestSuiteID {
+        switch self {
+        case .courseRecovery: .courseRecovery
+        case .serverLifecycle: .serverLifecycle
+        case .providerSettingsSource: .providerSettingsSource
+        case .courseGeneration: .courseGeneration
+        case .courseEditor: .courseEditor
+        case .hermesLink: .hermesLink
+        case .courseRouteFallback: .courseRouteFallback
+        }
+    }
+
+    var root: LearnfoldStrictHarnessRoot {
+        switch self {
+        case .courseRecovery: .courseRecovery
+        case .serverLifecycle: .serverLifecycle
+        case .providerSettingsSource: .providerSettingsSource
+        case .courseGeneration: .courseGeneration
+        case .courseEditor: .courseEditor
+        case .hermesLink: .hermesLink
+        case .courseRouteFallback: .courseRouteFallback
+        }
+    }
+
+    var canRenderWithoutLiveDependencies: Bool {
+        switch self {
+        case .courseRecovery, .serverLifecycle, .providerSettingsSource,
+             .courseGeneration, .courseEditor, .hermesLink,
+             .courseRouteFallback:
+            true
+        }
+    }
+}
+
+enum StrictUITestLaunchErrorCode: String, Error, Equatable {
+    case testingEnvironmentRequired = "testing-environment-required"
+    case unregisteredCheckpoint = "unregistered-checkpoint"
+    case mixedLaunchAuthorities = "mixed-launch-authorities"
+    case multipleSuites = "multiple-suites"
+    case missingRoute = "missing-route"
+    case missingState = "missing-state"
+    case unknownState = "unknown-state"
+    case routeStateMismatch = "route-state-mismatch"
+    case duplicateRoute = "duplicate-route"
+    case multipleRoutes = "multiple-routes"
+    case multipleStates = "multiple-states"
+    case suiteConfiguration = "suite-configuration"
+    case harnessUnavailable = "harness-unavailable"
+
+    var message: String {
+        switch self {
+        case .testingEnvironmentRequired:
+            "Strict checkpoint routes require LEARNFOLD_UI_TESTING=1."
+        case .unregisteredCheckpoint:
+            "A UI-test or checkpoint-shaped argument was not registered with the strict launch parser."
+        case .mixedLaunchAuthorities:
+            "A strict route cannot be combined with legacy, live-only, marketing, or non-authoritative test controls."
+        case .multipleSuites:
+            "Only one strict checkpoint suite may be selected per launch."
+        case .missingRoute:
+            "A checkpoint scenario was provided without its exact route."
+        case .missingState:
+            "The checkpoint route must be followed immediately by one scenario token."
+        case .unknownState:
+            "The checkpoint route was followed by an unknown scenario token."
+        case .routeStateMismatch:
+            "The checkpoint scenario does not belong to the selected route."
+        case .duplicateRoute:
+            "A checkpoint route may appear exactly once."
+        case .multipleRoutes:
+            "Only one checkpoint route may be selected per launch."
+        case .multipleStates:
+            "Only the one adjacent checkpoint scenario token is allowed."
+        case .suiteConfiguration:
+            "The selected checkpoint suite rejected its typed configuration."
+        case .harnessUnavailable:
+            "This checkpoint is quarantined until its root can be constructed without live dependencies."
+        }
+    }
+}
+
+enum StrictUITestLaunchErrorDetail: Equatable {
+    case courseEditor(CourseEditorCheckpointUITestConfigurationError)
+    case hermesLinkConfiguration
+    case quarantinedFixture(StrictUITestFixture)
+
+    var accessibilityValue: String? {
+        switch self {
+        case .courseEditor(let error):
+            error.accessibilityValue
+        case .hermesLinkConfiguration:
+            "invalid-hermes-link-configuration"
+        case .quarantinedFixture(let fixture):
+            "quarantined-\(fixture.suiteID.rawValue)"
+        }
+    }
+}
+
+struct StrictUITestLaunchError: Equatable {
+    let code: StrictUITestLaunchErrorCode
+    let suiteHint: StrictUITestSuiteID?
+    let detail: StrictUITestLaunchErrorDetail?
+
+    init(
+        code: StrictUITestLaunchErrorCode,
+        suiteHint: StrictUITestSuiteID?,
+        detail: StrictUITestLaunchErrorDetail? = nil
+    ) {
+        self.code = code
+        self.suiteHint = suiteHint
+        self.detail = detail
+    }
+}
+
+enum StrictUITestLaunchConfiguration: Equatable {
+    case disabled
+    case valid(StrictUITestFixture)
+    case invalid(StrictUITestLaunchError)
+
+    /// The one process launch parse used by AppDelegate, the SwiftUI app root,
+    /// strict fixture sentinels, and production-entry guards.
+    static let current = StrictUITestLaunchConfiguration.parse()
+
+    var isRequested: Bool {
+        if case .disabled = self { return false }
+        return true
+    }
+
+    var suiteHint: StrictUITestSuiteID? {
+        switch self {
+        case .disabled:
+            nil
+        case .valid(let fixture):
+            fixture.suiteID
+        case .invalid(let error):
+            error.suiteHint
+        }
+    }
+
+    var root: LearnfoldStrictHarnessRoot? {
+        switch self {
+        case .disabled:
+            nil
+        case .valid(let fixture):
+            fixture.root
+        case .invalid:
+            .configurationError
+        }
+    }
+
+    static func parse(
+        arguments: [String] = ProcessInfo.processInfo.arguments,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        suites: [StrictUITestSuiteDescriptor] = StrictUITestSuiteDescriptor.registered
+    ) -> StrictUITestLaunchConfiguration {
+        let suiteMatches = suites.filter { suite in
+            arguments.contains(where: suite.containsSignal)
+        }
+        let unregisteredCheckpointArguments = arguments.filter { argument in
+            isGenericCheckpointShaped(argument)
+                && !suites.contains(where: { $0.containsSignal(argument) })
+        }
+        let isRequested = !suiteMatches.isEmpty || !unregisteredCheckpointArguments.isEmpty
+
+        guard isRequested else { return .disabled }
+
+        let singleSuiteHint = suiteMatches.count == 1 ? suiteMatches[0].id : nil
+        guard environment["LEARNFOLD_UI_TESTING"] == "1" else {
+            return .invalid(StrictUITestLaunchError(
+                code: .testingEnvironmentRequired,
+                suiteHint: singleSuiteHint
+            ))
+        }
+        guard unregisteredCheckpointArguments.isEmpty else {
+            return .invalid(StrictUITestLaunchError(
+                code: .unregisteredCheckpoint,
+                suiteHint: singleSuiteHint
+            ))
+        }
+        guard DebugLaunchSignalAuthorityInventory.conflictingSignals(
+            arguments: arguments,
+            environment: environment
+        ).isEmpty else {
+            return .invalid(StrictUITestLaunchError(
+                code: .mixedLaunchAuthorities,
+                suiteHint: singleSuiteHint
+            ))
+        }
+        guard suiteMatches.count == 1, let suite = suiteMatches.first else {
+            return .invalid(StrictUITestLaunchError(
+                code: .multipleSuites,
+                suiteHint: nil
+            ))
+        }
+
+        if suite.id == .courseEditor {
+            switch CourseEditorCheckpointUITestConfigurationParser.parse(
+                arguments: arguments
+            ) {
+            case .invalid(let error):
+                return .invalid(StrictUITestLaunchError(
+                    code: .suiteConfiguration,
+                    suiteHint: suite.id,
+                    detail: .courseEditor(error)
+                ))
+            case .valid(let configuration):
+                if case .failure(let code) = routeStateArgument(
+                    arguments: arguments,
+                    suite: suite
+                ) {
+                    return .invalid(StrictUITestLaunchError(
+                        code: code,
+                        suiteHint: suite.id
+                    ))
+                }
+                return configured(.courseEditor(configuration))
+            }
+        }
+
+        if suite.id == .hermesLink {
+            guard case .scenario(let scenario) =
+                    HermesLinkCheckpointConfiguration.parse(
+                        arguments: arguments,
+                        environment: environment
+                    ) else {
+                return .invalid(StrictUITestLaunchError(
+                    code: .suiteConfiguration,
+                    suiteHint: suite.id,
+                    detail: .hermesLinkConfiguration
+                ))
+            }
+            return configured(.hermesLink(scenario))
+        }
+
+        let stateArgument: String
+        switch routeStateArgument(arguments: arguments, suite: suite) {
+        case .success(let argument):
+            stateArgument = argument
+        case .failure(let code):
+            return .invalid(StrictUITestLaunchError(
+                code: code,
+                suiteHint: suite.id
+            ))
+        }
+
+        let fixture: StrictUITestFixture
+        switch suite.id {
+        case .courseRecovery:
+            guard let scenario = CourseRecoveryCheckpointUITestScenario(rawValue: stateArgument) else {
+                return .invalid(StrictUITestLaunchError(
+                    code: .unknownState,
+                    suiteHint: suite.id
+                ))
+            }
+            fixture = .courseRecovery(scenario)
+        case .serverLifecycle:
+            guard let scenario = ServerLifecycleCheckpointScenario(rawValue: stateArgument) else {
+                return .invalid(StrictUITestLaunchError(
+                    code: .unknownState,
+                    suiteHint: suite.id
+                ))
+            }
+            fixture = .serverLifecycle(scenario)
+        case .providerSettingsSource:
+            guard let scenario = ProviderSettingsSourceCheckpointScenario(rawValue: stateArgument) else {
+                return .invalid(StrictUITestLaunchError(
+                    code: .unknownState,
+                    suiteHint: suite.id
+                ))
+            }
+            fixture = .providerSettingsSource(scenario)
+        case .courseGeneration:
+            guard let scenario = CourseGenerationCheckpointScenario(rawValue: stateArgument) else {
+                return .invalid(StrictUITestLaunchError(
+                    code: .unknownState,
+                    suiteHint: suite.id
+                ))
+            }
+            fixture = .courseGeneration(scenario)
+        case .courseRouteFallback:
+            guard let scenario = CourseRouteFallbackUITestScenario(rawValue: stateArgument) else {
+                return .invalid(StrictUITestLaunchError(
+                    code: .unknownState,
+                    suiteHint: suite.id
+                ))
+            }
+            fixture = .courseRouteFallback(scenario)
+        case .courseEditor, .hermesLink:
+            preconditionFailure("Suite-specific parser must return before generic route parsing")
+        }
+        return configured(fixture)
+    }
+
+    private static func configured(
+        _ fixture: StrictUITestFixture
+    ) -> StrictUITestLaunchConfiguration {
+        guard fixture.canRenderWithoutLiveDependencies else {
+            return .invalid(StrictUITestLaunchError(
+                code: .harnessUnavailable,
+                suiteHint: fixture.suiteID,
+                detail: .quarantinedFixture(fixture)
+            ))
+        }
+        return .valid(fixture)
+    }
+
+    private static func routeStateArgument(
+        arguments: [String],
+        suite: StrictUITestSuiteDescriptor
+    ) -> Result<String, StrictUITestLaunchErrorCode> {
+        let exactRoutes = arguments.enumerated().filter {
+            suite.routes[$0.element] != nil
+        }
+        let shapedRoutes = arguments.enumerated().filter {
+            suite.isRouteShaped($0.element)
+        }
+        let shapedStates = arguments.enumerated().filter {
+            suite.isScenarioToken($0.element)
+        }
+
+        guard !exactRoutes.isEmpty else {
+            return .failure(.missingRoute)
+        }
+        guard exactRoutes.count == 1 else {
+            let distinctRoutes = Set(exactRoutes.map(\.element))
+            return .failure(
+                distinctRoutes.count == 1 ? .duplicateRoute : .multipleRoutes
+            )
+        }
+        guard shapedRoutes.count == 1 else {
+            return .failure(.multipleRoutes)
+        }
+
+        let route = exactRoutes[0]
+        let stateIndex = arguments.index(after: route.offset)
+        guard arguments.indices.contains(stateIndex) else {
+            return .failure(.missingState)
+        }
+        let stateArgument = arguments[stateIndex]
+        guard suite.allScenarioArguments.contains(stateArgument) else {
+            return .failure(.unknownState)
+        }
+        guard suite.routes[route.element]?.contains(stateArgument) == true else {
+            return .failure(.routeStateMismatch)
+        }
+        guard shapedStates.count == 1, shapedStates[0].offset == stateIndex else {
+            return .failure(.multipleStates)
+        }
+        return .success(stateArgument)
+    }
+
+    private static func isGenericCheckpointShaped(_ argument: String) -> Bool {
+        guard argument.hasPrefix("--ui-test-")
+                || argument.hasPrefix("--checkpoint-") else {
+            return false
+        }
+        return !DebugLaunchSignalAuthorityInventory.legacyPrimaryArguments
+            .contains(argument)
+            && !DebugLaunchSignalAuthorityInventory.legacyModifierArguments
+                .contains(argument)
+            && !DebugLaunchSignalAuthorityInventory.liveOnlyArguments
+                .contains(argument)
+    }
+}
+#endif
+
+enum LearnfoldUITestLaunchPolicy {
+    static let explicitUITestingKey = "LEARNFOLD_UI_TESTING"
+    static let xctestConfigurationKey = "XCTestConfigurationFilePath"
+
+    static func allowsTestOnlyOverrides(
+        environment: [String: String],
+        hasXCTestConfiguration: Bool? = nil,
+        hasExplicitUITestingAuthority: Bool = false
+    ) -> Bool {
+        environment[explicitUITestingKey] == "1"
+            || hasExplicitUITestingAuthority
+            || (hasXCTestConfiguration
+                ?? (environment[xctestConfigurationKey] != nil))
+    }
+
+    static func isTestOnlyControlEnabled(
+        _ key: String,
+        environment: [String: String],
+        hasXCTestConfiguration: Bool? = nil,
+        hasExplicitUITestingAuthority: Bool = false
+    ) -> Bool {
+        allowsTestOnlyOverrides(
+            environment: environment,
+            hasXCTestConfiguration: hasXCTestConfiguration,
+            hasExplicitUITestingAuthority: hasExplicitUITestingAuthority
+        ) && environment[key] == "1"
+    }
+}
+
+/// Strict checkpoints are stronger than ordinary UI-test mode. `isRequested`
+/// intentionally ignores environment validity so malformed or env-absent
+/// launches are quarantined before stored keys or live dependencies are read.
+enum LearnfoldStrictHarnessPolicy {
+    static let recoveryCheckpointBaseArgument =
+        "--ui-test-course-recovery-checkpoint"
+
+    static let serverLifecycleCheckpointRouteArguments: Set<String> = [
+        "--ui-test-server-lifecycle",
+        "--ui-test-ssh-login",
+        "--ui-test-ssh-agent-picker",
+        "--ui-test-manual-server",
+        "--ui-test-slingshot-browser",
+    ]
+
+    static let serverLifecycleCheckpointStatePrefixes = [
+        "server-lifecycle-",
+        "ssh-login-",
+        "ssh-agent-picker-",
+        "manual-server-",
+        "slingshot-browser-",
+    ]
+
+    static func isRequested() -> Bool {
+        #if DEBUG
+        StrictUITestLaunchConfiguration.current.isRequested
+        #else
+        false
+        #endif
+    }
+
+    static func isRequested(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        #if DEBUG
+        StrictUITestLaunchConfiguration.parse(
+            arguments: arguments,
+            environment: environment
+        ).isRequested
+        #else
+        false
+        #endif
+    }
+
+    static func strictHarnessRoot() -> LearnfoldStrictHarnessRoot? {
+        #if DEBUG
+        StrictUITestLaunchConfiguration.current.root
+        #else
+        nil
+        #endif
+    }
+
+    static func strictHarnessRoot(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> LearnfoldStrictHarnessRoot? {
+        #if DEBUG
+        StrictUITestLaunchConfiguration.parse(
+            arguments: arguments,
+            environment: environment
+        ).root
+        #else
+        nil
+        #endif
+    }
+
+    static func isStrictHarnessActive() -> Bool {
+        isRequested()
+    }
+
+    static func isStrictHarnessActive(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        isRequested(arguments: arguments, environment: environment)
+    }
+
+    static func isRecoveryCheckpointActive() -> Bool {
+        #if DEBUG
+        StrictUITestLaunchConfiguration.current.suiteHint == .courseRecovery
+        #else
+        false
+        #endif
+    }
+
+    static func isRecoveryCheckpointActive(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        #if DEBUG
+        StrictUITestLaunchConfiguration.parse(
+            arguments: arguments,
+            environment: environment
+        ).suiteHint == .courseRecovery
+        #else
+        false
+        #endif
+    }
+
+    static func isServerLifecycleCheckpointActive() -> Bool {
+        #if DEBUG
+        StrictUITestLaunchConfiguration.current.suiteHint == .serverLifecycle
+        #else
+        false
+        #endif
+    }
+
+    static func isServerLifecycleCheckpointActive(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        #if DEBUG
+        StrictUITestLaunchConfiguration.parse(
+            arguments: arguments,
+            environment: environment
+        ).suiteHint == .serverLifecycle
+        #else
+        false
+        #endif
+    }
+}
+
+/// Debug-only tripwire for production entry points that must remain untouched
+/// by any strict fixture root. Instrumented code records only while a strict
+/// signal is active, so normal app behavior is unchanged.
+enum LearnfoldStrictHarnessSentinel {
+    #if DEBUG
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var recordedEvents: [String] = []
+    private static let maximumRecordedEvents = 100
+    #endif
+
+    static func recordForbiddenEntry(
+        _ event: String
+    ) {
+        #if DEBUG
+        guard LearnfoldStrictHarnessPolicy.isStrictHarnessActive() else { return }
+        append(event)
+        #endif
+    }
+
+    static func recordForbiddenEntry(
+        _ event: String,
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        #if DEBUG
+        guard LearnfoldStrictHarnessPolicy.isStrictHarnessActive(
+            arguments: arguments,
+            environment: environment
+        ) else { return }
+        append(event)
+        #endif
+    }
+
+    #if DEBUG
+    private static func append(_ event: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard recordedEvents.count < maximumRecordedEvents else { return }
+        recordedEvents.append(event)
+    }
+    #endif
+
+    static func forbiddenEvents() -> [String] {
+        #if DEBUG
+        guard LearnfoldStrictHarnessPolicy.isStrictHarnessActive() else { return [] }
+        return snapshot()
+        #else
+        return []
+        #endif
+    }
+
+    static func forbiddenEvents(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String] {
+        #if DEBUG
+        guard LearnfoldStrictHarnessPolicy.isStrictHarnessActive(
+            arguments: arguments,
+            environment: environment
+        ) else { return [] }
+        return snapshot()
+        #else
+        return []
+        #endif
+    }
+
+    #if DEBUG
+    private static func snapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedEvents
+    }
+    #endif
+
+    #if DEBUG
+    static func resetForTesting() {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedEvents = []
+    }
+    #endif
+}
+
+#if DEBUG
+struct LearnfoldStrictHarnessSentinelPresentation {
+    let title: String
+    let rootIdentifier: String
+    let eventIdentifier: String
+    let detailsIdentifier: String
+
+    static let courseRecovery = LearnfoldStrictHarnessSentinelPresentation(
+        title: "STRICT NON-LIVE FIXTURE ROOT · LIVE LIFECYCLE SUPPRESSED",
+        rootIdentifier: "courseRecoveryCheckpoint.strictRoot",
+        eventIdentifier: "courseRecoveryCheckpoint.forbiddenSideEffects",
+        detailsIdentifier: "courseRecoveryCheckpoint.forbiddenSideEffectDetails"
+    )
+
+    static let serverLifecycle = LearnfoldStrictHarnessSentinelPresentation(
+        title: "STRICT P2 NON-LIVE FIXTURE ROOT · LIVE LIFECYCLE SUPPRESSED",
+        rootIdentifier: "serverCheckpoint.strictRoot",
+        eventIdentifier: "serverCheckpoint.forbiddenSideEffects",
+        detailsIdentifier: "serverCheckpoint.forbiddenSideEffectDetails"
+    )
+
+    static let providerSettingsSource = LearnfoldStrictHarnessSentinelPresentation(
+        title: "STRICT PROVIDER NON-LIVE FIXTURE ROOT · LIVE LIFECYCLE SUPPRESSED",
+        rootIdentifier: "providerSettingsSourceCheckpoint.strictRoot",
+        eventIdentifier: "providerSettingsSourceCheckpoint.forbiddenSideEffects",
+        detailsIdentifier: "providerSettingsSourceCheckpoint.forbiddenSideEffectDetails"
+    )
+
+    static let courseGeneration = LearnfoldStrictHarnessSentinelPresentation(
+        title: "STRICT GENERATION NON-LIVE FIXTURE ROOT · LIVE LIFECYCLE SUPPRESSED",
+        rootIdentifier: "courseGenerationCheckpoint.strictRoot",
+        eventIdentifier: "courseGenerationCheckpoint.forbiddenSideEffects",
+        detailsIdentifier: "courseGenerationCheckpoint.forbiddenSideEffectDetails"
+    )
+
+    static let courseEditor = LearnfoldStrictHarnessSentinelPresentation(
+        title: "STRICT EDITOR NON-LIVE FIXTURE ROOT · LIVE LIFECYCLE SUPPRESSED",
+        rootIdentifier: "courseEditorCheckpoint.strictRoot",
+        eventIdentifier: "courseEditorCheckpoint.forbiddenSideEffects",
+        detailsIdentifier: "courseEditorCheckpoint.forbiddenSideEffectDetails"
+    )
+
+    static let hermesLink = LearnfoldStrictHarnessSentinelPresentation(
+        title: "STRICT LINK NON-LIVE FIXTURE ROOT · LIVE LIFECYCLE SUPPRESSED",
+        rootIdentifier: "hermesLinkCheckpoint.strictRoot",
+        eventIdentifier: "hermesLinkCheckpoint.forbiddenSideEffects",
+        detailsIdentifier: "hermesLinkCheckpoint.forbiddenSideEffectDetails"
+    )
+
+    static let courseRouteFallback = LearnfoldStrictHarnessSentinelPresentation(
+        title: "STRICT ROUTE NON-LIVE FIXTURE ROOT · LIVE LIFECYCLE SUPPRESSED",
+        rootIdentifier: "courseRouteFallbackCheckpoint.strictRoot",
+        eventIdentifier: "courseRouteFallbackCheckpoint.forbiddenSideEffects",
+        detailsIdentifier: "courseRouteFallbackCheckpoint.forbiddenSideEffectDetails"
+    )
+
+    static let configurationError = LearnfoldStrictHarnessSentinelPresentation(
+        title: "STRICT INVALID FIXTURE ROOT · LIVE LIFECYCLE SUPPRESSED",
+        rootIdentifier: "strictCheckpoint.strictRoot",
+        eventIdentifier: "strictCheckpoint.forbiddenSideEffects",
+        detailsIdentifier: "strictCheckpoint.forbiddenSideEffectDetails"
+    )
+}
+
+struct LearnfoldStrictHarnessSentinelBanner: View {
+    let presentation: LearnfoldStrictHarnessSentinelPresentation
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text(presentation.title)
+                .font(.caption2.monospaced().weight(.bold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(Color.indigo)
+                .accessibilityIdentifier(presentation.rootIdentifier)
+
+            TimelineView(.periodic(from: .now, by: 0.2)) { _ in
+                let events = LearnfoldStrictHarnessSentinel.forbiddenEvents()
+                VStack(spacing: 2) {
+                    Text("Forbidden production entry events · \(events.count)")
+                        .font(.caption2.monospaced().weight(.semibold))
+                        .accessibilityIdentifier(presentation.eventIdentifier)
+                        .accessibilityValue(String(events.count))
+                    if !events.isEmpty {
+                        Text(events.prefix(3).joined(separator: ", "))
+                            .font(.caption2.monospaced())
+                            .accessibilityIdentifier(presentation.detailsIdentifier)
+                    }
+                }
+                .foregroundStyle(events.isEmpty ? Color.green : Color.red)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(Color.black)
+            }
+        }
+    }
+}
+
+extension View {
+    func learnfoldStrictHarnessBoundary(
+        _ presentation: LearnfoldStrictHarnessSentinelPresentation
+    ) -> some View {
+        safeAreaInset(edge: .top, spacing: 0) {
+            LearnfoldStrictHarnessSentinelBanner(presentation: presentation)
+        }
+    }
+
+    @ViewBuilder
+    func serverLifecycleStrictHarnessBoundaryIfActive(
+        visible: Bool = true
+    ) -> some View {
+        if visible,
+           LearnfoldStrictHarnessPolicy.isServerLifecycleCheckpointActive() {
+            learnfoldStrictHarnessBoundary(.serverLifecycle)
+        } else {
+            self
+        }
+    }
+}
+#endif
+
+#if !DEBUG
+extension View {
+    func serverLifecycleStrictHarnessBoundaryIfActive(
+        visible: Bool = true
+    ) -> some View {
+        self
+    }
+}
+#endif
+
+/// Scalar notification data captured on UserNotifications' delivery queue.
+/// `UNNotificationResponse` and its `userInfo` dictionary are framework-owned
+/// and non-Sendable, so the app delegate must not carry either into its
+/// main-actor state work.
+private struct NotificationResponsePayload: Sendable {
+    // These are notification wire keys, not runtime state. Keep them local to
+    // the nonisolated snapshot boundary rather than reaching into the
+    // main-actor AppLifecycleController.
+    private static let serverIdKey = "litter.notification.serverId"
+    private static let threadIdKey = "litter.notification.threadId"
+
+    let actionIdentifier: String
+    let approvalRequestId: String?
+    let serverId: String?
+    let threadId: String?
+
+    init(response: UNNotificationResponse) {
+        actionIdentifier = response.actionIdentifier
+        let userInfo = response.notification.request.content.userInfo
+        approvalRequestId = userInfo[WatchApprovalNotification.requestIdKey] as? String
+        serverId = userInfo[Self.serverIdKey] as? String
+        threadId = userInfo[Self.threadIdKey] as? String
+    }
+
+    var threadKey: ThreadKey? {
+        guard let serverId, let threadId else { return nil }
+        let trimmedServerId = serverId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedThreadId = threadId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedServerId.isEmpty, !trimmedThreadId.isEmpty else { return nil }
+        return ThreadKey(serverId: trimmedServerId, threadId: trimmedThreadId)
+    }
+}
+
+/// UserNotifications does not annotate its completion handler as Sendable.
+/// This box keeps the boundary explicit while ensuring the handler is called
+/// exactly once after any asynchronous approval action settles.
+private final class NotificationCompletionHandlerBox: @unchecked Sendable {
+    private let handler: () -> Void
+
+    init(_ handler: @escaping () -> Void) {
+        self.handler = handler
+    }
+
+    func complete() {
+        handler()
+    }
+}
+
+@MainActor
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     private var pendingNotificationThreadKey: ThreadKey?
     private var splashWindow: UIWindow?
@@ -14,6 +1140,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 
     weak var appRuntime: AppRuntimeController? {
         didSet {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "AppDelegate.appRuntime.bind"
+            )
             if let key = pendingNotificationThreadKey {
                 LLog.info(
                     "push",
@@ -27,7 +1156,23 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        guard !LearnfoldStrictHarnessPolicy.isStrictHarnessActive() else {
+            // Strict fixtures skip production startup, but still need the
+            // UI-only iOS 26 geometry bridge for deterministic rotation.
+            OrientationResponder.shared.start()
+            return true
+        }
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "AppDelegate.liveStartup"
+        )
+
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "OpenAIApiKeyStore.applyToEnvironment"
+        )
         OpenAIApiKeyStore.shared.applyToEnvironment()
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "LitterPlatform.bootstrapLocalRuntime"
+        )
         LitterPlatform.bootstrapLocalRuntimeIfNeeded()
         LLog.bootstrap()
 
@@ -42,7 +1187,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
             object: nil,
             queue: .main
         ) { _ in
-            LocalCodexBootstrap.shared.stopBlocking(timeout: 2.5)
+            MainActor.assumeIsolated {
+                LocalCodexBootstrap.shared.stopBlocking(timeout: 2.5)
+            }
         }
         #endif
 
@@ -53,8 +1200,8 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         ) { [weak self] _ in
             LLog.info("lifecycle", "protected app data became available")
             OpenAIApiKeyStore.shared.applyToEnvironment()
-            guard let appRuntime = self?.appRuntime else { return }
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
+                guard let appRuntime = self?.appRuntime else { return }
                 await appRuntime.restoreMissingLocalAuthStateIfNeeded()
             }
         }
@@ -66,13 +1213,16 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         DispatchQueue.global(qos: .userInitiated).async {
             AppModel.prewarmRustBridges()
         }
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "UNUserNotificationCenter.configure"
+        )
         UNUserNotificationCenter.current().delegate = self
         UNUserNotificationCenter.current().setNotificationCategories([
             UNNotificationCategory(
                 identifier: "litter.task.complete",
                 actions: [],
                 intentIdentifiers: [],
-                options: [.allowAnnouncement]
+                options: []
             ),
             UNNotificationCategory(
                 identifier: WatchApprovalNotification.categoryIdentifier,
@@ -92,8 +1242,14 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
                 options: [.customDismissAction]
             ),
         ])
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "OrientationResponder.start"
+        )
         OrientationResponder.shared.start()
         DispatchQueue.main.async {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "CloudKVSBridge.start"
+            )
             CloudKVSBridge.shared.start()
         }
         // The XCTest host is not entitled for the production CloudKit container.
@@ -103,6 +1259,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil,
            ProcessInfo.processInfo.environment["LEARNFOLD_UI_TESTING"] != "1" {
             Task {
+                LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                    "CourseCloudSyncEngine.start"
+                )
                 await CourseCloudSyncEngine.shared.startIfAvailable()
             }
         }
@@ -112,6 +1271,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         // experimental feature flag. Flip the `appleWatch` feature in
         // Settings → Experimental Features to enable. No-op when disabled.
         DispatchQueue.main.async {
+            LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+                "WatchCompanionBridge.start"
+            )
             if ExperimentalFeatures.shared.isEnabled(.appleWatch) {
                 WatchCompanionBridge.shared.start()
             }
@@ -129,24 +1291,34 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
             }
             self.windowBeforeSplash = scene.windows.first(where: \.isKeyWindow)
             let window = UIWindow(windowScene: scene)
+            #if DEBUG
+            let freezeForAcceptance = LearnfoldSplashAcceptanceFreezePolicy.isEnabled()
+            #else
+            let freezeForAcceptance = false
+            #endif
             // Keyboard window is typically at level ~10000. Go above it.
             window.windowLevel = UIWindow.Level(rawValue: 10000002)
             let hosting = UIHostingController(rootView:
-                AnimatedSplashView(appReady: true) {}
+                AnimatedSplashView(
+                    appReady: true,
+                    freezeBrandedFrame: freezeForAcceptance
+                ) {}
             )
             hosting.view.backgroundColor = .clear
             window.rootViewController = hosting
             window.makeKeyAndVisible()
             self.splashWindow = window
 
-            // Minimum display time
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                self.minTimeElapsed = true
-                self.tryDismissSplash()
-            }
-            // Hard max
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                self.forceDismissSplash()
+            if !freezeForAcceptance {
+                // Minimum display time
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self.minTimeElapsed = true
+                    self.tryDismissSplash()
+                }
+                // Hard max
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    self.forceDismissSplash()
+                }
             }
         }
     }
@@ -205,6 +1377,10 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func applicationWillTerminate(_ application: UIApplication) {
+        guard !LearnfoldStrictHarnessPolicy.isStrictHarnessActive() else {
+            return
+        }
+
         // Best-effort graceful shutdown of the iroh endpoint. iOS only
         // fires this hook reliably on Catalyst (NSApplicationDelegate)
         // and on OS-initiated terminations from background — swipe-up-
@@ -224,46 +1400,56 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         _ = semaphore.wait(timeout: .now() + 2.5)
     }
 
-    func userNotificationCenter(
+    nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
+        let payload = NotificationResponsePayload(response: response)
+        let completion = NotificationCompletionHandlerBox(completionHandler)
+        Task { @MainActor [weak self] in
+            guard let self else {
+                completion.complete()
+                return
+            }
+            await self.handleNotificationResponse(payload, completion: completion)
+        }
+    }
+
+    private func handleNotificationResponse(
+        _ payload: NotificationResponsePayload,
+        completion: NotificationCompletionHandlerBox
+    ) async {
+        defer { completion.complete() }
+        guard !LearnfoldStrictHarnessPolicy.isStrictHarnessActive() else { return }
+
         LLog.info(
             "push",
             "user opened notification",
-            payloadJson: notificationPayloadJson(response.notification.request.content.userInfo)
+            fields: ["actionId": payload.actionIdentifier]
         )
 
-        let info = response.notification.request.content.userInfo
-        let actionId = response.actionIdentifier
-        if actionId == WatchApprovalNotification.allowActionIdentifier ||
-            actionId == WatchApprovalNotification.denyActionIdentifier,
-            let requestId = info[WatchApprovalNotification.requestIdKey] as? String {
-            let approve = actionId == WatchApprovalNotification.allowActionIdentifier
-            Task { @MainActor in
-                do {
-                    try await AppModel.shared.store.respondToApproval(
-                        requestId: requestId,
-                        decision: approve ? .accept : .decline
-                    )
-                } catch {
-                    LLog.error(
-                        "push",
-                        "approval action dispatch failed: \(error.localizedDescription)"
-                    )
-                }
-                completionHandler()
+        if (payload.actionIdentifier == WatchApprovalNotification.allowActionIdentifier ||
+            payload.actionIdentifier == WatchApprovalNotification.denyActionIdentifier),
+           let requestId = payload.approvalRequestId {
+            let approve = payload.actionIdentifier == WatchApprovalNotification.allowActionIdentifier
+            do {
+                try await AppModel.shared.store.respondToApproval(
+                    requestId: requestId,
+                    decision: approve ? .accept : .decline
+                )
+            } catch {
+                LLog.error(
+                    "push",
+                    "approval action dispatch failed: \(error.localizedDescription)"
+                )
             }
             return
         }
 
-        if let key = AppLifecycleController.notificationThreadKey(
-            from: response.notification.request.content.userInfo
-        ) {
+        if let key = payload.threadKey {
             openThreadFromNotification(key)
         }
-        completionHandler()
     }
 
     private func openThreadFromNotification(_ key: ThreadKey) {
@@ -300,12 +1486,71 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 @main
 struct LitterApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var appModel = AppModel.shared
-    @State private var voiceRuntime = VoiceRuntimeController.shared
-    @State private var appRuntime = AppRuntimeController.shared
-    @State private var themeManager = ThemeManager.shared
-    @State private var wallpaperManager = WallpaperManager.shared
+    @State private var appModel: AppModel?
+    @State private var voiceRuntime: VoiceRuntimeController?
+    @State private var appRuntime: AppRuntimeController?
+    @State private var themeManager: ThemeManager?
+    @State private var wallpaperManager: WallpaperManager?
     @Environment(\.scenePhase) private var scenePhase
+    #if DEBUG
+    private let strictLaunchConfiguration: StrictUITestLaunchConfiguration
+    #endif
+
+    init() {
+        #if DEBUG
+        let strictLaunchConfiguration = StrictUITestLaunchConfiguration.current
+        self.strictLaunchConfiguration = strictLaunchConfiguration
+        let suppressesLiveDependencies = strictLaunchConfiguration.isRequested
+        #else
+        let suppressesLiveDependencies = false
+        #endif
+        _appModel = State(
+            initialValue: Self.liveDependency(
+                suppressed: suppressesLiveDependencies,
+                event: "LitterApp.AppModel.shared",
+                AppModel.shared
+            )
+        )
+        _voiceRuntime = State(
+            initialValue: Self.liveDependency(
+                suppressed: suppressesLiveDependencies,
+                event: "LitterApp.VoiceRuntimeController.shared",
+                VoiceRuntimeController.shared
+            )
+        )
+        _appRuntime = State(
+            initialValue: Self.liveDependency(
+                suppressed: suppressesLiveDependencies,
+                event: "LitterApp.AppRuntimeController.shared",
+                AppRuntimeController.shared
+            )
+        )
+        _themeManager = State(
+            initialValue: Self.liveDependency(
+                suppressed: suppressesLiveDependencies,
+                event: "LitterApp.ThemeManager.shared",
+                ThemeManager.shared
+            )
+        )
+        _wallpaperManager = State(
+            initialValue: Self.liveDependency(
+                suppressed: suppressesLiveDependencies,
+                event: "LitterApp.WallpaperManager.shared",
+                WallpaperManager.shared
+            )
+        )
+    }
+
+    @MainActor
+    private static func liveDependency<Value>(
+        suppressed: Bool,
+        event: String,
+        _ value: @autoclosure () -> Value
+    ) -> Value? {
+        guard !suppressed else { return nil }
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(event)
+        return value()
+    }
 
     @SceneBuilder
     var body: some Scene {
@@ -317,41 +1562,23 @@ struct LitterApp: App {
             // `MacWindowTitleBarStyler` via
             // `UIWindowScene.sizeRestrictions`.
             .commands {
-                LitterCommands(appModel: appModel)
+                if let appModel {
+                    LitterCommands(appModel: appModel)
+                }
             }
         #else
         mainWindowGroup
         #endif
     }
 
+    /// SceneBuilder cannot express runtime branch selection. Keep one scene
+    /// topology and choose the isolated strict or live root below ViewBuilder.
     private var mainWindowGroup: some Scene {
         WindowGroup {
-            ContentView()
-                .environment(appModel)
-                .environment(appRuntime)
-                .environment(voiceRuntime)
-                .environment(themeManager)
-                .environment(wallpaperManager)
-                .task {
-                    appModel.start()
-                    voiceRuntime.bind(appModel: appModel)
-                    appRuntime.bind(appModel: appModel, voiceRuntime: voiceRuntime)
-                    appDelegate.appRuntime = appRuntime
-                    appRuntime.appDidBecomeActive()
-                    #if targetEnvironment(macCatalyst)
-                    LocalCodexBootstrap.shared.startIfNeeded(appModel: appModel)
-                    #endif
-                    // Pair host (BLE advertiser, ultrasonic emitter,
-                    // Bonjour publish, WS listener) and the iPhone client
-                    // (BLE scanner, ultrasonic reader, NISession) are
-                    // strictly opt-in: they only start when the user
-                    // opens the Pair screen in Settings → Experimental,
-                    // and stop on disappear. The screen itself is gated
-                    // behind `#if DEBUG`, so neither stack is reachable
-                    // in Release builds.
-                }
+            applicationRoot
         }
         .onChange(of: scenePhase) { _, newPhase in
+            guard let appRuntime else { return }
             LLog.info("lifecycle", "scenePhase changed", fields: ["phase": newPhase.debugName])
             switch newPhase {
             case .background:
@@ -365,7 +1592,297 @@ struct LitterApp: App {
             }
         }
     }
+
+    @ViewBuilder
+    private var applicationRoot: some View {
+        #if DEBUG
+        switch strictLaunchConfiguration {
+        case .disabled:
+            liveApplicationRoot
+        case .valid(let fixture):
+            switch fixture {
+            case .courseRecovery(let scenario):
+                CourseDraftRecoveryUITestHarnessView(
+                    strictLaunchScenario: scenario
+                )
+            case .serverLifecycle(let scenario):
+                ServerLifecycleStrictCheckpointRoot(scenario: scenario)
+            case .providerSettingsSource(let scenario):
+                ProviderSettingsSourceStrictCheckpointRoot(
+                    scenario: scenario
+                )
+            case .courseGeneration(let scenario):
+                CourseGenerationStrictCheckpointRoot(
+                    scenario: scenario
+                )
+            case .courseEditor(let configuration):
+                CourseEditorStrictCheckpointRoot(
+                    configuration: configuration
+                )
+            case .hermesLink(let scenario):
+                HermesLinkStrictCheckpointRoot(scenario: scenario)
+            case .courseRouteFallback(let scenario):
+                CourseRouteFallbackStrictCheckpointRoot(scenario: scenario)
+            }
+        case .invalid(let error):
+            StrictUITestConfigurationErrorRoot(error: error)
+        }
+        #else
+        liveApplicationRoot
+        #endif
+    }
+
+    private var liveApplicationRoot: some View {
+        let appModel = requiredAppModel
+        let voiceRuntime = requiredVoiceRuntime
+        let appRuntime = requiredAppRuntime
+        let themeManager = requiredThemeManager
+        let wallpaperManager = requiredWallpaperManager
+
+        return ContentView()
+            .environment(appModel)
+            .environment(appRuntime)
+            .environment(voiceRuntime)
+            .environment(themeManager)
+            .environment(wallpaperManager)
+            .task {
+                appModel.start()
+                voiceRuntime.bind(appModel: appModel)
+                appRuntime.bind(appModel: appModel, voiceRuntime: voiceRuntime)
+                appDelegate.appRuntime = appRuntime
+                appRuntime.appDidBecomeActive()
+                #if targetEnvironment(macCatalyst)
+                LocalCodexBootstrap.shared.startIfNeeded(appModel: appModel)
+                #endif
+                // Pair host (BLE advertiser, ultrasonic emitter,
+                // Bonjour publish, WS listener) and the iPhone client
+                // (BLE scanner, ultrasonic reader, NISession) are
+                // strictly opt-in: they only start when the user
+                // opens the Pair screen in Settings → Experimental,
+                // and stop on disappear. The screen itself is gated
+                // behind `#if DEBUG`, so neither stack is reachable
+                // in Release builds.
+            }
+    }
+
+    private var requiredAppModel: AppModel {
+        guard let appModel else {
+            preconditionFailure("Live application scene requires AppModel")
+        }
+        return appModel
+    }
+
+    private var requiredVoiceRuntime: VoiceRuntimeController {
+        guard let voiceRuntime else {
+            preconditionFailure("Live application scene requires VoiceRuntimeController")
+        }
+        return voiceRuntime
+    }
+
+    private var requiredAppRuntime: AppRuntimeController {
+        guard let appRuntime else {
+            preconditionFailure("Live application scene requires AppRuntimeController")
+        }
+        return appRuntime
+    }
+
+    private var requiredThemeManager: ThemeManager {
+        guard let themeManager else {
+            preconditionFailure("Live application scene requires ThemeManager")
+        }
+        return themeManager
+    }
+
+    private var requiredWallpaperManager: WallpaperManager {
+        guard let wallpaperManager else {
+            preconditionFailure("Live application scene requires WallpaperManager")
+        }
+        return wallpaperManager
+    }
 }
+
+#if DEBUG
+@MainActor
+private struct ServerLifecycleStrictCheckpointRoot: View {
+    let scenario: ServerLifecycleCheckpointScenario
+    @State private var discovery = NetworkDiscovery(runtimeMode: .inertCheckpoint)
+
+    var body: some View {
+        NavigationStack {
+            DiscoveryView(
+                runtimeDependencies: .inertCheckpoint,
+                discovery: discovery,
+                autoStartDiscovery: false,
+                checkpointConfiguration: .scenario(scenario),
+                connectionAttemptHook: scenario.lf16Substate == nil
+                    ? nil
+                    : .lf16FailOnce
+            )
+        }
+    }
+}
+
+@MainActor
+private struct ProviderSettingsSourceStrictCheckpointRoot: View {
+    let scenario: ProviderSettingsSourceCheckpointScenario
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ProviderSettingsSourceCheckpointUITestHarnessView(scenario: scenario)
+                .frame(maxHeight: .infinity)
+
+            LearnfoldStrictHarnessSentinelBanner(presentation: .providerSettingsSource)
+        }
+    }
+}
+
+@MainActor
+private struct CourseGenerationStrictCheckpointRoot: View {
+    let scenario: CourseGenerationCheckpointScenario
+
+    var body: some View {
+        CourseGenerationCheckpointUITestHarnessView(scenario: scenario)
+            .learnfoldStrictHarnessBoundary(.courseGeneration)
+    }
+}
+
+@MainActor
+private struct CourseEditorStrictCheckpointRoot: View {
+    let configuration: CourseEditorCheckpointUITestConfiguration
+
+    var body: some View {
+        CourseEditorCheckpointUITestHarnessView(configuration: configuration)
+    }
+}
+
+@MainActor
+private struct StrictUITestConfigurationErrorRoot: View {
+    let error: StrictUITestLaunchError
+
+    private var presentation: LearnfoldStrictHarnessSentinelPresentation {
+        switch error.suiteHint {
+        case .courseRecovery:
+            .courseRecovery
+        case .serverLifecycle:
+            .serverLifecycle
+        case .providerSettingsSource:
+            .providerSettingsSource
+        case .courseGeneration:
+            .courseGeneration
+        case .courseEditor:
+            .courseEditor
+        case .hermesLink:
+            .hermesLink
+        case .courseRouteFallback:
+            .courseRouteFallback
+        case nil:
+            .configurationError
+        }
+    }
+
+    private var rootIdentifier: String {
+        switch error.suiteHint {
+        case .courseRecovery:
+            "courseRecoveryCheckpoint.configurationError"
+        case .serverLifecycle:
+            "server-checkpoint-config-error-root"
+        case .providerSettingsSource:
+            "providerSettingsSourceCheckpoint.configurationError"
+        case .courseGeneration:
+            "courseGenerationCheckpoint.configurationError"
+        case .courseEditor:
+            "course-checkpoint-configuration-error"
+        case .hermesLink:
+            "hermesLinkCheckpoint.configurationError"
+        case .courseRouteFallback:
+            "courseRouteFallbackCheckpoint.configurationError"
+        case nil:
+            "strictCheckpoint.configurationError"
+        }
+    }
+
+    private var codeIdentifier: String {
+        switch error.suiteHint {
+        case .serverLifecycle:
+            "server-checkpoint-config-error-code"
+        case .courseRecovery:
+            "courseRecoveryCheckpoint.configurationError.code"
+        case .providerSettingsSource:
+            "providerSettingsSourceCheckpoint.configurationError.code"
+        case .courseGeneration:
+            "courseGenerationCheckpoint.configurationError.code"
+        case .courseEditor:
+            "courseEditorCheckpoint.configurationError.code"
+        case .hermesLink:
+            "hermesLinkCheckpoint.configurationError.code"
+        case .courseRouteFallback:
+            "courseRouteFallbackCheckpoint.configurationError.code"
+        case nil:
+            "strictCheckpoint.configurationError.code"
+        }
+    }
+
+    private var messageIdentifier: String {
+        switch error.suiteHint {
+        case .serverLifecycle:
+            "server-checkpoint-config-error-message"
+        case .courseRecovery:
+            "courseRecoveryCheckpoint.configurationError.message"
+        case .providerSettingsSource:
+            "providerSettingsSourceCheckpoint.configurationError.message"
+        case .courseGeneration:
+            "courseGenerationCheckpoint.configurationError.message"
+        case .courseEditor:
+            "courseEditorCheckpoint.configurationError.message"
+        case .hermesLink:
+            "hermesLinkCheckpoint.configurationError.message"
+        case .courseRouteFallback:
+            "courseRouteFallbackCheckpoint.configurationError.message"
+        case nil:
+            "strictCheckpoint.configurationError.message"
+        }
+    }
+
+    private var accessibilityValue: String {
+        error.detail?.accessibilityValue ?? error.code.rawValue
+    }
+
+    private var configurationErrorContent: some View {
+        ContentUnavailableView {
+            Label("Checkpoint configuration rejected", systemImage: "wrench.adjustable")
+        } description: {
+            VStack(spacing: 8) {
+                Text(error.code.rawValue)
+                    .font(.caption.monospaced().weight(.semibold))
+                    .accessibilityIdentifier(codeIdentifier)
+                Text(error.code.message)
+                    .font(.footnote)
+                    .accessibilityIdentifier(messageIdentifier)
+            }
+        }
+        .accessibilityIdentifier(rootIdentifier)
+        .accessibilityValue(accessibilityValue)
+    }
+
+    @ViewBuilder
+    var body: some View {
+        switch error.suiteHint {
+        case .courseEditor:
+            NavigationStack {
+                configurationErrorContent
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                LearnfoldStrictHarnessSentinelBanner(presentation: .courseEditor)
+            }
+        default:
+            NavigationStack {
+                configurationErrorContent
+            }
+            .learnfoldStrictHarnessBoundary(presentation)
+        }
+    }
+}
+#endif
 
 private extension UIApplication.State {
     var debugName: String {
@@ -417,6 +1934,21 @@ struct ContentView: View {
         ConversationTextSize.clamped(rawValue: textSizeStep).scale
     }
 
+    #if DEBUG
+    @ViewBuilder
+    private var discoveryConnectionRetryEvidenceSurface: some View {
+        if let receipt = appState.discoveryConnectionRetryEvidenceReceipt {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Connection retry receipt")
+                .accessibilityIdentifier("lf16-connection-retry-receipt")
+                .accessibilityValue(receipt.accessibilityValue)
+                .allowsHitTesting(false)
+        }
+    }
+    #endif
+
     var body: some View {
         @Bindable var bindableAppState = appState
 
@@ -427,6 +1959,15 @@ struct ContentView: View {
                 #if DEBUG
                 if MarketingScreenshotHarnessView.isEnabled {
                     MarketingScreenshotHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseRetryUITestHarnessView.isEnabled {
+                    CourseRetryUITestHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseGenerationControlUITestHarnessView.isEnabled {
+                    CourseGenerationControlUITestHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseDraftRecoveryUITestHarnessView.isEnabled {
+                    CourseDraftRecoveryUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseChatContinuityUITestHarnessView.isEnabled {
                     CourseChatContinuityUITestHarnessView()
@@ -441,6 +1982,9 @@ struct ContentView: View {
                 courseExperienceRoot
                 #endif
 
+                #if DEBUG
+                discoveryConnectionRetryEvidenceSurface
+                #endif
             }
             .task {
                 if composerBottomInset <= 0, geometry.safeAreaInsets.bottom > 0 {
@@ -472,8 +2016,12 @@ struct ContentView: View {
         .onAppear {
             themeManager.syncSystemColorScheme(colorScheme)
             CourseCloudSyncApplyBridge.shared.register(store: courseStore)
-            let forceDiscoveryForUITest =
-                ProcessInfo.processInfo.environment["CODEXIOS_UI_TEST_FORCE_DISCOVERY"] == "1"
+            let environment = ProcessInfo.processInfo.environment
+            let forceDiscoveryForUITest = LearnfoldUITestLaunchPolicy
+                .isTestOnlyControlEnabled(
+                    "CODEXIOS_UI_TEST_FORCE_DISCOVERY",
+                    environment: environment
+                )
             if forceDiscoveryForUITest {
                 appState.showServerPicker = true
             }
@@ -517,19 +2065,25 @@ struct ContentView: View {
             }
         ) {
             NavigationStack {
-                DiscoveryView(onServerSelected: { server in
-                    if connectsCourseAgentAfterServerSelection {
-                        SavedProjectStore.selectedServerId = server.id
-                        Task {
-                            await courseStore.selectRemoteAgentServer(
-                                serverID: server.id,
-                                appModel: appModel
-                            )
+                DiscoveryView(
+                    runtimeDependencies: .live(
+                        appModel: appModel,
+                        appState: appState
+                    ),
+                    onServerSelected: { server in
+                        if connectsCourseAgentAfterServerSelection {
+                            SavedProjectStore.selectedServerId = server.id
+                            Task {
+                                await courseStore.selectRemoteAgentServer(
+                                    serverID: server.id,
+                                    appModel: appModel
+                                )
+                            }
                         }
+                        connectsCourseAgentAfterServerSelection = false
+                        appState.showServerPicker = false
                     }
-                    connectsCourseAgentAfterServerSelection = false
-                    appState.showServerPicker = false
-                })
+                )
             }
             .environment(appModel)
             .environment(appState)

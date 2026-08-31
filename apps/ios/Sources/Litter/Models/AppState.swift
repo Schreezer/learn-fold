@@ -1,6 +1,33 @@
 import Observation
 import SwiftUI
 
+enum DiscoveryConnectionRetryReceipt: String, Equatable {
+    case failureAlert = "failure-alert"
+    case retrying
+    case postRetry = "post-retry"
+}
+
+#if DEBUG
+struct DiscoveryConnectionRetryEvidenceReceipt: Equatable {
+    let state: DiscoveryConnectionRetryReceipt
+    let attemptCount: Int
+
+    init?(state: DiscoveryConnectionRetryReceipt, attemptCount: Int) {
+        let minimumAttemptCount = switch state {
+        case .failureAlert: 1
+        case .retrying, .postRetry: 2
+        }
+        guard attemptCount >= minimumAttemptCount else { return nil }
+        self.state = state
+        self.attemptCount = attemptCount
+    }
+
+    var accessibilityValue: String {
+        state.rawValue
+    }
+}
+#endif
+
 @MainActor
 @Observable
 final class AppState {
@@ -54,6 +81,10 @@ final class AppState {
     var showModelSelector = false
     var showSettings = false
     var pendingThreadNavigation: ThreadKey?
+    #if DEBUG
+    private(set) var discoveryConnectionRetryEvidenceReceipt:
+        DiscoveryConnectionRetryEvidenceReceipt?
+    #endif
     private var dismissedPendingUserInputIds: Set<String> = []
     private var threadPermissionOverrides: [String: ThreadPermissionOverride] = [:]
     var approvalPolicy: String {
@@ -120,6 +151,21 @@ final class AppState {
     func isPendingUserInputDismissed(id: String) -> Bool {
         dismissedPendingUserInputIds.contains(id)
     }
+
+    #if DEBUG
+    @discardableResult
+    func recordDiscoveryConnectionRetryEvidenceReceipt(
+        _ receipt: DiscoveryConnectionRetryEvidenceReceipt
+    ) -> Bool {
+        guard receipt.state == .postRetry else { return false }
+        discoveryConnectionRetryEvidenceReceipt = receipt
+        return true
+    }
+
+    func clearDiscoveryConnectionRetryEvidenceReceipt() {
+        discoveryConnectionRetryEvidenceReceipt = nil
+    }
+    #endif
 
     func approvalPolicy(for threadKey: ThreadKey?) -> String {
         guard let threadKey else { return approvalPolicy }

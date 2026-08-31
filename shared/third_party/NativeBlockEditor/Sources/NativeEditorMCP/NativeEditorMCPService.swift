@@ -10,6 +10,7 @@ public enum NativeEditorMCPError: Error, Equatable, Sendable {
     case protectedContent([String])
     case asyncTaskNotFound(String)
     case revisionConflict(pageID: String, expected: Int64, actual: Int64)
+    case workspaceGenerationConflict(expected: Int64, actual: Int64)
 }
 
 extension NativeEditorMCPError: LocalizedError {
@@ -26,6 +27,8 @@ extension NativeEditorMCPError: LocalizedError {
         case let .asyncTaskNotFound(id): "Async task \(id) was not found."
         case let .revisionConflict(pageID, expected, actual):
             "Page \(pageID) changed from revision \(expected) to \(actual). Fetch it again and retry against the new revision."
+        case let .workspaceGenerationConflict(expected, actual):
+            "The workspace changed from generation \(expected) to \(actual). Reload it and retry."
         }
     }
 
@@ -33,7 +36,7 @@ extension NativeEditorMCPError: LocalizedError {
         switch self {
         case .invalidArguments, .unsupportedCommand, .contentNotFound, .ambiguousContent, .protectedContent:
             "validation_error"
-        case .revisionConflict:
+        case .revisionConflict, .workspaceGenerationConflict:
             "conflict"
         case .pageNotFound, .asyncTaskNotFound:
             "object_not_found"
@@ -59,6 +62,16 @@ public struct NativeEditorPageSnapshot: Sendable {
     }
 }
 
+public struct NativeEditorWorkspaceSnapshot: Sendable {
+    public let workspace: PageWorkspace
+    public let generation: Int64
+
+    public init(workspace: PageWorkspace, generation: Int64) {
+        self.workspace = workspace
+        self.generation = generation
+    }
+}
+
 /// A persistent, Notion-style agent facade over the native block engine.
 ///
 /// Calls reload the SQLite library before reading or mutating it so a long-lived
@@ -79,16 +92,19 @@ public actor NativeEditorMCPService {
     private let store: SQLiteLibraryStore
     private let markdownCodec = NotionEnhancedMarkdownCodec()
     private var workspace: PageWorkspace
+    private var workspaceGeneration: Int64
     private var lastOpenPageID: String?
     private var asyncTasks: [String: AsyncTaskRecord] = [:]
 
     private init(
         store: SQLiteLibraryStore,
         workspace: PageWorkspace,
+        workspaceGeneration: Int64,
         lastOpenPageID: String?
     ) {
         self.store = store
         self.workspace = workspace
+        self.workspaceGeneration = workspaceGeneration
         self.lastOpenPageID = lastOpenPageID
     }
 
@@ -101,14 +117,20 @@ public actor NativeEditorMCPService {
             return NativeEditorMCPService(
                 store: store,
                 workspace: persisted.workspace,
+                workspaceGeneration: persisted.workspaceGeneration,
                 lastOpenPageID: persisted.lastOpenPageID
             )
         }
         let workspace = seedWorkspace ?? PageWorkspace(rootTitle: "Home")
-        try await store.save(workspace, lastOpenPageID: workspace.rootPageID, recordHistory: false)
+        let workspaceGeneration = try await store.save(
+            workspace,
+            lastOpenPageID: workspace.rootPageID,
+            recordHistory: false
+        )
         return NativeEditorMCPService(
             store: store,
             workspace: workspace,
+            workspaceGeneration: workspaceGeneration,
             lastOpenPageID: workspace.rootPageID
         )
     }
@@ -183,8 +205,15 @@ public actor NativeEditorMCPService {
     }
 
     public func workspaceSnapshot() async throws -> PageWorkspace {
+        try await workspaceSnapshotWithGeneration().workspace
+    }
+
+    public func workspaceSnapshotWithGeneration() async throws -> NativeEditorWorkspaceSnapshot {
         try await reload()
-        return workspace
+        return NativeEditorWorkspaceSnapshot(
+            workspace: workspace,
+            generation: workspaceGeneration
+        )
     }
 
     /// Atomically replaces the complete workspace through the same validated
@@ -194,20 +223,36 @@ public actor NativeEditorMCPService {
     /// method. The store records page history, rebuilds FTS, and emits a
     /// durable mutation receipt in the same commit.
     public func replaceWorkspace(_ replacement: PageWorkspace) async throws {
-        try replacement.validate()
         try await reload()
+        try await replaceWorkspace(
+            replacement,
+            expectedGeneration: workspaceGeneration
+        )
+    }
+
+    /// Commits a fully staged workspace only if no editor, tool, or cloud
+    /// writer changed the SQLite library after the caller read its generation.
+    /// The generation check and complete replacement share one BEGIN IMMEDIATE
+    /// transaction, so a losing caller cannot expose a partial workspace.
+    public func replaceWorkspace(
+        _ replacement: PageWorkspace,
+        expectedGeneration: Int64
+    ) async throws {
+        try replacement.validate()
         let previousPageIDs = Set(workspace.pages.keys)
         let replacementPageIDs = Set(replacement.pages.keys)
         let changedPageIDs = previousPageIDs.union(replacementPageIDs)
-        try await store.save(
+        let committedGeneration = try await store.save(
             replacement,
             lastOpenPageID: replacement.pages[lastOpenPageID ?? ""] == nil
                 ? replacement.rootPageID
                 : lastOpenPageID,
             changedPageIDs: changedPageIDs,
-            recordHistory: true
+            recordHistory: true,
+            expectedWorkspaceGeneration: expectedGeneration
         )
         workspace = replacement
+        workspaceGeneration = committedGeneration
         if workspace.pages[lastOpenPageID ?? ""] == nil {
             lastOpenPageID = workspace.rootPageID
         }
@@ -769,6 +814,7 @@ public actor NativeEditorMCPService {
     private func reload() async throws {
         guard let persisted = try await store.load() else { return }
         workspace = persisted.workspace
+        workspaceGeneration = persisted.workspaceGeneration
         lastOpenPageID = persisted.lastOpenPageID
     }
 
@@ -776,12 +822,13 @@ public actor NativeEditorMCPService {
         changedPageIDs: Set<String>,
         expectedRevisions: [String: Int64] = [:]
     ) async throws {
-        try await store.save(
+        workspaceGeneration = try await store.save(
             workspace,
             lastOpenPageID: lastOpenPageID,
             changedPageIDs: changedPageIDs,
             recordHistory: !changedPageIDs.isEmpty,
-            expectedRevisions: expectedRevisions
+            expectedRevisions: expectedRevisions,
+            expectedWorkspaceGeneration: workspaceGeneration
         )
     }
 
@@ -798,6 +845,11 @@ public actor NativeEditorMCPService {
         } catch LibraryStoreError.revisionConflict(let conflictPageID, let expected, let actual) {
             throw NativeEditorMCPError.revisionConflict(
                 pageID: conflictPageID,
+                expected: expected,
+                actual: actual
+            )
+        } catch LibraryStoreError.workspaceGenerationConflict(let expected, let actual) {
+            throw NativeEditorMCPError.workspaceGenerationConflict(
                 expected: expected,
                 actual: actual
             )

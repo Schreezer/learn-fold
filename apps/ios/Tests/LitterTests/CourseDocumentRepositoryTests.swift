@@ -3,6 +3,7 @@ import NativeEditorMCP
 import XCTest
 @testable import Litter
 
+@MainActor
 final class CourseDocumentRepositoryTests: XCTestCase {
     func testCoursePageLinkResolverAcceptsOnlyNativeEditorPageLinks() throws {
         let pageID = "763e4ff6-b27c-445e-916b-34a237f34bc3"
@@ -98,10 +99,10 @@ final class CourseDocumentRepositoryTests: XCTestCase {
             rootTitle: "Remote Bash"
         )
         await CourseDocumentRegistry.shared.register(threadID: threadID, workspaceID: workspaceID)
-        var plan = CourseBrief()
-        plan.planID = "remote-bash-plan"
-        plan.revision = 1
-        plan.title = "Remote Bash"
+        let plan = approvedMutationPlan(
+            planID: "remote-bash-plan",
+            title: "Remote Bash"
+        )
         try await repository.approvePlan(plan)
 
         let arguments = #"{"workspace_id":"\#(workspaceID)","script":"printf remote-ok > result.txt && cat result.txt"}"#
@@ -159,18 +160,11 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         )
         await CourseDocumentRegistry.shared.register(threadID: threadID, workspaceID: workspaceID)
 
-        var revisionOne = CourseBrief()
-        revisionOne.planID = "remote-plan"
-        revisionOne.revision = 1
-        revisionOne.title = "Remote Plan"
-        revisionOne.summary = "First revision"
-        revisionOne.outcome = "Learn safely"
-        revisionOne.startingPoint = "Beginner"
-        revisionOne.focusGap = "Practice"
-        revisionOne.estimatedDuration = "1h"
-        revisionOne.chapters = [
-            CourseChapter(id: "one", title: "One", objective: "Learn", deliverables: ["Lesson"]),
-        ]
+        var revisionOne = approvedMutationPlan(
+            planID: "remote-plan",
+            title: "Remote Plan",
+            summary: "First visible revision"
+        )
         try await repository.presentPlan(revisionOne)
         try await repository.approvePlan(revisionOne)
         let revisionOneIsApproved = await repository.isLatestPlanApproved()
@@ -222,10 +216,10 @@ final class CourseDocumentRepositoryTests: XCTestCase {
             rootTitle: "Remote Flight"
         )
         await CourseDocumentRegistry.shared.register(threadID: threadID, workspaceID: workspaceID)
-        var plan = CourseBrief()
-        plan.planID = "remote-flight-plan"
-        plan.revision = 1
-        plan.title = "Remote Flight"
+        let plan = approvedMutationPlan(
+            planID: "remote-flight-plan",
+            title: "Remote Flight"
+        )
         try await repository.approvePlan(plan)
         let first = Task.detached {
             CourseDocumentToolRouter.shared.handleDynamicTool(
@@ -264,9 +258,10 @@ final class CourseDocumentRepositoryTests: XCTestCase {
             databaseURL: directory.appendingPathComponent(".course/course-library.sqlite"),
             rootTitle: "Approval identity"
         )
-        var revisionOne = CourseBrief()
-        revisionOne.planID = "swift-concurrency"
-        revisionOne.revision = 1
+        let revisionOne = approvedMutationPlan(
+            planID: "swift-concurrency",
+            title: "Swift Concurrency"
+        )
         try await repository.presentPlan(revisionOne)
 
         var changedContent = revisionOne
@@ -312,10 +307,11 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         var oldPlan = CourseBrief()
         oldPlan.planID = "old-hermes-plan"
         oldPlan.revision = 1
-        var newerPlan = CourseBrief()
-        newerPlan.planID = "newer-device-plan"
-        newerPlan.revision = 2
-        newerPlan.title = "Plan currently under review"
+        let newerPlan = approvedMutationPlan(
+            planID: "newer-device-plan",
+            revision: 2,
+            title: "Plan Currently Under Review"
+        )
         try await repository.presentPlan(newerPlan)
 
         do {
@@ -344,13 +340,10 @@ final class CourseDocumentRepositoryTests: XCTestCase {
             databaseURL: directory.appendingPathComponent(".course/course-library.sqlite"),
             rootTitle: "Protected approval"
         )
-        var plan = CourseBrief()
-        plan.planID = "protected-approval"
-        plan.revision = 1
-        plan.title = "Protected approval"
+        let forgedPlan = CourseBrief()
         let mirrorDirectory = directory.appendingPathComponent(".course", isDirectory: true)
         try FileManager.default.createDirectory(at: mirrorDirectory, withIntermediateDirectories: true)
-        let planData = try JSONEncoder().encode(plan)
+        let planData = try JSONEncoder().encode(forgedPlan)
         try planData.write(
             to: mirrorDirectory.appendingPathComponent(
                 AppleCourseApprovalPolicy.presentedPlanFilename
@@ -374,8 +367,12 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         )
         XCTAssertTrue(forgedMutation.isError)
 
-        try await repository.presentPlan(plan)
-        try await repository.approvePlan(plan)
+        let approvedPlan = approvedMutationPlan(
+            planID: "protected-approval",
+            title: "Protected Approval"
+        )
+        try await repository.presentPlan(approvedPlan)
+        try await repository.approvePlan(approvedPlan)
         let authorizedMutation = await repository.callTool(
             named: NativeEditorMCPToolCatalog.updatePage,
             argumentsJSON: try jsonString([
@@ -534,6 +531,226 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         XCTAssertGreaterThan(secondSaved.revision, firstSaved.revision)
         XCTAssertTrue(AppFlowyMarkdownCodec().encode(secondSaved.document).contains("Second edit"))
     }
+
+#if DEBUG
+    @MainActor
+    func testFailedEditorFlushRetryPreservesExactDraftAndSavesOnlyOnce() async throws {
+        let (repository, directory) = try await makeRepository(autosaveDelay: .seconds(60))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = try await repository.rootPageSnapshot()
+        let model = CoursePageEditorModel(pageID: root.id, repository: repository)
+        await model.load()
+
+        var draft = model.document
+        draft.root.children.append(.paragraph("First pending recovery edit"))
+        draft.root.children.append(.paragraph("Second pending recovery edit"))
+        draft.ensureStableBlockIDs()
+        await repository.debugFailNextFlushes()
+
+        model.userChangedDocument(draft)
+        XCTAssertEqual(model.saveState, .saving)
+        XCTAssertEqual(model.saveState.accessibilityValue, "Saving changes")
+        await model.flush()
+
+        let expectedError = try XCTUnwrap(
+            CourseDocumentDebugFlushError.simulatedFailure.errorDescription
+        )
+        XCTAssertEqual(model.document, draft)
+        XCTAssertEqual(model.errorMessage, expectedError)
+        XCTAssertEqual(model.saveState, .failed(expectedError))
+        XCTAssertEqual(model.saveState.failureMessage, expectedError)
+        XCTAssertEqual(model.saveState.accessibilityValue, "Changes not saved")
+        XCTAssertTrue(model.saveState.canRetry)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent(".course/pending-user-edits.json").path
+        ))
+
+        // Model two near-simultaneous activations. The first transition to
+        // `saving` fences the second, while the repository also serializes any
+        // caller that already reached the flush boundary.
+        let firstRetry = Task { @MainActor in
+            await model.retrySave()
+        }
+        let repeatedRetry = Task { @MainActor in
+            await model.retrySave()
+        }
+        await firstRetry.value
+        await repeatedRetry.value
+
+        XCTAssertEqual(model.saveState, .saved)
+        XCTAssertEqual(model.saveState.accessibilityValue, "Changes saved")
+        XCTAssertFalse(model.saveState.canRetry)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.document, draft)
+        let saved = try await repository.pageSnapshot(id: root.id)
+        assertPersistedDocument(saved.document, matches: draft)
+        XCTAssertEqual(
+            saved.document.root.children.suffix(2).compactMap { $0.delta?.plainText },
+            ["First pending recovery edit", "Second pending recovery edit"]
+        )
+        XCTAssertEqual(saved.revision, root.revision + 1)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent(".course/pending-user-edits.json").path
+        ))
+
+        // A repeated action after success is a no-op: it must not turn the
+        // acknowledged retry into a second write.
+        await model.retrySave()
+        let afterRepeatedRetry = try await repository.pageSnapshot(id: root.id)
+        XCTAssertEqual(afterRepeatedRetry.revision, saved.revision)
+        assertPersistedDocument(afterRepeatedRetry.document, matches: draft)
+        XCTAssertEqual(model.saveState, .saved)
+    }
+
+    @MainActor
+    func testLateFailedFlushCannotReplaceNewerEditOrItsSaveState() async throws {
+        let (repository, directory) = try await makeRepository(autosaveDelay: .seconds(60))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = try await repository.rootPageSnapshot()
+        let model = CoursePageEditorModel(pageID: root.id, repository: repository)
+        await model.load()
+
+        var firstDraft = model.document
+        firstDraft.root.children.append(.paragraph("Earlier edit awaiting flush"))
+        firstDraft.ensureStableBlockIDs()
+        await repository.debugFailNextFlushes(delay: .milliseconds(200))
+        model.userChangedDocument(firstDraft)
+
+        let flushTask = Task { @MainActor in
+            await model.flush()
+        }
+        try await Task.sleep(for: .milliseconds(50))
+
+        var newestDraft = model.document
+        newestDraft.root.children.append(.paragraph("Newest edit owns completion"))
+        newestDraft.ensureStableBlockIDs()
+        model.userChangedDocument(newestDraft)
+        await flushTask.value
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.saveState, .saved)
+        XCTAssertEqual(model.document, newestDraft)
+        let saved = try await repository.pageSnapshot(id: root.id)
+        assertPersistedDocument(saved.document, matches: newestDraft)
+        XCTAssertEqual(
+            saved.document.root.children.suffix(2).compactMap { $0.delta?.plainText },
+            ["Earlier edit awaiting flush", "Newest edit owns completion"]
+        )
+        XCTAssertEqual(saved.revision, root.revision + 1)
+    }
+
+    @MainActor
+    func testLF50RuntimeProbeTracksRealPendingFailureSaveAndReopenWithoutContent() async throws {
+        let (repository, directory) = try await makeRepository(autosaveDelay: .seconds(60))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = try await repository.rootPageSnapshot()
+        let model = CoursePageEditorModel(pageID: root.id, repository: repository)
+        await model.load()
+        let probeConfiguration = CourseEditorRuntimeProbeConfiguration(
+            runToken: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+            keyData: Data(repeating: 0xA5, count: 32)
+        )
+
+        let initial = CourseEditorLF50RuntimeProbeSnapshot(
+            model: model,
+            configuration: probeConfiguration
+        )
+        XCTAssertEqual(initial.saveState, "idle")
+        XCTAssertFalse(initial.hasPendingEdit)
+        XCTAssertEqual(initial.confirmedRevision, root.revision)
+
+        var draft = model.document
+        let privateText = "Private learner paragraph must stay out of runtime evidence"
+        draft.root.children.append(.paragraph(privateText))
+        draft.ensureStableBlockIDs()
+        await repository.debugFailNextFlushes()
+        model.userChangedDocument(draft)
+
+        let modified = CourseEditorLF50RuntimeProbeSnapshot(
+            model: model,
+            configuration: probeConfiguration
+        )
+        XCTAssertEqual(modified.saveState, "saving")
+        XCTAssertTrue(modified.hasPendingEdit)
+        XCTAssertEqual(modified.confirmedRevision, root.revision)
+        XCTAssertNotEqual(modified.documentDigest, initial.documentDigest)
+        XCTAssertNotEqual(modified.orderDigest, initial.orderDigest)
+        XCTAssertFalse(modified.accessibilityValue.contains(privateText))
+        assertLF50ProbeContainsOnlyPrivacySafeFields(modified)
+
+        await model.flush()
+        let failed = CourseEditorLF50RuntimeProbeSnapshot(
+            model: model,
+            configuration: probeConfiguration
+        )
+        XCTAssertEqual(failed.saveState, "failed")
+        XCTAssertTrue(failed.hasPendingEdit)
+        XCTAssertEqual(failed.confirmedRevision, root.revision)
+        XCTAssertEqual(failed.documentDigest, modified.documentDigest)
+        XCTAssertEqual(failed.orderDigest, modified.orderDigest)
+        XCTAssertFalse(failed.accessibilityValue.contains(privateText))
+        assertLF50ProbeContainsOnlyPrivacySafeFields(failed)
+
+        await model.retrySave()
+        let saved = CourseEditorLF50RuntimeProbeSnapshot(
+            model: model,
+            configuration: probeConfiguration
+        )
+        XCTAssertEqual(saved.saveState, "saved")
+        XCTAssertFalse(saved.hasPendingEdit)
+        XCTAssertEqual(saved.confirmedRevision, root.revision + 1)
+        XCTAssertEqual(saved.documentDigest, modified.documentDigest)
+        XCTAssertEqual(saved.orderDigest, modified.orderDigest)
+        assertLF50ProbeContainsOnlyPrivacySafeFields(saved)
+        let differentlyKeyed = CourseEditorLF50RuntimeProbeSnapshot(
+            model: model,
+            configuration: CourseEditorRuntimeProbeConfiguration(
+                runToken: probeConfiguration.runToken,
+                keyData: Data(repeating: 0xB6, count: 32)
+            )
+        )
+        XCTAssertNotEqual(differentlyKeyed.documentDigest, saved.documentDigest)
+        XCTAssertNotEqual(differentlyKeyed.orderDigest, saved.orderDigest)
+
+        let reopenedModel = CoursePageEditorModel(pageID: root.id, repository: repository)
+        await reopenedModel.load()
+        let reopened = CourseEditorLF50RuntimeProbeSnapshot(
+            model: reopenedModel,
+            configuration: probeConfiguration
+        )
+        XCTAssertEqual(reopened.saveState, "idle")
+        XCTAssertFalse(reopened.hasPendingEdit)
+        XCTAssertEqual(reopened.confirmedRevision, root.revision + 1)
+        XCTAssertEqual(reopened.documentDigest, saved.documentDigest)
+        XCTAssertEqual(reopened.orderDigest, saved.orderDigest)
+        XCTAssertFalse(reopened.accessibilityValue.contains(privateText))
+        assertLF50ProbeContainsOnlyPrivacySafeFields(reopened)
+    }
+
+    private func assertLF50ProbeContainsOnlyPrivacySafeFields(
+        _ probe: CourseEditorLF50RuntimeProbeSnapshot,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let keys = Set(probe.accessibilityValue.split(separator: ";").compactMap { field in
+            field.split(separator: "=", maxSplits: 1).first.map(String.init)
+        })
+        XCTAssertEqual(
+            keys,
+            [
+                "save-state",
+                "pending-edit",
+                "confirmed-revision",
+                "document-digest",
+                "order-digest",
+            ],
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(probe.documentDigest.count, 64, file: file, line: line)
+        XCTAssertEqual(probe.orderDigest.count, 64, file: file, line: line)
+    }
+#endif
 
     @MainActor
     func testEditorModelCanBackspaceContinuouslyAcrossAutosaveBoundaries() async throws {
@@ -904,9 +1121,11 @@ final class CourseDocumentRepositoryTests: XCTestCase {
             )
         }
         await Task.yield()
-        var replacement = CourseBrief()
-        replacement.planID = "replacement-plan"
-        replacement.revision = 2
+        let replacement = approvedMutationPlan(
+            planID: "replacement-plan",
+            revision: 2,
+            title: "Replacement Course Plan"
+        )
         let presentation = Task {
             try await repository.presentPlan(replacement)
         }
@@ -1149,21 +1368,106 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         XCTAssertEqual(mixed.children.map(\.status), [.generated, .pendingGeneration])
     }
 
-    private func makeRepository() async throws -> (CourseDocumentRepository, URL) {
+    /// SQLite/AppFlowy reloads intentionally reconstruct runtime `BlockNode.id`
+    /// values. Full persisted semantics include type, lossless data (including
+    /// stable `block_id`), and recursive child order, so compare that exact
+    /// representation rather than ephemeral runtime UUIDs.
+    private func assertPersistedDocument(
+        _ actual: BlockDocument,
+        matches expected: BlockDocument,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        assertPersistedNode(actual.root, matches: expected.root, file: file, line: line)
+        XCTAssertEqual(
+            actual.flattenedNodes().map { $0.node.stableBlockID },
+            expected.flattenedNodes().map { $0.node.stableBlockID },
+            file: file,
+            line: line
+        )
+    }
+
+    private func assertPersistedNode(
+        _ actual: BlockNode,
+        matches expected: BlockNode,
+        file: StaticString,
+        line: UInt
+    ) {
+        XCTAssertEqual(actual.type, expected.type, file: file, line: line)
+        XCTAssertEqual(actual.data, expected.data, file: file, line: line)
+        XCTAssertEqual(actual.children.count, expected.children.count, file: file, line: line)
+        for (actualChild, expectedChild) in zip(actual.children, expected.children) {
+            assertPersistedNode(actualChild, matches: expectedChild, file: file, line: line)
+        }
+    }
+
+    private func makeRepository(
+        autosaveDelay: Duration = .milliseconds(350)
+    ) async throws -> (CourseDocumentRepository, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CourseDocumentRepositoryTests-\(UUID().uuidString)", isDirectory: true)
         let databaseURL = directory.appendingPathComponent(".course/course-library.sqlite")
         let repository = try await CourseDocumentRepository.open(
             workspaceID: UUID().uuidString,
             databaseURL: databaseURL,
-            rootTitle: "Test course"
+            rootTitle: "Test course",
+            autosaveDelay: autosaveDelay
         )
-        var plan = CourseBrief()
-        plan.planID = "test-course-plan"
-        plan.revision = 1
+        let plan = approvedMutationPlan(
+            planID: "test-course-plan",
+            title: "Test Course"
+        )
         try await repository.presentPlan(plan)
         try await repository.approvePlan(plan)
         return (repository, directory)
+    }
+
+    /// The approval receipt deliberately accepts only the current typed-v2
+    /// hierarchy. Keep mutation tests on this complete fixture; tests that
+    /// model stale, unapproved, or forged receipts build those cases directly.
+    private func approvedMutationPlan(
+        planID: String,
+        revision: Int = 1,
+        title: String,
+        summary: String = "Build a practical foundation through guided practice."
+    ) -> CourseBrief {
+        let chapter = CourseChapter(
+            id: "foundation-skills",
+            title: "Foundation Skills",
+            objective: "Build a reliable conceptual foundation through practice.",
+            deliverables: ["Practice the core foundation"]
+        )
+        var plan = CourseBrief()
+        plan.planID = planID
+        plan.revision = revision
+        plan.title = title
+        plan.summary = summary
+        plan.outcome = "Apply the core ideas in a practical exercise."
+        plan.startingPoint = "Basic familiarity with the topic."
+        plan.focusGap = "Structured practice with the essential concepts."
+        plan.estimatedDuration = "One focused hour"
+        plan.structureVersion = CoursePlanHierarchyPolicy.currentStructureVersion
+        plan.chapters = [chapter]
+        plan.learningPath = [
+            CourseLearningNode(
+                id: chapter.id,
+                title: chapter.title,
+                kind: .folder,
+                status: .pendingGeneration,
+                role: .chapter,
+                children: [
+                    CourseLearningNode(
+                        id: "foundation-practice",
+                        title: "Practice the Core Foundation",
+                        kind: .markdown,
+                        status: .pendingGeneration,
+                        role: .lesson,
+                        children: []
+                    ),
+                ]
+            ),
+        ]
+        return plan
     }
 
     private func stageDraftWithoutFlushing(databaseURL: URL) async throws -> String {

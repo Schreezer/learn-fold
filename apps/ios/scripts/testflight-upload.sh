@@ -156,6 +156,22 @@ if [[ "$EXPORT_SIGNING_STYLE" == "manual" && -z "$WATCH_COMP_PROVISIONING_PROFIL
     exit 1
 fi
 
+if [[ "$TESTFLIGHT_SKIP_BUILD" != "1" ]]; then
+    if [[ -z "${LEARNFOLD_HOSTED_ACCESS_TOKEN:-}" ]]; then
+        echo "LEARNFOLD_HOSTED_ACCESS_TOKEN is required for a Hosted-default beta archive" >&2
+        exit 1
+    fi
+    if [[ ! "$LEARNFOLD_HOSTED_ACCESS_TOKEN" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+        echo "LEARNFOLD_HOSTED_ACCESS_TOKEN must use URL-safe bearer-token characters" >&2
+        exit 1
+    fi
+    if [[ -n "${LEARNFOLD_HOSTED_AGENT_URL:-}" \
+        && "$LEARNFOLD_HOSTED_AGENT_URL" != https://* ]]; then
+        echo "LEARNFOLD_HOSTED_AGENT_URL must use HTTPS" >&2
+        exit 1
+    fi
+fi
+
 MARKETING_VERSION="$(resolve_requested_testflight_version)"
 
 if [[ -z "$BUILD_NUMBER" ]]; then
@@ -191,6 +207,15 @@ if [[ -n "$AUTH_KEY_PATH" && -n "$AUTH_KEY_ID" && -n "$AUTH_ISSUER_ID" ]]; then
 fi
 
 if [[ "$TESTFLIGHT_SKIP_BUILD" != "1" ]]; then
+    hosted_xcconfig_dir="$(mktemp -d "${TMPDIR:-/tmp}/learnfold-hosted.XXXXXX")"
+    hosted_xcconfig="$hosted_xcconfig_dir/HostedSecrets.xcconfig"
+    trap 'unlink "$hosted_xcconfig" 2>/dev/null || true; rmdir "$hosted_xcconfig_dir" 2>/dev/null || true' EXIT
+    : > "$hosted_xcconfig"
+    chmod 600 "$hosted_xcconfig"
+    {
+        printf 'LEARNFOLD_HOSTED_ACCESS_TOKEN = %s\n' "$LEARNFOLD_HOSTED_ACCESS_TOKEN"
+    } > "$hosted_xcconfig"
+
     echo "==> Regenerating Xcode project"
     "$PROJECT_DIR/scripts/regenerate-project.sh"
 
@@ -200,12 +225,17 @@ if [[ "$TESTFLIGHT_SKIP_BUILD" != "1" ]]; then
         -project "$PROJECT_PATH"
         -scheme "$SCHEME"
         -configuration "$CONFIGURATION"
+        -xcconfig "$hosted_xcconfig"
         -destination "generic/platform=iOS"
         -archivePath "$ARCHIVE_PATH"
         clean archive
         MARKETING_VERSION="$MARKETING_VERSION"
         CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
     )
+
+    if [[ -n "${LEARNFOLD_HOSTED_AGENT_URL:-}" ]]; then
+        archive_cmd+=(LEARNFOLD_HOSTED_AGENT_URL="$LEARNFOLD_HOSTED_AGENT_URL")
+    fi
 
     if [[ -n "$TEAM_ID" ]]; then
         archive_cmd+=(DEVELOPMENT_TEAM="$TEAM_ID")

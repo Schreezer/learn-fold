@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use codex_app_server_protocol::{ClientRequest, ServerNotification};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedEntry {
@@ -74,7 +75,7 @@ impl MessageRecorder {
             return;
         }
         let ts_ms = s.start.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
-        if let Ok(json) = serde_json::to_string(request) {
+        if let Ok(json) = recorded_request_json(request) {
             s.entries.push(RecordedEntry {
                 ts_ms,
                 dir: Direction::Out,
@@ -154,5 +155,190 @@ impl MessageRecorder {
             }
         }
         Ok(result)
+    }
+}
+
+fn recorded_request_json(request: &ClientRequest) -> serde_json::Result<String> {
+    match request {
+        ClientRequest::LoginAccount { request_id, .. } => serde_json::to_string(&json!({
+            "method": "account/login/start",
+            "id": request_id,
+            "params": {
+                "redacted": true
+            }
+        })),
+        _ => serde_json::to_string(request),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_app_server_protocol::{
+        LoginAccountParams, RequestId, ThreadArchivedNotification, ThreadClosedNotification,
+    };
+
+    const API_KEY_CANARY: &str = "sk-recorder-api-key-canary-never-persist";
+    const CHATGPT_TOKEN_CANARY: &str = "eyJ-recorder-chatgpt-token-canary-never-persist";
+
+    fn record_single_request(request: &ClientRequest) -> (String, RecordedEntry) {
+        let recorder = MessageRecorder::new();
+        recorder.start_recording();
+        recorder.record_request("local-test", request);
+        let recording = recorder.stop_recording();
+        let mut entries = MessageRecorder::parse_recording(&recording)
+            .expect("recorded request should produce valid recording JSON");
+        assert_eq!(entries.len(), 1);
+        (recording, entries.remove(0))
+    }
+
+    fn assert_credential_absent(recording: &str, credential: &str) {
+        assert!(
+            !recording
+                .as_bytes()
+                .windows(credential.len())
+                .any(|window| window == credential.as_bytes()),
+            "recording contained credential bytes"
+        );
+    }
+
+    fn assert_redacted_login_entry(entry: &RecordedEntry, expected_id: i64) {
+        assert_eq!(entry.dir, Direction::Out);
+        let json: serde_json::Value =
+            serde_json::from_str(&entry.json).expect("entry should contain valid request JSON");
+        assert_eq!(
+            json,
+            json!({
+                "method": "account/login/start",
+                "id": expected_id,
+                "params": {
+                    "redacted": true
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn api_key_login_recording_redacts_credentials() {
+        let request = ClientRequest::LoginAccount {
+            request_id: RequestId::Integer(41),
+            params: LoginAccountParams::ApiKey {
+                api_key: API_KEY_CANARY.to_string(),
+            },
+        };
+
+        let (recording, entry) = record_single_request(&request);
+
+        assert_credential_absent(&recording, API_KEY_CANARY);
+        assert_redacted_login_entry(&entry, 41);
+    }
+
+    #[test]
+    fn chatgpt_token_login_recording_redacts_credentials() {
+        let request = ClientRequest::LoginAccount {
+            request_id: RequestId::Integer(42),
+            params: LoginAccountParams::ChatgptAuthTokens {
+                access_token: CHATGPT_TOKEN_CANARY.to_string(),
+                chatgpt_account_id: "synthetic-account".to_string(),
+                chatgpt_plan_type: Some("synthetic-plan".to_string()),
+            },
+        };
+
+        let (recording, entry) = record_single_request(&request);
+
+        assert_credential_absent(&recording, CHATGPT_TOKEN_CANARY);
+        assert_redacted_login_entry(&entry, 42);
+    }
+
+    #[test]
+    fn non_sensitive_request_recording_is_unchanged() {
+        let request: ClientRequest = serde_json::from_value(json!({
+            "method": "model/list",
+            "id": 43,
+            "params": {
+                "limit": 5
+            }
+        }))
+        .expect("model/list should be a valid request");
+        let expected = serde_json::to_value(&request).expect("request should serialize");
+
+        let (_, entry) = record_single_request(&request);
+        let actual: serde_json::Value =
+            serde_json::from_str(&entry.json).expect("entry should contain valid request JSON");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn replay_ignores_redacted_login_between_ordered_inbound_notifications() {
+        let source_thread_id = "synthetic-source-thread";
+        let target_thread_id = "synthetic-target-thread";
+        let login = ClientRequest::LoginAccount {
+            request_id: RequestId::Integer(44),
+            params: LoginAccountParams::ApiKey {
+                api_key: API_KEY_CANARY.to_string(),
+            },
+        };
+        let first = ServerNotification::ThreadArchived(ThreadArchivedNotification {
+            thread_id: source_thread_id.to_string(),
+        });
+        let second = ServerNotification::ThreadClosed(ThreadClosedNotification {
+            thread_id: source_thread_id.to_string(),
+        });
+        let entries = vec![
+            RecordedEntry {
+                ts_ms: 10,
+                dir: Direction::In,
+                server_id: "synthetic-source-server".to_string(),
+                json: serde_json::to_string(&first).expect("first notification should serialize"),
+            },
+            RecordedEntry {
+                ts_ms: 20,
+                dir: Direction::Out,
+                server_id: "synthetic-source-server".to_string(),
+                json: recorded_request_json(&login).expect("login marker should serialize"),
+            },
+            RecordedEntry {
+                ts_ms: 30,
+                dir: Direction::In,
+                server_id: "synthetic-source-server".to_string(),
+                json: serde_json::to_string(&second).expect("second notification should serialize"),
+            },
+        ];
+        let recording = serde_json::to_string(&entries).expect("recording should serialize");
+
+        assert_credential_absent(&recording, API_KEY_CANARY);
+        let replayed = MessageRecorder::replay_entries(
+            &recording,
+            "synthetic-target-server",
+            target_thread_id,
+        )
+        .expect("mixed recording should replay");
+
+        assert_eq!(replayed.len(), 2, "outbound entries must remain ignored");
+
+        let (first_ts, first_server, first_notification) = &replayed[0];
+        assert_eq!(*first_ts, 10);
+        assert_eq!(first_server, "synthetic-target-server");
+        match first_notification {
+            ServerNotification::ThreadArchived(notification) => {
+                assert_eq!(notification.thread_id, target_thread_id);
+            }
+            other => {
+                panic!("expected first replayed notification to be ThreadArchived, got {other:?}")
+            }
+        }
+
+        let (second_ts, second_server, second_notification) = &replayed[1];
+        assert_eq!(*second_ts, 30);
+        assert_eq!(second_server, "synthetic-target-server");
+        match second_notification {
+            ServerNotification::ThreadClosed(notification) => {
+                assert_eq!(notification.thread_id, target_thread_id);
+            }
+            other => {
+                panic!("expected second replayed notification to be ThreadClosed, got {other:?}")
+            }
+        }
     }
 }

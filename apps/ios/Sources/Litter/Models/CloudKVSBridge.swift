@@ -70,9 +70,9 @@ final class CloudKVSBridge {
             queue: .main
         ) { [weak self] notification in
             guard let self else { return }
-            Task { @MainActor in
-                self.handleExternalChange(notification: notification)
-            }
+            let reason = notification.userInfo?[NSUbiquitousKeyValueStoreChangeReasonKey] as? Int
+            // NotificationCenter invokes this observer synchronously on .main.
+            MainActor.assumeIsolated { self.handleExternalChange(reason: reason) }
         }
         observers.append(externalChange)
 
@@ -121,16 +121,14 @@ final class CloudKVSBridge {
 
     // MARK: - Inbound
 
-    private func handleExternalChange(notification: Notification) {
-        let reasonRaw = notification
-            .userInfo?[NSUbiquitousKeyValueStoreChangeReasonKey] as? Int
-        if let reasonRaw {
+    private func handleExternalChange(reason: Int?) {
+        if let reason {
             // 0 = ServerChange, 1 = InitialSyncChange, 2 = QuotaViolationChange,
             // 3 = AccountChange. We treat all as "re-pull and merge".
             LLog.info(
                 "cloud_sync",
                 "kvs external change",
-                fields: ["reason": reasonRaw]
+                fields: ["reason": reason]
             )
         }
         applyEnvelopeFromStore()

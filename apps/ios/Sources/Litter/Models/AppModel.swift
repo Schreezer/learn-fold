@@ -57,10 +57,16 @@ final class AppModel {
     /// Kick off Rust bridge construction on a background thread.
     /// Call from `AppDelegate.didFinishLaunching` before SwiftUI touches `shared`.
     nonisolated static func prewarmRustBridges() {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "AppModel.prewarmRustBridges"
+        )
         _ = _prewarmResult
     }
 
     private nonisolated static let _prewarmResult: RustBridges = {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "AppModel.RustBridges.init"
+        )
         // Boot the iSH kernel BEFORE any Rust bridge construction so the exec
         // hook is wired up before the first command can be issued. Idempotent
         // — the AppDelegate call site is a no-op on second invocation.
@@ -130,6 +136,7 @@ final class AppModel {
         ssh: SshBridge? = nil,
         reconnectController: ReconnectController? = nil
     ) {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry("AppModel.init")
         let bridges = Self._prewarmResult
         self.store = store ?? bridges.store
         self.client = client ?? bridges.client
@@ -149,13 +156,7 @@ final class AppModel {
         // icon / capability flag goes through this single shared
         // client, so a probe response in one screen surfaces metadata
         // everywhere.
-        let metadataClient = self.client
-        AgentRuntimeMetadataProvider.lookup = { [weak metadataClient] name in
-            metadataClient?.agentMetadata(name: name)
-        }
-        AgentRuntimeMetadataProvider.all = { [weak metadataClient] in
-            metadataClient?.allAgentMetadata() ?? []
-        }
+        AgentRuntimeMetadataProvider.install(client: self.client)
     }
 
     deinit {

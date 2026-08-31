@@ -9,6 +9,130 @@ private let appLifecycleSignpostLog = OSLog(
     category: "lifecycle"
 )
 
+enum AppNotificationPermissionAction: Equatable {
+    case none
+    case requestAuthorization
+    case openSettings
+}
+
+struct AppNotificationPermissionPresentation: Equatable {
+    let statusText: String
+    let detailText: String
+    let actionTitle: String?
+    let action: AppNotificationPermissionAction
+}
+
+enum AppNotificationPermissionPolicy {
+    /// Notification categories remain registered at launch, but authorization
+    /// is requested only from the learner-initiated Settings action.
+    static let requestsOnRuntimeBind = false
+
+    static func presentation(
+        for authorizationStatus: UNAuthorizationStatus?
+    ) -> AppNotificationPermissionPresentation {
+        switch authorizationStatus {
+        case nil:
+            AppNotificationPermissionPresentation(
+                statusText: "Checking…",
+                detailText: "Checking notification access for Learnfold.",
+                actionTitle: nil,
+                action: .none
+            )
+        case .notDetermined:
+            AppNotificationPermissionPresentation(
+                statusText: "Not Enabled",
+                detailText: "Get notified when an agent finishes while Learnfold is in the background.",
+                actionTitle: "Enable Notifications",
+                action: .requestAuthorization
+            )
+        case .denied:
+            AppNotificationPermissionPresentation(
+                statusText: "Denied",
+                detailText: "Notifications are blocked for Learnfold. You can enable them in Settings.",
+                actionTitle: "Open Settings",
+                action: .openSettings
+            )
+        case .authorized, .provisional, .ephemeral:
+            AppNotificationPermissionPresentation(
+                statusText: "Enabled",
+                detailText: "Agent completion notifications are enabled.",
+                actionTitle: nil,
+                action: .none
+            )
+        @unknown default:
+            AppNotificationPermissionPresentation(
+                statusText: "Unavailable",
+                detailText: "Notification access could not be determined.",
+                actionTitle: nil,
+                action: .none
+            )
+        }
+    }
+}
+
+@MainActor
+protocol AppNotificationAuthorizing: AnyObject {
+    func authorizationStatus() async -> UNAuthorizationStatus
+    func requestAuthorization(options: UNAuthorizationOptions) async throws
+}
+
+@MainActor
+final class SystemAppNotificationAuthorizer: AppNotificationAuthorizing {
+    func authorizationStatus() async -> UNAuthorizationStatus {
+        await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                continuation.resume(returning: settings.authorizationStatus)
+            }
+        }
+    }
+
+    func requestAuthorization(options: UNAuthorizationOptions) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            UNUserNotificationCenter.current().requestAuthorization(options: options) { _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+}
+
+@MainActor
+final class AppNotificationPermissionController {
+    static let shared = AppNotificationPermissionController(
+        authorizer: SystemAppNotificationAuthorizer()
+    )
+
+    private let authorizer: any AppNotificationAuthorizing
+
+    init(authorizer: any AppNotificationAuthorizing) {
+        self.authorizer = authorizer
+    }
+
+    /// Runtime setup registers notification categories separately. It must
+    /// never trigger the system authorization prompt without learner action.
+    func runtimeDidBind() {}
+
+    func authorizationStatus() async -> UNAuthorizationStatus {
+        await authorizer.authorizationStatus()
+    }
+
+    func requestFromSettings() async -> UNAuthorizationStatus {
+        let currentStatus = await authorizationStatus()
+        guard currentStatus == .notDetermined else { return currentStatus }
+
+        LLog.info("push", "requesting notification permission from learner action")
+        do {
+            try await authorizer.requestAuthorization(options: [.alert, .sound])
+        } catch {
+            LLog.error("push", "notification permission request failed", error: error)
+        }
+        return await authorizationStatus()
+    }
+}
+
 @MainActor
 final class AppLifecycleController {
     static let notificationServerIdKey = "litter.notification.serverId"
@@ -23,7 +147,6 @@ final class AppLifecycleController {
     private var backgroundedTurnKeys: Set<ThreadKey> = []
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     private var bgWakeCount: Int = 0
-    private var notificationPermissionRequested = false
     private var hasRecoveredCurrentForegroundSession = false
     private var hasEnteredBackgroundSinceLaunch = false
     private var foregroundRecoveryTask: Task<Void, Never>?
@@ -287,17 +410,17 @@ final class AppLifecycleController {
         lastBackgroundedAt = Date()
     }
 
-    func requestNotificationPermissionIfNeeded() {
-        guard !notificationPermissionRequested else { return }
-        #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--ui-test-conversation-display") {
-            notificationPermissionRequested = true
-            return
-        }
-        #endif
-        notificationPermissionRequested = true
-        LLog.info("push", "requesting notification permission")
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    static func notificationAuthorizationStatus() async -> UNAuthorizationStatus {
+        await AppNotificationPermissionController.shared.authorizationStatus()
+    }
+
+    static func requestNotificationAuthorization() async -> UNAuthorizationStatus {
+        await AppNotificationPermissionController.shared.requestFromSettings()
+    }
+
+    static func openNotificationSettings() {
+        guard let url = URL(string: UIApplication.openNotificationSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
 
     func reconcileBackgroundedTurns(

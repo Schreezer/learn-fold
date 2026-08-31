@@ -12,7 +12,7 @@ public struct CodeBlockView: View, Equatable {
         self.isSmall = isSmall
     }
 
-    public static func == (lhs: CodeBlockView, rhs: CodeBlockView) -> Bool {
+    public nonisolated static func == (lhs: CodeBlockView, rhs: CodeBlockView) -> Bool {
         lhs.language == rhs.language && lhs.content == rhs.content && lhs.isSmall == rhs.isSmall
     }
 

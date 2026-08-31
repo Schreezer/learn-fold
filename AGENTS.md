@@ -151,6 +151,8 @@ Incremental policy:
 | `make play-upload` | Full Android build + Google Play upload |
 | `make clean` | Remove all build artifacts + stamp cache |
 
+For a quick internal-only TestFlight build, use `BETA_GROUP_NAMES="Internal Testers" SUBMIT_BETA_REVIEW=0 WAIT_FOR_PROCESSING=1 make testflight`; this uploads, waits for Apple processing, and assigns the build without submitting external Beta App Review.
+
 ### Cache invalidation
 - `make rebuild-bindings` — force-rebuild UniFFI bindings.
 - `make clean-rust` / `make clean-ios` / `make clean-android` — remove platform-specific artifacts.

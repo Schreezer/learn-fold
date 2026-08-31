@@ -1,6 +1,6 @@
 import SwiftUI
 import WatchKit
-import UserNotifications
+@preconcurrency import UserNotifications
 
 /// Identifiers shared with the iPhone notification scheduler. Keep in lock
 /// step with `WatchApprovalNotification` on the iOS target — copied here so
@@ -44,7 +44,8 @@ enum WatchApprovalActionRouter {
 /// Routes notification action taps from the system into
 /// `WatchSessionBridge.shared.sendApprovalDecision`. Owned by
 /// `LitterWatchApp` so the singleton survives the whole app lifetime.
-final class WatchNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+@MainActor
+final class WatchNotificationDelegate: NSObject, @preconcurrency UNUserNotificationCenterDelegate {
     static let shared = WatchNotificationDelegate()
     private override init() { super.init() }
 
@@ -59,20 +60,20 @@ final class WatchNotificationDelegate: NSObject, UNUserNotificationCenterDelegat
         )
         switch decision {
         case .approve(let requestId):
+            completionHandler()
             Task { @MainActor in
                 WatchSessionBridge.shared.sendApprovalDecision(
                     requestId: requestId,
                     approve: true
                 )
-                completionHandler()
             }
         case .deny(let requestId):
+            completionHandler()
             Task { @MainActor in
                 WatchSessionBridge.shared.sendApprovalDecision(
                     requestId: requestId,
                     approve: false
                 )
-                completionHandler()
             }
         case .noop:
             completionHandler()
@@ -98,6 +99,7 @@ let watchBackgroundRefreshInterval: TimeInterval = 15 * 60
 /// the watch can rehydrate its App Group snapshot while suspended. Routes
 /// `WKApplicationRefreshBackgroundTask`s to `forceHydrateFromAppGroup`
 /// then reschedules the next refresh.
+@MainActor
 final class LitterWatchAppDelegate: NSObject, WKApplicationDelegate {
     static let shared = LitterWatchAppDelegate()
 

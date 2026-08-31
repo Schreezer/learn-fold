@@ -32,7 +32,8 @@ final class RealtimeWebRtcSession: NSObject {
     private var routeObserver: NSObjectProtocol?
     private var candidatesGathered = 0
 
-    private var iceGatheringContinuation: CheckedContinuation<Void, Never>?
+    private var iceGatheringContinuation: CheckedContinuation<Bool, Never>?
+    private var iceGatheringTimeoutTask: Task<Void, Never>?
 
     override init() {
         super.init()
@@ -170,10 +171,7 @@ final class RealtimeWebRtcSession: NSObject {
     }
 
     private func cleanup() {
-        if let continuation = iceGatheringContinuation {
-            iceGatheringContinuation = nil
-            continuation.resume()
-        }
+        finishIceGatheringWait(timedOut: false)
         removeRouteObserver()
         dataChannel?.close()
         dataChannel = nil
@@ -265,7 +263,7 @@ final class RealtimeWebRtcSession: NSObject {
         connection: RTCPeerConnection,
         constraints: RTCMediaConstraints
     ) async throws -> RTCSessionDescription {
-        try await withCheckedThrowingContinuation { continuation in
+        let sdp: String = try await withCheckedThrowingContinuation { continuation in
             connection.offer(for: constraints) { description, error in
                 if let error = error {
                     continuation.resume(throwing: error)
@@ -275,9 +273,13 @@ final class RealtimeWebRtcSession: NSObject {
                     continuation.resume(throwing: RealtimeWebRtcSessionError.offerCreationFailed)
                     return
                 }
-                continuation.resume(returning: description)
+                // WebRTC's Objective-C object is not Sendable. Copy its SDP
+                // while in the callback, then reconstruct the description on
+                // this main-actor session after the continuation resumes.
+                continuation.resume(returning: description.sdp)
             }
         }
+        return RTCSessionDescription(type: .offer, sdp: sdp)
     }
 
     private func setLocalDescription(
@@ -315,35 +317,29 @@ final class RealtimeWebRtcSession: NSObject {
     private func awaitIceGatheringComplete(connection: RTCPeerConnection) async -> Bool {
         if connection.iceGatheringState == .complete { return false }
 
-        return await withTaskGroup(of: Bool.self) { group in
-            group.addTask { @MainActor [weak self] in
-                guard let self else { return false }
-                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                    self.iceGatheringContinuation = continuation
-                }
-                return false
-            }
-            group.addTask { [weak self] in
+        return await withCheckedContinuation { continuation in
+            iceGatheringContinuation = continuation
+            iceGatheringTimeoutTask?.cancel()
+            iceGatheringTimeoutTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: Self.iceGatheringTimeout)
-                await MainActor.run {
-                    if let continuation = self?.iceGatheringContinuation {
-                        self?.iceGatheringContinuation = nil
-                        continuation.resume()
-                    }
-                }
-                return true
+                guard !Task.isCancelled else { return }
+                self?.finishIceGatheringWait(timedOut: true)
             }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            return first
         }
+    }
+
+    private func finishIceGatheringWait(timedOut: Bool) {
+        iceGatheringTimeoutTask?.cancel()
+        iceGatheringTimeoutTask = nil
+        guard let continuation = iceGatheringContinuation else { return }
+        iceGatheringContinuation = nil
+        continuation.resume(returning: timedOut)
     }
 
     fileprivate func iceGatheringStateChanged(to state: RTCIceGatheringState) {
         LLog.info("webrtc", "iceGatheringState changed", fields: ["state": describe(state)])
-        guard state == .complete, let continuation = iceGatheringContinuation else { return }
-        iceGatheringContinuation = nil
-        continuation.resume()
+        guard state == .complete else { return }
+        finishIceGatheringWait(timedOut: false)
     }
 
     fileprivate func iceConnectionStateChanged(to state: RTCIceConnectionState) {

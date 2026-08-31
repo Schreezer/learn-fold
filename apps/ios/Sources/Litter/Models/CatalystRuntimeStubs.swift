@@ -11,7 +11,19 @@ final class AppRuntimeController {
     @ObservationIgnored private weak var appModel: AppModel?
     @ObservationIgnored private let reachability = NetworkReachabilityObserver()
 
+    private init() {
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "CatalystAppRuntimeController.init"
+        )
+    }
+
     func bind(appModel: AppModel, voiceRuntime: VoiceRuntimeController) {
+        guard !LearnfoldStrictHarnessPolicy.isStrictHarnessActive() else {
+            return
+        }
+        LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
+            "CatalystAppRuntimeController.bind"
+        )
         self.appModel = appModel
         reachability.bind(appModel: appModel)
         reachability.start()

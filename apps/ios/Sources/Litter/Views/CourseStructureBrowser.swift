@@ -10,7 +10,7 @@ struct CoursePageStructureBrowser: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Course structure")
+                Text("Course pages")
                     .font(.system(size: 28, weight: .bold, design: .rounded))
                 Text("Every lesson and note is an editable page")
                     .font(.subheadline)
@@ -18,10 +18,11 @@ struct CoursePageStructureBrowser: View {
             }
 
             VStack(spacing: 0) {
-                ForEach(nodes) { node in
+                ForEach(Array(nodes.enumerated()), id: \.element.id) { index, node in
                     CoursePageStructureNode(
                         node: node,
                         depth: 0,
+                        ordinal: String(index + 1),
                         expandedNodeIDs: $expandedNodeIDs,
                         onOpenPage: onOpenPage
                     )
@@ -40,6 +41,7 @@ struct CoursePageStructureBrowser: View {
 private struct CoursePageStructureNode: View {
     let node: CourseLearningNode
     let depth: Int
+    let ordinal: String
     @Binding var expandedNodeIDs: Set<String>
     let onOpenPage: (String) -> Void
 
@@ -48,20 +50,44 @@ private struct CoursePageStructureNode: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Button {
-                    guard !node.children.isEmpty else { return }
-                    withAnimation(.snappy(duration: 0.22)) {
-                        if isExpanded { expandedNodeIDs.remove(node.id) }
-                        else { expandedNodeIDs.insert(node.id) }
+                if node.children.isEmpty {
+                    Image(systemName: "doc.text.fill")
+                        .font(.body)
+                        .foregroundStyle(
+                            node.status == .pendingGeneration ? Color.secondary : Color.blue
+                        )
+                        .frame(width: 44, height: 44)
+                        .accessibilityHidden(true)
+                } else {
+                    Button {
+                        withAnimation(.snappy(duration: 0.22)) {
+                            if isExpanded { expandedNodeIDs.remove(node.id) }
+                            else { expandedNodeIDs.insert(node.id) }
+                        }
+                    } label: {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(
+                                node.status == .pendingGeneration ? Color.secondary : Color.blue
+                            )
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
-                } label: {
-                    Image(systemName: node.children.isEmpty ? "doc.text.fill" : (isExpanded ? "chevron.down" : "chevron.right"))
-                        .font(node.children.isEmpty ? .body : .caption.weight(.bold))
-                        .foregroundStyle(node.status == .pendingGeneration ? Color.secondary : Color.blue)
-                        .frame(width: 24, height: 40)
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier(
+                        CoursePageStructureAccessibilityPolicy.disclosureIdentifier(for: node)
+                    )
+                    .accessibilityLabel(
+                        CoursePageStructureAccessibilityPolicy.disclosureLabel(
+                            for: node,
+                            ordinal: ordinal,
+                            isExpanded: isExpanded
+                        )
+                    )
+                    .accessibilityHint(
+                        isExpanded ? "Collapses this course section." : "Expands this course section."
+                    )
                 }
-                .buttonStyle(.plain)
-                .disabled(node.children.isEmpty)
 
                 Button {
                     if let pageID = node.pageID { onOpenPage(pageID) }
@@ -83,16 +109,30 @@ private struct CoursePageStructureNode: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(node.pageID == nil)
+                .accessibilityElement(children: .ignore)
+                .accessibilityIdentifier(
+                    CoursePageStructureAccessibilityPolicy.rowIdentifier(for: node)
+                )
+                .accessibilityLabel(
+                    CoursePageStructureAccessibilityPolicy.rowLabel(
+                        for: node,
+                        ordinal: ordinal,
+                        status: statusLabel
+                    )
+                )
+                .accessibilityHint("Opens this editable course page.")
             }
             .padding(.leading, CGFloat(depth) * 22 + 10)
             .padding(.trailing, 12)
             .padding(.vertical, 8)
 
             if isExpanded {
-                ForEach(node.children) { child in
+                ForEach(Array(node.children.enumerated()), id: \.element.id) { index, child in
                     CoursePageStructureNode(
                         node: child,
                         depth: depth + 1,
+                        ordinal: "\(ordinal).\(index + 1)",
                         expandedNodeIDs: $expandedNodeIDs,
                         onOpenPage: onOpenPage
                     )
@@ -114,6 +154,35 @@ private struct CoursePageStructureNode: View {
     }
 }
 
+enum CoursePageStructureAccessibilityPolicy {
+    static func rowIdentifier(for node: CourseLearningNode) -> String {
+        "course-page-row-\(node.id)"
+    }
+
+    static func disclosureIdentifier(for node: CourseLearningNode) -> String {
+        "course-page-expand-\(node.id)"
+    }
+
+    static func rowLabel(
+        for node: CourseLearningNode,
+        ordinal: String,
+        status: String
+    ) -> String {
+        let role = node.role?.displayName ?? (node.kind == .folder ? "Section" : "Page")
+        return "\(ordinal), \(role), \(node.title), \(status)"
+    }
+
+    static func disclosureLabel(
+        for node: CourseLearningNode,
+        ordinal: String,
+        isExpanded: Bool
+    ) -> String {
+        let role = node.role?.displayName ?? "Section"
+        let action = isExpanded ? "Collapse" : "Expand"
+        return "\(action) \(ordinal), \(role), \(node.title)"
+    }
+}
+
 struct CourseStructureBrowser: View {
     let snapshot: CourseWorkspaceSnapshot
     let recommendedFilePath: String?
@@ -126,7 +195,7 @@ struct CourseStructureBrowser: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .bottom) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Course structure")
+                    Text("Source files")
                         .font(.system(size: 28, weight: .bold, design: .rounded))
                     Text("\(snapshot.fileCount) files  •  \(snapshot.folderCount) folders")
                         .font(.subheadline)
@@ -168,6 +237,9 @@ struct CourseStructureBrowser: View {
             hasInitializedExpansion = true
             expandedPaths = defaultExpandedPaths
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-structure-browser")
+        .accessibilityValue("\(snapshot.fileCount) files, \(snapshot.folderCount) folders")
     }
 
     private var defaultExpandedPaths: Set<String> {
@@ -340,6 +412,8 @@ struct CourseFileViewerView: View {
     let rootURL: URL
     @Bindable var store: CourseExperienceStore
     let onOpenRelativePath: (String) -> Void
+    let onOpenCourseStructure: () -> Void
+    let onReturnToLibrary: () -> Void
 
     @State private var loadState: LoadState = .loading
     @State private var fileURL: URL?
@@ -349,7 +423,19 @@ struct CourseFileViewerView: View {
         case text(String)
         case image(UIImage)
         case unsupported
+        case unavailable
         case failed(String)
+
+        var accessibilityValue: String {
+            switch self {
+            case .loading: "Opening file"
+            case .text: "File loaded as text"
+            case .image: "File loaded as image"
+            case .unsupported: "Preview unavailable"
+            case .unavailable: "File unavailable"
+            case .failed: "File preview failed"
+            }
+        }
     }
 
     var body: some View {
@@ -361,16 +447,18 @@ struct CourseFileViewerView: View {
                 if isMarkdown {
                     ScrollView {
                         Text(text)
+                            .accessibilityIdentifier("course-file-viewer-text")
                             .font(.body)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 20)
-                        .padding(.top, 22)
-                        .padding(.bottom, 44)
+                            .padding(.horizontal, 20)
+                            .padding(.top, 22)
+                            .padding(.bottom, 44)
                     }
                 } else {
                     ScrollView([.horizontal, .vertical]) {
                         Text(text)
+                            .accessibilityIdentifier("course-file-viewer-text")
                             .font(.system(.body, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -390,9 +478,17 @@ struct CourseFileViewerView: View {
                     systemImage: "doc",
                     description: Text("You can share this file or open it in another app.")
                 )
+            case .unavailable:
+                CourseRouteUnavailableView(
+                    kind: .file,
+                    courseTitle: course.title,
+                    canOpenCourseStructure: course.workspaceID != nil,
+                    onOpenCourseStructure: onOpenCourseStructure,
+                    onReturnToLibrary: onReturnToLibrary
+                )
             case .failed(let message):
                 ContentUnavailableView(
-                    "Couldn’t open file",
+                    "Couldn’t preview file",
                     systemImage: "exclamationmark.triangle",
                     description: Text(message)
                 )
@@ -426,6 +522,8 @@ struct CourseFileViewerView: View {
         .onChange(of: store.courseWorkspaceRefreshVersion) { _, _ in
             loadFile()
         }
+        .accessibilityIdentifier("course-file-viewer")
+        .accessibilityValue(loadState.accessibilityValue)
     }
 
     private var isMarkdown: Bool {
@@ -453,8 +551,9 @@ struct CourseFileViewerView: View {
                 loadState = .unsupported
             }
         } catch {
-            loadState = .failed(error.localizedDescription)
+            loadState = CourseRouteFallbackPolicy.fileIsUnavailable(after: error)
+                ? .unavailable
+                : .failed(error.localizedDescription)
         }
     }
-
 }

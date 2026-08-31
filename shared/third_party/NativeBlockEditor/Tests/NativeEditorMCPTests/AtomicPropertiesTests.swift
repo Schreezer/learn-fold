@@ -70,6 +70,61 @@ final class AtomicPropertiesTests: XCTestCase {
         XCTAssertEqual(receipts[0].changedPageIDs, [before.id])
     }
 
+    func testWorkspaceGenerationCASRejectsStaleWholeWorkspaceWithoutPartialPages() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NativeEditorWorkspaceCAS-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("course-library.sqlite")
+        let shellWriter = try await NativeEditorMCPService.open(databaseURL: databaseURL)
+        let editorWriter = try await NativeEditorMCPService.open(databaseURL: databaseURL)
+        let staleBase = try await shellWriter.workspaceSnapshotWithGeneration()
+        let root = try await editorWriter.rootPageSnapshot()
+
+        _ = try await editorWriter.updatePage([
+            "page_id": .string(root.id),
+            "command": "replace_content",
+            "expected_revision": .integer(Int(root.revision)),
+            "new_str": "# Learner edit\nThis edit won the interleaving race.",
+        ])
+
+        var staleCandidate = staleBase.workspace
+        let candidate = try staleCandidate.createPage(
+            title: "Partially staged shell page",
+            parentID: staleCandidate.rootPageID,
+            document: BlockDocument(root: BlockNode(type: "page", children: [
+                .heading("Partially staged shell page", level: 1),
+            ]))
+        )
+        if var parent = staleCandidate.page(id: staleCandidate.rootPageID)?.document {
+            parent.root.children.append(
+                .childPage(pageID: candidate.id, title: candidate.title, icon: candidate.icon)
+            )
+            try staleCandidate.saveDocument(parent, for: staleCandidate.rootPageID)
+        }
+
+        do {
+            try await shellWriter.replaceWorkspace(
+                staleCandidate,
+                expectedGeneration: staleBase.generation
+            )
+            XCTFail("Expected the stale whole-workspace CAS to lose")
+        } catch LibraryStoreError.workspaceGenerationConflict(
+            let expected,
+            let actual
+        ) {
+            XCTAssertEqual(expected, staleBase.generation)
+            XCTAssertGreaterThan(actual, expected)
+        }
+
+        let durable = try await editorWriter.workspaceSnapshot()
+        XCTAssertNil(durable.page(id: candidate.id))
+        let durableRoot = try XCTUnwrap(durable.page(id: durable.rootPageID))
+        XCTAssertTrue(
+            AppFlowyMarkdownCodec().encode(durableRoot.document)
+                .contains("This edit won the interleaving race.")
+        )
+    }
+
     private func makeService() async throws -> (NativeEditorMCPService, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("NativeEditorAtomicProperties-\(UUID().uuidString)", isDirectory: true)

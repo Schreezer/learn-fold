@@ -1,4 +1,4 @@
-import ActivityKit
+@preconcurrency import ActivityKit
 import Foundation
 
 @MainActor
@@ -28,12 +28,15 @@ final class TurnLiveActivityController {
     private func cleanupStaleActivities() {
         guard !didCleanupStaleActivities else { return }
         didCleanupStaleActivities = true
-        for stale in Activity<CodexTurnAttributes>.activities {
+        for staleID in Activity<CodexTurnAttributes>.activities.map(\.id) {
             let state = CodexTurnAttributes.ContentState(
                 phase: .completed, elapsedSeconds: 0, toolCallCount: 0,
                 activeThreadCount: 0, fileChangeCount: 0, contextPercent: 0
             )
-            Task {
+            Task { @MainActor in
+                guard let stale = Activity<CodexTurnAttributes>.activities.first(where: { $0.id == staleID }) else {
+                    return
+                }
                 await stale.end(.init(state: state, staleDate: nil), dismissalPolicy: .immediate)
             }
         }
@@ -107,7 +110,7 @@ final class TurnLiveActivityController {
     }
 
     private func update(for thread: AppThreadSnapshot, activeCount: Int, snapshot: AppSnapshotRecord) {
-        guard let activity else { return }
+        guard let activityID = activity?.id else { return }
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastUpdateTime > 2.0 else { return }
 
@@ -127,7 +130,10 @@ final class TurnLiveActivityController {
             contextPercent: thread.contextPercent
         )
         lastUpdateTime = now
-        Task {
+        Task { @MainActor in
+            guard let activity = Activity<CodexTurnAttributes>.activities.first(where: { $0.id == activityID }) else {
+                return
+            }
             await activity.update(.init(state: state, staleDate: Date(timeIntervalSinceNow: 60)))
         }
 
@@ -135,7 +141,7 @@ final class TurnLiveActivityController {
     }
 
     func updateBackgroundWake(for thread: AppThreadSnapshot, pushCount: Int) {
-        guard let activity else { return }
+        guard let activityID = activity?.id else { return }
         if let snapshot = thread.latestAssistantSnippetSnapshot,
            outputSnippetSourceItemId != snapshot.sourceItemId || outputSnippet != snapshot.snippet {
             outputSnippetSourceItemId = snapshot.sourceItemId
@@ -153,13 +159,16 @@ final class TurnLiveActivityController {
             contextPercent: thread.contextPercent
         )
         lastUpdateTime = CFAbsoluteTimeGetCurrent()
-        Task {
+        Task { @MainActor in
+            guard let activity = Activity<CodexTurnAttributes>.activities.first(where: { $0.id == activityID }) else {
+                return
+            }
             await activity.update(.init(state: state, staleDate: Date(timeIntervalSinceNow: 60)))
         }
     }
 
     func endCurrent(phase: CodexTurnAttributes.ContentState.Phase, snapshot: AppSnapshotRecord?) {
-        guard let activity else { return }
+        guard let activityID = activity?.id else { return }
         let thread = activeKey.flatMap { snapshot?.threadSnapshot(for: $0) }
         let state = CodexTurnAttributes.ContentState(
             phase: phase,
@@ -170,7 +179,10 @@ final class TurnLiveActivityController {
             fileChangeCount: 0,
             contextPercent: thread?.contextPercent ?? 0
         )
-        Task {
+        Task { @MainActor in
+            guard let activity = Activity<CodexTurnAttributes>.activities.first(where: { $0.id == activityID }) else {
+                return
+            }
             await activity.end(
                 .init(state: state, staleDate: Date(timeIntervalSinceNow: 60)),
                 dismissalPolicy: .after(.now + 4)

@@ -18,7 +18,8 @@ enum AlleycatCredentialStoreError: LocalizedError {
     }
 }
 
-final class AlleycatCredentialStore {
+/// Keychain calls are synchronous and the instance has no mutable state.
+final class AlleycatCredentialStore: @unchecked Sendable {
     static let shared = AlleycatCredentialStore()
 
     private let service = "com.alleycat.token"

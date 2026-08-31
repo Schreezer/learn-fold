@@ -47,8 +47,8 @@ final class WatchCompanionBridgeTests: XCTestCase {
     private var savedPinnedKeys: [PinnedThreadKey] = []
     private var savedHiddenKeys: [PinnedThreadKey] = []
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         savedSnapshot = AppModel.shared.snapshot
         savedPinnedKeys = SavedThreadsStore.pinnedKeys()
         savedHiddenKeys = SavedThreadsStore.hiddenKeys()
@@ -60,7 +60,7 @@ final class WatchCompanionBridgeTests: XCTestCase {
         }
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         AppModel.shared.applySnapshot(savedSnapshot)
         // Wipe whatever the test left behind…
         for key in SavedThreadsStore.pinnedKeys() { SavedThreadsStore.remove(key) }
@@ -72,7 +72,7 @@ final class WatchCompanionBridgeTests: XCTestCase {
         if let pending = AppModel.shared.composerPrefillRequest {
             AppModel.shared.clearComposerPrefill(id: pending.id)
         }
-        super.tearDown()
+        try await super.tearDown()
     }
 
     // MARK: - 1. Complication mode = .running with real runtime

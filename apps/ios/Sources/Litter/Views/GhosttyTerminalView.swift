@@ -804,7 +804,7 @@ final class LitterTerminalAccessoryBar: UIView {
         config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10)
         config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attrs in
             var out = attrs
-            out.font = UIFont(name: "SFMono-Regular", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
+            out[AttributeScopes.UIKitAttributes.FontAttribute.self] = UIFont(name: "SFMono-Regular", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
             return out
         }
         let button = UIButton(configuration: config)
@@ -1052,7 +1052,8 @@ final class TerminalSelectionOverlayView: UIView {
 /// focus keyboard / open links, pinch to resize, two-finger pan to
 /// scroll, and one-finger pan when an in-terminal mouse-tracking app
 /// captures the mouse.
-final class GhosttyHostView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
+@MainActor
+final class GhosttyHostView: UIView, UIGestureRecognizerDelegate, @preconcurrency UIEditMenuInteractionDelegate {
     private static let bellHapticThrottle: TimeInterval = 0.25
     private static let selectionDragSlop: CGFloat = 8.0
 

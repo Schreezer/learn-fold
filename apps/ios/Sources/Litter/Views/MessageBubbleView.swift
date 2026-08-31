@@ -1,6 +1,6 @@
 import SwiftUI
 import Hairball
-import HairballUI
+@preconcurrency import HairballUI
 import Nuke
 import NukeUI
 import UIKit
@@ -211,7 +211,7 @@ struct UserBubble: View {
         )
     }
 
-    private static func imageData(forSource source: String) -> Data? {
+    private nonisolated static func imageData(forSource source: String) -> Data? {
         if source.hasPrefix("file://") {
             let path = String(source.dropFirst("file://".count))
             return FileManager.default.contents(atPath: path)
@@ -222,7 +222,7 @@ struct UserBubble: View {
     }
 }
 
-struct AssistantBubble: View, Equatable {
+struct AssistantBubble: View, @preconcurrency Equatable {
     let markdownString: String
     let markdownIdentity: Int
     var label: String? = nil
@@ -968,7 +968,8 @@ private func litterSystemTheme(
     return theme
 }
 
-struct LitterCodeBlockRenderer: CodeBlockRenderer {
+@MainActor
+struct LitterCodeBlockRenderer: @preconcurrency CodeBlockRenderer {
     @ViewBuilder
     func makeBody(configuration: CodeBlockConfiguration) -> some View {
         if isDiffLanguage(configuration.language) {
@@ -1035,7 +1036,7 @@ private struct CodeBlockTerminalContextMenu: ViewModifier {
 // MARK: - Syntax Highlighting Theme Mapping
 
 /// Shared highlighter instance — theme is switched at runtime via `setTheme(_:)`.
-private let sharedHighlighter = HighlightrCodeSyntaxHighlighter(theme: "atom-one-dark")
+@MainActor private let sharedHighlighter = HighlightrCodeSyntaxHighlighter(theme: "atom-one-dark")
 
 /// Maps a Litter theme slug to the closest Highlightr theme name.
 /// Direct matches are checked first, then known family prefixes, then light/dark fallback.
@@ -1123,12 +1124,14 @@ private func highlightrThemeName(for slug: String, type: ThemeDefinition.ThemeTy
 }
 
 /// Returns the current Highlightr theme name based on the active Litter theme.
+@MainActor
 private func currentHighlightrTheme(for colorScheme: ColorScheme) -> String {
     let resolved = colorScheme == .dark ? ThemeStore.shared.dark : ThemeStore.shared.light
     return highlightrThemeName(for: resolved.slug, type: resolved.type)
 }
 
 /// Syncs the shared highlighter to match the current Litter theme.
+@MainActor
 private func syncHighlighterTheme(for colorScheme: ColorScheme) {
     let desired = currentHighlightrTheme(for: colorScheme)
     if sharedHighlighter.themeName != desired {
@@ -1138,6 +1141,7 @@ private func syncHighlighterTheme(for colorScheme: ColorScheme) {
 
 // MARK: - Auto-Scaling Markdown Modifiers
 
+@MainActor
 private struct ScaledContentMarkdownModifier: ViewModifier {
     @Environment(\.textScale) private var textScale
     @Environment(\.colorScheme) private var colorScheme
@@ -1168,6 +1172,7 @@ private struct ScaledContentMarkdownModifier: ViewModifier {
     }
 }
 
+@MainActor
 private struct ScaledSystemMarkdownModifier: ViewModifier {
     @Environment(\.textScale) private var textScale
     @Environment(\.colorScheme) private var colorScheme

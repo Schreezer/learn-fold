@@ -130,6 +130,7 @@ enum LitterPlatform {
 #endif
     }
 
+    @MainActor
     static func localRuntimeDisplayName() -> String {
 #if targetEnvironment(macCatalyst)
         for candidate in [

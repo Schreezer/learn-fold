@@ -61,7 +61,8 @@ enum SSHCredentialStoreError: LocalizedError {
     }
 }
 
-final class SSHCredentialStore {
+/// Keychain calls are synchronous and the instance has no mutable state.
+final class SSHCredentialStore: @unchecked Sendable {
     static let shared = SSHCredentialStore()
 
     private let service = "com.litter.ssh.credentials"

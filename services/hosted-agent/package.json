@@ -1,0 +1,27 @@
+{
+  "name": "learnfold-hosted-agent",
+  "version": "0.1.0",
+  "private": true,
+  "license": "GPL-3.0-only WITH LicenseRef-App-Store-Google-Play-Exception",
+  "type": "module",
+  "scripts": {
+    "check": "wrangler types && tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "vitest run",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "4.0.34",
+    "@cloudflare/think": "0.15.1",
+    "agents": "0.20.1",
+    "ai": "7.0.56"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.8",
+    "@types/node": "24.10.0",
+    "typescript": "5.9.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.119.0"
+  }
+}

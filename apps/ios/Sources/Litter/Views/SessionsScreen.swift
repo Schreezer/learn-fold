@@ -1064,7 +1064,8 @@ struct SessionsScreen: View {
                     )
                 )
 
-                if hasChildren && !collapsedSessionNodeKeys.contains(node.thread.key) {
+                let nodeKey = node.thread.key
+                if hasChildren && !collapsedSessionNodeKeys.contains(nodeKey) {
                     append(nodes: node.children, depth: depth + 1)
                 }
             }

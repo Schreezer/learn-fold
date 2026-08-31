@@ -12,7 +12,10 @@ import Foundation
 /// `ghostty_surface_read_text`. The UI overlay view subscribes to
 /// `onSelectionRangeChanged` to redraw handles when Rust pushes a new range.
 final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Sendable {
-    private weak var terminal: LitterGhosttyTerminal?
+    /// The Obj-C terminal owns non-Sendable Ghostty C handles. Keep its weak
+    /// reference isolated to the main actor so background Rust callbacks only
+    /// ever transfer the actor-safe handle, never the terminal itself.
+    private let terminalHandle: GhosttyTerminalHandle
 
     /// Most recently pushed selection range (viewport-relative). `nil` when
     /// no selection is active. Written from the Rust runtime via
@@ -25,23 +28,32 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
     /// Callback fired on the main thread whenever the stored selection
     /// range changes. The terminal view installs this to drive handle
     /// repaints + edit-menu visibility.
-    var onSelectionRangeChanged: ((TerminalCellRange?) -> Void)?
+    private let selectionCallbackStorage = SelectionCallbackStorage()
+    /// All one-way renderer callbacks share this mailbox. A callback stream
+    /// such as focus → key → text must reach Ghostty in that same order; an
+    /// independent `Task { @MainActor in ... }` for each callback does not
+    /// provide that guarantee.
+    private let terminalDelivery: MainActorTerminalDelivery
+    @MainActor var onSelectionRangeChanged: ((TerminalCellRange?) -> Void)? {
+        didSet {
+            selectionCallbackStorage.replace(onSelectionRangeChanged)
+        }
+    }
 
-    init(terminal: LitterGhosttyTerminal) {
-        self.terminal = terminal
+    @MainActor init(terminal: LitterGhosttyTerminal) {
+        terminalHandle = GhosttyTerminalHandle(terminal: terminal)
+        terminalDelivery = MainActorTerminalDelivery(terminalHandle: terminalHandle)
     }
 
     func setFocus(focused: Bool) {
-        let terminal = self.terminal
-        DispatchQueue.main.async {
-            terminal?.setFocused(focused)
+        terminalDelivery.enqueue { terminal in
+            terminal.terminal?.setFocused(focused)
         }
     }
 
     func setOcclusion(occluded: Bool) {
-        let terminal = self.terminal
-        DispatchQueue.main.async {
-            terminal?.setOcclusion(occluded)
+        terminalDelivery.enqueue { terminal in
+            terminal.terminal?.setOcclusion(occluded)
         }
     }
 
@@ -52,24 +64,18 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
     }
 
     func applyConfigFile(path: String) {
-        let terminal = self.terminal
-        if Thread.isMainThread {
-            try? terminal?.applyConfig(atPath: path)
-        } else {
-            DispatchQueue.main.async {
-                try? terminal?.applyConfig(atPath: path)
-            }
+        terminalDelivery.enqueueOrDeliverImmediatelyIfIdle { terminal in
+            try? terminal.terminal?.applyConfig(atPath: path)
         }
     }
 
     func dispatchKey(event: TerminalKeyEvent) {
-        let terminal = self.terminal
         let action = Int32(GhosttyKeyTranslator.action(for: event.action))
         let litterKey = GhosttyKeyTranslator.litterKey(for: event.code)
         let mods = Int32(GhosttyKeyTranslator.mods(for: event.mods))
         let text = event.text.isEmpty ? nil : event.text
-        DispatchQueue.main.async {
-            _ = terminal?.dispatchKeyAction(
+        terminalDelivery.enqueue { terminal in
+            _ = terminal.terminal?.dispatchKeyAction(
                 action,
                 key: litterKey,
                 mods: mods,
@@ -80,12 +86,11 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
     }
 
     func dispatchText(text: String, composing: Bool) {
-        let terminal = self.terminal
-        DispatchQueue.main.async {
+        terminalDelivery.enqueue { terminal in
             if composing {
-                terminal?.setPreeditText(text.isEmpty ? nil : text)
+                terminal.terminal?.setPreeditText(text.isEmpty ? nil : text)
             } else {
-                terminal?.sendText(text)
+                terminal.terminal?.sendText(text)
             }
         }
     }
@@ -98,9 +103,8 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
         // we reuse it: the platform-side controller forwards the bytes
         // to the running process unchanged. Writing them through
         // `writeOutput` would paint the wrapper on screen instead.
-        let terminal = self.terminal
-        DispatchQueue.main.async {
-            terminal?.inputHandler?(bytes)
+        terminalDelivery.enqueue { terminal in
+            terminal.terminal?.inputHandler?(bytes)
         }
     }
 
@@ -112,8 +116,9 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
         // block long enough to return — bounded waits keep this safe under
         // a misbehaving renderer (no deadlock with the renderer's tokio
         // runtime because no main-thread caller is waiting on us).
-        return runOnMainBlocking { [weak terminal] in
-            terminal?.readText(
+        let terminalHandle = terminalHandle
+        return runOnMainBlocking { @MainActor [terminalHandle] in
+            terminalHandle.terminal?.readText(
                 fromRow: range.start.row,
                 column: range.start.col,
                 toRow: range.end.row,
@@ -123,8 +128,9 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
     }
 
     func readText(startRow: UInt32, startCol: UInt32, endRow: UInt32, endCol: UInt32) -> String? {
-        runOnMainBlocking { [weak terminal] in
-            terminal?.readText(
+        let terminalHandle = terminalHandle
+        return runOnMainBlocking { @MainActor [terminalHandle] in
+            terminalHandle.terminal?.readText(
                 fromRow: startRow,
                 column: startCol,
                 toRow: endRow,
@@ -134,8 +140,9 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
     }
 
     func cellMetrics() -> TerminalCellMetrics {
-        let metrics = runOnMainBlocking { [weak terminal] in
-            terminal?.surfaceMetrics()
+        let terminalHandle = terminalHandle
+        let metrics = runOnMainBlocking { @MainActor [terminalHandle] in
+            terminalHandle.terminal?.surfaceMetrics()
         } ?? LitterGhosttySurfaceMetrics()
         return TerminalCellMetrics(
             cellWidthPx: Float(metrics.cellWidthPx),
@@ -154,9 +161,9 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
         selectionLock.lock()
         selectionRange = range
         selectionLock.unlock()
-        let callback = onSelectionRangeChanged
-        DispatchQueue.main.async {
-            callback?(range)
+        let callback = selectionCallbackStorage.snapshot()
+        terminalDelivery.enqueue { _ in
+            callback?.invoke(range)
         }
     }
 
@@ -173,13 +180,149 @@ final class GhosttyRendererBackendBridge: TerminalRendererBackend, @unchecked Se
     /// waits. `DispatchQueue.main.sync` from a background thread is fine
     /// here because the Rust tick task never holds a lock the main thread
     /// could be waiting on.
-    private func runOnMainBlocking<T>(_ work: @MainActor @Sendable () -> T) -> T {
+    private func runOnMainBlocking<T: Sendable>(_ work: @MainActor @Sendable () -> T) -> T {
         if Thread.isMainThread {
             return MainActor.assumeIsolated { work() }
         }
         return DispatchQueue.main.sync {
             MainActor.assumeIsolated { work() }
         }
+    }
+}
+
+/// Actor-isolated indirection for the non-Sendable Obj-C terminal. The bridge
+/// may be retained and invoked by Rust's concurrent executor, while all
+/// accesses to Ghostty's underlying C handles stay on the main actor.
+@MainActor
+private final class GhosttyTerminalHandle {
+    weak var terminal: LitterGhosttyTerminal?
+
+    init(terminal: LitterGhosttyTerminal) {
+        self.terminal = terminal
+    }
+}
+
+/// A lock-backed FIFO mailbox whose drain is confined to the main actor.
+///
+/// Rust can invoke the backend from concurrent executor tasks, so the lock
+/// establishes one delivery order at the bridge boundary. Exactly one main
+/// queue drain consumes that order; commands appended while a drain is
+/// running are consumed by the same drain before it releases ownership.
+/// The queued operations only receive the main-actor terminal handle, so
+/// Ghostty's non-Sendable C/UI objects never leave the main actor.
+private final class MainActorTerminalDelivery: @unchecked Sendable {
+    fileprivate typealias Operation = @MainActor @Sendable (GhosttyTerminalHandle) -> Void
+
+    private let lock = NSLock()
+    private let terminalHandle: GhosttyTerminalHandle
+    private var operations: [Operation] = []
+    private var drainScheduled = false
+
+    @MainActor
+    init(terminalHandle: GhosttyTerminalHandle) {
+        self.terminalHandle = terminalHandle
+    }
+
+    fileprivate func enqueue(_ operation: @escaping Operation) {
+        lock.lock()
+        operations.append(operation)
+        let shouldScheduleDrain = !drainScheduled
+        if shouldScheduleDrain {
+            drainScheduled = true
+        }
+        lock.unlock()
+
+        guard shouldScheduleDrain else { return }
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                self?.drain()
+            }
+        }
+    }
+
+    /// Preserve the renderer's synchronous configuration contract when the
+    /// caller is already on main. This keeps the resize/flush work which
+    /// follows `applyConfigFile` from overtaking its config update. If prior
+    /// work is queued, configuration joins that FIFO and main drains through
+    /// it before returning; a previously scheduled async drain then finds an
+    /// empty mailbox and safely does nothing.
+    fileprivate func enqueueOrDeliverImmediatelyIfIdle(_ operation: @escaping Operation) {
+        guard Thread.isMainThread else {
+            enqueue(operation)
+            return
+        }
+
+        let shouldDrainBeforeReturning: Bool
+        lock.lock()
+        if drainScheduled {
+            operations.append(operation)
+            shouldDrainBeforeReturning = true
+        } else {
+            shouldDrainBeforeReturning = false
+        }
+        lock.unlock()
+
+        MainActor.assumeIsolated {
+            if shouldDrainBeforeReturning {
+                drain()
+            } else {
+                operation(terminalHandle)
+            }
+        }
+    }
+
+    @MainActor
+    private func drain() {
+        while true {
+            let operation: Operation?
+            lock.lock()
+            if operations.isEmpty {
+                drainScheduled = false
+                operation = nil
+            } else {
+                operation = operations.removeFirst()
+            }
+            lock.unlock()
+
+            guard let operation else { return }
+            operation(terminalHandle)
+        }
+    }
+}
+
+/// Synchronizes replacement of the UI callback with background renderer
+/// updates. The wrapper is immutable after creation and its callback is only
+/// invoked from a `@MainActor` task, so crossing the wrapper itself is safe.
+private final class SelectionCallbackStorage: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: MainActorSelectionCallback?
+
+    func replace(_ callback: (@MainActor (TerminalCellRange?) -> Void)?) {
+        lock.lock()
+        self.callback = callback.map(MainActorSelectionCallback.init)
+        lock.unlock()
+    }
+
+    func snapshot() -> MainActorSelectionCallback? {
+        lock.lock()
+        defer { lock.unlock() }
+        return callback
+    }
+}
+
+/// Immutable main-actor callback token. It retains the callback scheduled by
+/// a particular selection update even if the terminal view replaces or clears
+/// its handler before that main-queue turn runs.
+private final class MainActorSelectionCallback: @unchecked Sendable {
+    private let callback: @MainActor (TerminalCellRange?) -> Void
+
+    init(_ callback: @escaping @MainActor (TerminalCellRange?) -> Void) {
+        self.callback = callback
+    }
+
+    @MainActor
+    func invoke(_ range: TerminalCellRange?) {
+        callback(range)
     }
 }
 

@@ -31,5 +31,6 @@ struct ServerPillRow: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 4)
         }
+        .accessibilityIdentifier("connected-server-pill-row")
     }
 }

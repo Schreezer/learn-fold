@@ -23,7 +23,7 @@ enum CourseWorkspaceError: LocalizedError, Equatable {
     }
 }
 
-enum CourseFileKind: String, Hashable {
+enum CourseFileKind: String, Hashable, Sendable {
     case folder
     case markdown
     case json
@@ -34,7 +34,7 @@ enum CourseFileKind: String, Hashable {
     case other
 }
 
-struct CourseFileNode: Identifiable, Hashable {
+struct CourseFileNode: Identifiable, Hashable, Sendable {
     let relativePath: String
     let name: String
     let kind: CourseFileKind
@@ -65,7 +65,7 @@ struct CourseFileNode: Identifiable, Hashable {
     }
 }
 
-struct CourseWorkspaceSnapshot: Equatable {
+struct CourseWorkspaceSnapshot: Equatable, Sendable {
     let rootURL: URL
     let nodes: [CourseFileNode]
     let fileCount: Int
