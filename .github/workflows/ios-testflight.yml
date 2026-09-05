@@ -147,6 +147,9 @@ jobs:
       - name: Build, upload, and assign to TestFlight
         run: |
           set -euo pipefail
+          # Rebuild the bundled helper on this host before the release target
+          # verifies it. Zig embeds host-specific build metadata in the binary.
+          make course-exec
           make testflight 2>&1 | tee "$RUNNER_TEMP/testflight.log"
           {
             echo '### TestFlight upload completed'
