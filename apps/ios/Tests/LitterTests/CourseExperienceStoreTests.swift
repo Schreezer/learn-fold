@@ -4,6 +4,7 @@ import NativeBlockEditorUI
 import NativeEditorMCP
 import SwiftUI
 import UIKit
+import Security
 @testable import Litter
 
 #if canImport(FoundationModels)
@@ -473,7 +474,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
         let store = CourseExperienceStore(
             defaults: defaults,
-            environment: ["SNAPPY_RESET_ONBOARDING": "1"],
+            environment: ["LEARNFOLD_HOSTED_AGENT_URL": "", "SNAPPY_RESET_ONBOARDING": "1"],
             appleRuntime: runtime
         )
 
@@ -1262,6 +1263,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         let store = CourseExperienceStore(
             defaults: defaults,
             environment: [
+                "LEARNFOLD_HOSTED_AGENT_URL": "",
                 "SNAPPY_RESET_ONBOARDING": "1",
                 "SNAPPY_APPLE_ON_DEVICE_AVAILABLE": "1",
                 "SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE": "1",
@@ -1297,6 +1299,39 @@ final class CourseExperienceStoreTests: XCTestCase {
             store.agentOptions.first(where: { $0.id == CourseAgentProvider.hosted })?.subtitle,
             "Cloud-hosted · deepseek-v4-flash · durable session"
         )
+    }
+
+    func testHostedGuestIsDefaultWithoutAnyAccessToken() throws {
+        let store = CourseExperienceStore(
+            defaults: try makeDefaults(),
+            environment: [
+                "LEARNFOLD_HOSTED_AGENT_URL": "https://hosted.example.test",
+                "LEARNFOLD_HOSTED_ACCESS_TOKEN": "",
+                "SNAPPY_APPLE_ON_DEVICE_AVAILABLE": "1",
+                "SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE": "1",
+            ]
+        )
+        XCTAssertEqual(store.preferredSetupAgentID, CourseAgentProvider.hosted)
+        XCTAssertTrue(store.hostedAvailability.available)
+        XCTAssertEqual(store.hostedAvailability.reason, "Ready to use during the beta. No login needed.")
+    }
+
+    func testHostedGuestIdentityIsStableAndScopedToService() throws {
+        let firstService = "https://\(UUID().uuidString).example.test"
+        let secondService = "https://\(UUID().uuidString).example.test"
+        defer {
+            for service in [firstService, secondService] {
+                SecItemDelete([
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: "com.chirag.learnfold.hosted-guest",
+                    kSecAttrAccount as String: service,
+                ] as CFDictionary)
+            }
+        }
+        let first = try HostedGuestIdentity.loadOrCreate(serviceURL: firstService)
+        XCTAssertEqual(first.count, 64)
+        XCTAssertEqual(first, try HostedGuestIdentity.loadOrCreate(serviceURL: firstService))
+        XCTAssertNotEqual(first, try HostedGuestIdentity.loadOrCreate(serviceURL: secondService))
     }
 
     func testHostedNewCourseSessionLocatorSurvivesRelaunch() throws {
@@ -1356,6 +1391,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         let store = CourseExperienceStore(
             defaults: defaults,
             environment: [
+                "LEARNFOLD_HOSTED_AGENT_URL": "",
                 "SNAPPY_RESET_ONBOARDING": "1",
                 "SNAPPY_APPLE_ON_DEVICE_AVAILABLE": "0",
                 "SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE": "0",
@@ -1380,6 +1416,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         let store = CourseExperienceStore(
             defaults: defaults,
             environment: [
+                "LEARNFOLD_HOSTED_AGENT_URL": "",
                 "SNAPPY_APPLE_ON_DEVICE_AVAILABLE": "0",
                 "SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE": "0",
             ]
@@ -4418,7 +4455,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             environment: [
                 "SNAPPY_RESET_ONBOARDING": "1",
                 "LEARNFOLD_HOSTED_AGENT_URL": "https://hosted.example.test",
-                "LEARNFOLD_HOSTED_ACCESS_TOKEN": "beta-access-token",
+                "LEARNFOLD_HOSTED_ACCESS_TOKEN": "",
             ]
         )
 
@@ -6156,6 +6193,77 @@ final class CourseExperienceStoreTests: XCTestCase {
             ),
             "catalog-model-id"
         )
+    }
+
+    func testUnbuiltCourseDraftCanResumeWithoutReplacingItsWorkspace() throws {
+        let defaults = try makeDefaults()
+        let coursesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumableCourseDraft-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: coursesRoot) }
+        let store = CourseExperienceStore(
+            defaults: defaults,
+            environment: [:],
+            coursesRootURL: coursesRoot
+        )
+
+        store.beginNewCourse()
+        let workspaceID = store.nativeCourseDirectory().lastPathComponent
+        XCTAssertNil(store.resumableCourseDraft)
+        XCTAssertFalse(store.requiresDraftReplacementConfirmation)
+
+        store.saveDraft("Build a course about actor isolation", for: nil)
+        store.navigationPath.removeAll()
+
+        XCTAssertEqual(
+            store.resumableCourseDraft,
+            CourseDraftResumePresentation(
+                courseTitle: nil,
+                detail: "Your unsent message is saved.",
+                isAgentWorking: false
+            )
+        )
+        XCTAssertTrue(store.requiresDraftReplacementConfirmation)
+
+        store.resumeCourseDraft()
+
+        XCTAssertEqual(store.navigationPath, [.newCourse])
+        XCTAssertEqual(store.courseChatDraft, "Build a course about actor isolation")
+        XCTAssertEqual(store.nativeCourseDirectory().lastPathComponent, workspaceID)
+    }
+
+    func testCourseDraftResumePresentationRecognizesSavedConversationState() throws {
+        let defaults = try makeDefaults()
+        let coursesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CourseDraftConversation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: coursesRoot) }
+        let store = CourseExperienceStore(
+            defaults: defaults,
+            environment: [:],
+            coursesRootURL: coursesRoot
+        )
+        store.beginNewCourse()
+
+        store.agentThreadKey = ThreadKey(
+            serverId: "course-agent",
+            threadId: UUID().uuidString.lowercased()
+        )
+        XCTAssertEqual(
+            store.resumableCourseDraft?.detail,
+            "Continue your saved conversation with the course agent."
+        )
+
+        store.brief.planID = "plan-1"
+        store.brief.title = "Swift concurrency"
+        store.showsBrief = true
+        XCTAssertEqual(store.resumableCourseDraft?.courseTitle, "Swift concurrency")
+        XCTAssertEqual(
+            store.resumableCourseDraft?.detail,
+            "Your course plan and conversation are saved."
+        )
+
+        store.generatedCourseID = "saved-course"
+        XCTAssertNil(store.resumableCourseDraft)
+        XCTAssertFalse(store.requiresDraftReplacementConfirmation)
     }
 
     func testBeginningNewCourseResetsDraftAndCreatesWorkspaceRoute() throws {
@@ -18876,4 +18984,393 @@ final class CourseChatTimelinePolicyTests: XCTestCase {
             )
         )
     }
+}
+
+@MainActor
+final class HostedCourseTranscriptTests: XCTestCase {
+    private var defaults: UserDefaults!
+    private var suite: String!
+    private var root: URL!
+    private var runtime: SuspendingHostedCourseRuntime!
+    private var apple: TestAppleCourseAgentRuntime!
+    private var store: CourseExperienceStore!
+    private var appModel: AppModel!
+
+    override func setUpWithError() throws {
+        suite = "HostedTranscriptTests-\(UUID().uuidString)"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        root = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        runtime = SuspendingHostedCourseRuntime()
+        apple = TestAppleCourseAgentRuntime()
+        store = CourseExperienceStore(
+            defaults: defaults,
+            environment: [:],
+            appleRuntime: apple,
+            hostedRuntime: runtime,
+            coursesRootURL: root
+        )
+        appModel = AppModel()
+        store.selectedAgentID = CourseAgentProvider.hosted
+        store.beginNewCourse()
+    }
+
+    override func tearDownWithError() throws {
+        runtime.finishRestore()
+        runtime.finishSend()
+        apple.releaseSuspendedRestore()
+        apple.releaseSuspendedSend()
+        defaults.removePersistentDomain(forName: suite)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testDelayedEmptyHistoryKeepsFirstMessageAndStreamingResponse() async throws {
+        let hydration = Task { await store.hydrateCourseThread(appModel: appModel, appState: AppState()) }
+        await runtime.waitForRestore()
+        XCTAssertTrue(store.sendMessage("Teach me percentages", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        let messageIDs = store.messages.map(\.id)
+        runtime.finishRestore()
+        await hydration.value
+        XCTAssertEqual(store.messages.map(\.id), messageIDs)
+        XCTAssertEqual(store.messages.first?.text, "Teach me percentages")
+        try await captureChat(named: "First message preserved while Hosted is thinking")
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.messages.last?.text, "Let's start with percentages.")
+    }
+
+    func testHostedPlaceholderStaysHiddenUntilResponseTextArrives() async throws {
+        XCTAssertTrue(store.sendMessage("Bro?", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        let responseID = try XCTUnwrap(store.messages.last?.id)
+        XCTAssertEqual(store.messages.count, 2)
+        XCTAssertEqual(store.localMessages(for: nil).map(\.text), ["Bro?"])
+        XCTAssertTrue(store.isAgentRequestPending)
+        runtime.emitPartialResponse(" \n")
+        XCTAssertEqual(store.localMessages(for: nil).map(\.text), ["Bro?"])
+        try await captureChat(named: "Hosted thinking without an empty response bubble")
+
+        runtime.emitPartialResponse("I'm here.")
+        XCTAssertEqual(store.localMessages(for: nil).map(\.text), ["Bro?", "I'm here."])
+        XCTAssertEqual(store.localMessages(for: nil).last?.id, responseID)
+        try await captureChat(named: "Hosted response appears when text arrives")
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.localMessages(for: nil).last?.id, responseID)
+        XCTAssertEqual(store.localMessages(for: nil).last?.text, "Let's start with percentages.")
+    }
+
+    func testHistoryStartedDuringSendDoesNotReplaceActiveTranscript() async throws {
+        XCTAssertTrue(store.sendMessage("Teach me percentages", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        runtime.finishRestore()
+        await store.hydrateCourseThread(appModel: appModel, appState: AppState())
+        XCTAssertEqual(runtime.restoreCount, 0)
+        XCTAssertEqual(store.messages.first?.text, "Teach me percentages")
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.messages.last?.text, "Let's start with percentages.")
+    }
+
+    func testDelayedHistoryCannotEraseAlreadyCompletedTurn() async throws {
+        let hydration = Task { await store.hydrateCourseThread(appModel: appModel, appState: AppState()) }
+        await runtime.waitForRestore()
+        XCTAssertTrue(store.sendMessage("Teach me percentages", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        runtime.finishSend()
+        try await waitForTurn()
+        runtime.finishRestore()
+        await hydration.value
+        XCTAssertEqual(store.messages.map(\.text), ["Teach me percentages", "Let's start with percentages."])
+    }
+
+    func testDelayedHistoryDoesNotPopulateReplacementCourse() async {
+        runtime.restored = [.init(role: .learner, text: "Old course question")]
+        let hydration = Task { await store.hydrateCourseThread(appModel: appModel, appState: AppState()) }
+        await runtime.waitForRestore()
+        store.beginNewCourse()
+        runtime.finishRestore()
+        await hydration.value
+        XCTAssertTrue(store.messages.isEmpty)
+    }
+
+    func testStaleHistoryFailureDoesNotMarkActiveConversationFailed() async throws {
+        runtime.restoreError = NSError(domain: "HostedRestoreTest", code: 1)
+        let hydration = Task { await store.hydrateCourseThread(appModel: appModel, appState: AppState()) }
+        await runtime.waitForRestore()
+        XCTAssertTrue(store.sendMessage("Teach me percentages", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        runtime.finishRestore()
+        await hydration.value
+        XCTAssertNil(store.agentError)
+        XCTAssertNil(store.mainAgentReadinessError)
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.messages.last?.text, "Let's start with percentages.")
+    }
+
+    func testHostedFailureAfterResponseKeepsSentMessageAndRecoversWithoutResending() async throws {
+        runtime.sendError = HostedCourseAgentRuntimeError.toolFailed("Continuation interrupted")
+        XCTAssertTrue(store.sendMessage("I code in JavaScript and Python", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.mainSubmissionRecoveryState, .acceptedReplyIncomplete)
+        XCTAssertNil(store.courseChatDraft)
+        XCTAssertEqual(store.messages.first?.text, "I code in JavaScript and Python")
+        XCTAssertTrue(store.agentError?.contains("received your message") == true)
+        XCTAssertFalse(store.agentError?.contains("couldn’t confirm") == true)
+        try await captureChat(named: "Interrupted reply preserves the sent message")
+
+        runtime.restored = [.init(role: .learner, text: "I code in JavaScript and Python"),
+                            .init(role: .agent, text: "Let's start with percentages.")]
+        runtime.finishRestore()
+        await store.checkSubmissionStatus(selectionDiscussionID: nil, appModel: appModel, appState: AppState())
+        XCTAssertNil(store.mainSubmissionRecoveryState)
+        XCTAssertNil(store.agentError)
+        XCTAssertNil(store.courseChatDraft)
+        XCTAssertEqual(store.localMessages(for: nil).count, 2)
+    }
+
+    func testHostedFailureBeforeResponseKeepsUnconfirmedDraft() async throws {
+        runtime.finalResponse = nil
+        runtime.sendError = HostedCourseAgentRuntimeError.toolFailed("Connection interrupted")
+        XCTAssertTrue(store.sendMessage("Keep this draft", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.mainSubmissionRecoveryState, .acceptanceUnknown)
+        XCTAssertEqual(store.courseChatDraft, "Keep this draft")
+    }
+
+    func testHostedQueuedResponseDeliveryFinishesInOrderBeforeFailureClassification() async {
+        var partials: [String] = []
+        let listener = HostedCourseEventListener { partials.append($0) }
+        listener.onResponseDelta(delta: "First ")
+        listener.onResponseDelta(delta: "response")
+        await listener.finishDelivery()
+        XCTAssertEqual(partials, ["First ", "First response"])
+    }
+
+    func testIdleHistoryStillRestoresConversation() async {
+        runtime.restored = [.init(role: .learner, text: "Saved question"), .init(role: .agent, text: "Saved answer")]
+        runtime.finishRestore()
+        await store.hydrateCourseThread(appModel: appModel, appState: AppState())
+        XCTAssertEqual(store.messages.map(\.text), ["Saved question", "Saved answer"])
+    }
+
+    func testHostedDiscussionHistoryPreservesNewQuestionAndUsesItsOwnDirectory() async throws {
+        let discussion = try makeDiscussion(provider: CourseAgentProvider.hosted)
+        let hydration = Task { await store.prepareSelectionDiscussionThread(id: discussion.id, appModel: appModel, appState: AppState()) }
+        await runtime.waitForRestore()
+        XCTAssertTrue(store.sendMessage("Explain this passage", selectionDiscussionID: discussion.id, appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        XCTAssertNotEqual(runtime.lastCourseDirectory, store.nativeCourseDirectory())
+        XCTAssertEqual(runtime.lastCourseDirectory, root.appendingPathComponent("focused-course", isDirectory: true))
+        runtime.finishRestore()
+        await hydration.value
+        XCTAssertEqual(store.localMessages(for: discussion.id).first?.text, "Explain this passage")
+        runtime.finishSend()
+        for _ in 0..<200 where store.isAgentRequestPending(for: discussion.id) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(store.localMessages(for: discussion.id).last?.text, "Let's start with percentages.")
+    }
+
+    func testHostedHistoryCannotRepopulateClosedDiscussion() async throws {
+        let discussion = try makeDiscussion(provider: CourseAgentProvider.hosted)
+        runtime.restored = [.init(role: .learner, text: "Old discussion")]
+        let hydration = Task { await store.prepareSelectionDiscussionThread(id: discussion.id, appModel: appModel, appState: AppState()) }
+        await runtime.waitForRestore()
+        try await store.resolveSelectionDiscussion(id: discussion.id, appModel: appModel)
+        runtime.finishRestore()
+        await hydration.value
+        XCTAssertNil(store.selectionLocalMessages[discussion.id])
+        XCTAssertNil(store.selectionDiscussionErrors[discussion.id])
+    }
+
+    func testHostedStaleDiscussionRestoreErrorDoesNotReplaceActiveResponse() async throws {
+        let discussion = try makeDiscussion(provider: CourseAgentProvider.hosted)
+        runtime.restoreError = HostedCourseAgentRuntimeError.unavailable("Old connection")
+        let hydration = Task { await store.prepareSelectionDiscussionThread(id: discussion.id, appModel: appModel, appState: AppState()) }
+        await runtime.waitForRestore()
+        store.selectionLocalMessages[discussion.id] = [.init(role: .learner, text: "New question")]
+        runtime.finishRestore()
+        await hydration.value
+        XCTAssertNil(store.selectionDiscussionErrors[discussion.id])
+        XCTAssertEqual(store.localMessages(for: discussion.id).first?.text, "New question")
+    }
+
+    func testAppleMainHistoryKeepsMessageSentWhileRestoring() async throws {
+        store.selectedAgentID = CourseAgentProvider.appleOnDevice
+        store.beginNewCourse()
+        apple.suspendsRestore = true
+        apple.suspendsSend = true
+        let hydration = Task { await store.hydrateCourseThread(appModel: appModel, appState: AppState()) }
+        try await waitForAppleRestore()
+        XCTAssertTrue(store.sendMessage("Explain actors", appModel: appModel, appState: AppState()))
+        for _ in 0..<200 where !apple.sendStarted { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(apple.sendStarted)
+        apple.releaseSuspendedRestore()
+        await hydration.value
+        XCTAssertEqual(store.messages.first?.text, "Explain actors")
+        apple.releaseSuspendedSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.messages.last?.text, "A streamed Apple response.")
+    }
+
+    func testAppleDiscussionHistoryDoesNotEraseNewLocalMessages() async throws {
+        let discussion = try makeDiscussion(provider: CourseAgentProvider.appleOnDevice)
+        apple.suspendsRestore = true
+        let hydration = Task { await store.prepareSelectionDiscussionThread(id: discussion.id, appModel: appModel, appState: AppState()) }
+        try await waitForAppleRestore()
+        store.selectionLocalMessages[discussion.id] = [.init(role: .learner, text: "New focused question")]
+        apple.releaseSuspendedRestore()
+        await hydration.value
+        XCTAssertEqual(store.localMessages(for: discussion.id).first?.text, "New focused question")
+    }
+
+    func testAppleHistoryDoesNotPopulateReplacementCourse() async throws {
+        store.selectedAgentID = CourseAgentProvider.appleOnDevice
+        store.beginNewCourse()
+        apple.suspendsRestore = true
+        apple.restored = [.init(role: .learner, text: "Old Apple question")]
+        let hydration = Task { await store.hydrateCourseThread(appModel: appModel, appState: AppState()) }
+        try await waitForAppleRestore()
+        store.beginNewCourse()
+        apple.releaseSuspendedRestore()
+        await hydration.value
+        XCTAssertTrue(store.messages.isEmpty)
+    }
+
+    private func waitForAppleRestore() async throws {
+        for _ in 0..<200 where !apple.restoreStarted { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(apple.restoreStarted)
+    }
+
+    private func makeDiscussion(provider: String) throws -> CourseSelectionDiscussion {
+        let directory = root.appendingPathComponent("focused-course", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        store.courses.append(LearningCourse(
+            id: "focused", title: "Focused course", subtitle: "", accentHex: "00FF9C",
+            progress: 0, lessonCount: 1, duration: "10 minutes", status: .ready,
+            workspaceID: "focused-course", agentRuntimeKind: provider
+        ))
+        let reference = try XCTUnwrap(CourseTextReference(
+            courseID: "focused", pageID: "lesson", pageTitle: "Lesson", selectedText: "A passage"
+        ))
+        var discussion = CourseSelectionDiscussion(reference: reference, target: .init(runtimeID: provider, serverID: nil, modelID: nil))
+        if provider == CourseAgentProvider.hosted { discussion.hostedSessionID = UUID() }
+        else { discussion.appleSessionID = UUID() }
+        store.selectionDiscussions.append(discussion)
+        return discussion
+    }
+
+    private func captureChat(named name: String) async throws {
+        let host = UIHostingController(rootView:
+            NavigationStack { CourseChatView(store: store) }
+                .environment(appModel)
+                .environment(AppState())
+        )
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = scene.coordinateSpace.bounds
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        try await Task.sleep(for: .milliseconds(500))
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func waitForTurn() async throws {
+        for _ in 0..<200 where store.isAgentRequestPending {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(store.isAgentRequestPending)
+    }
+}
+
+@MainActor
+private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
+    var restored: [HostedCourseAgentStoredMessage] = []
+    var restoreError: Error?
+    var sendError: Error?
+    var finalResponse: String? = "Let's start with percentages."
+    private(set) var restoreCount = 0
+    private(set) var lastCourseDirectory: URL?
+    private var restoreContinuation: CheckedContinuation<Void, Never>?
+    private var sendContinuation: CheckedContinuation<Void, Never>?
+    private var restoreWaiter: CheckedContinuation<Void, Never>?
+    private var sendWaiter: CheckedContinuation<Void, Never>?
+    private var restoreReleased = false
+    private var sendReleased = false
+    private var sendStarted = false
+    private var partialResponse: (@MainActor (String) -> Void)?
+
+    func availability() -> HostedCourseAgentAvailability {
+        .init(available: true, reason: "Test Hosted runtime")
+    }
+
+    func restoredMessages(sessionID: UUID) async throws -> [HostedCourseAgentStoredMessage] {
+        restoreCount += 1
+        restoreWaiter?.resume()
+        restoreWaiter = nil
+        let snapshot = restored
+        if !restoreReleased { await withCheckedContinuation { restoreContinuation = $0 } }
+        if let restoreError { throw restoreError }
+        return snapshot
+    }
+
+    func send(
+        sessionID: UUID,
+        workspaceID: String,
+        courseDirectory: URL,
+        prompt: String,
+        onPartialResponse: @escaping @MainActor (String) -> Void,
+        onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
+    ) async throws {
+        lastCourseDirectory = courseDirectory
+        partialResponse = onPartialResponse
+        defer { partialResponse = nil }
+        sendStarted = true
+        sendWaiter?.resume()
+        sendWaiter = nil
+        if !sendReleased { await withCheckedContinuation { sendContinuation = $0 } }
+        if let finalResponse { onPartialResponse(finalResponse) }
+        if let sendError { throw sendError }
+    }
+
+    func emitPartialResponse(_ text: String) {
+        partialResponse?(text)
+    }
+
+    func waitForRestore() async {
+        if restoreCount == 0 { await withCheckedContinuation { restoreWaiter = $0 } }
+    }
+
+    func waitForSend() async {
+        if !sendStarted { await withCheckedContinuation { sendWaiter = $0 } }
+    }
+
+    func finishRestore() {
+        restoreReleased = true
+        restoreContinuation?.resume()
+        restoreContinuation = nil
+    }
+
+    func finishSend() {
+        sendReleased = true
+        sendContinuation?.resume()
+        sendContinuation = nil
+    }
+
+    func cancel(sessionID: UUID) { finishSend() }
 }

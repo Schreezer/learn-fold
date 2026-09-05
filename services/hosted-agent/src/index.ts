@@ -7,6 +7,8 @@ import { generateText } from "ai"
 import { isAuthorized, unauthorized } from "./auth"
 import { COURSE_AGENT_PROMPT } from "./course-prompt"
 import { createHostedModel, DEFAULT_MODEL } from "./provider"
+import { authorizeGuestRoute, enforceGuestTurnLimit, guestSession } from "./guest"
+export { GuestUsage } from "./guest"
 
 const MAX_WORKSPACE_ID_LENGTH = 128
 
@@ -87,11 +89,23 @@ export class HostedCourseAgent extends Think<HostedEnv> {
       .withCachedPrompt()
   }
 
-  override beforeTurn(context: TurnContext): TurnConfig {
-    const workspaceID = workspaceIDFrom(context)
-    if (!workspaceID) {
-      throw new Error("A valid Learnfold workspaceId is required for every hosted turn.")
-    }
+  override async beforeTurn(context: TurnContext): Promise<TurnConfig> {
+    // Think's tool auto-continuations have no request body. Keep the course
+    // binding in durable storage so they also survive object restarts.
+    const workspaceID = await this.ctx.storage.transaction(async (storage) => {
+      const saved = await storage.get<string>("learnfold.workspaceId")
+      const supplied = workspaceIDFrom(context)
+      const resolved = context.continuation && context.body === undefined ? saved : supplied
+      if (!resolved) {
+        throw new Error("A valid Learnfold workspaceId is required for every hosted turn.")
+      }
+      if (saved && saved !== resolved) {
+        throw new Error("This Hosted conversation belongs to a different course workspace.")
+      }
+      if (!saved) await storage.put("learnfold.workspaceId", resolved)
+      return resolved
+    })
+    await enforceGuestTurnLimit(this.name, this.env)
     const clientToolNames = Object.keys(context.tools).filter((name) =>
       name === "present_course_plan" || name.startsWith("native-editor-"),
     )
@@ -113,7 +127,8 @@ export class HostedCourseAgent extends Think<HostedEnv> {
     return {
       instructions: `${context.system}\n\nCurrent Learnfold workspace_id: ${workspaceID}${approvalInstructions}`,
       activeTools,
-      maxSteps: 24,
+      maxSteps: this.name.startsWith("guest-") ? 12 : 24,
+      maxOutputTokens: this.name.startsWith("guest-") ? 8192 : undefined,
       sendReasoning: false,
     }
   }
@@ -133,6 +148,9 @@ function json(value: unknown, status = 200): Response {
 export default {
   async fetch(request: Request, env: HostedEnv): Promise<Response> {
     const url = new URL(request.url)
+    if (url.pathname === "/guest-session" && request.method === "POST") {
+      return guestSession(request, env, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)
+    }
     if (url.pathname === "/health" && request.method === "GET") {
       if (!await isAuthorized(request, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)) return unauthorized()
       return json({
@@ -144,7 +162,12 @@ export default {
       })
     }
 
-    if (!await isAuthorized(request, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)) return unauthorized()
+    if (!await isAuthorized(request, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)) {
+      if (env.GUEST_BETA_ENABLED !== "true") return unauthorized()
+      const guestRequest = await authorizeGuestRoute(request, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)
+      if (!guestRequest) return unauthorized()
+      return (await routeAgentRequest(guestRequest, env)) ?? json({ error: "not_found" }, 404)
+    }
     return (await routeAgentRequest(request, env)) ?? json({ error: "not_found" }, 404)
   },
 } satisfies ExportedHandler<HostedEnv>

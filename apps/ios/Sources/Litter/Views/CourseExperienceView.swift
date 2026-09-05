@@ -750,9 +750,11 @@ struct CourseRouteFallbackStrictCheckpointRoot: View {
             CourseLibraryContent(
                 courses: [Self.course],
                 selectedAgentID: "codex",
+                resumableDraft: nil,
                 onOpenAppSettings: {},
                 onOpenAgentSettings: {},
                 onOpenCourse: { _ in },
+                onResumeDraft: {},
                 onNewCourse: {}
             )
             .navigationBarHidden(true)
@@ -887,7 +889,7 @@ private struct CourseAgentSetupConnectionControls: View {
                     Text(
                         connectionState == .connecting
                             ? "Connecting…"
-                            : "Connect \(agentID.displayLabel)"
+                            : agentID == CourseAgentProvider.hosted ? "Continue" : "Connect \(agentID.displayLabel)"
                     )
                 }
                 .font(.headline)
@@ -901,7 +903,9 @@ private struct CourseAgentSetupConnectionControls: View {
             .disabled(connectionState == .connecting || !isAgentAvailable)
 
             Label {
-                Text("Hosted is the default during the beta, so you can start learning without configuring an agent. Apple and Codex remain available when you want them.")
+                Text(agentID == CourseAgentProvider.hosted
+                    ? "No login needed during the beta. Your prompts are processed in the cloud. Daily usage limits apply."
+                    : "You can change your course agent later in Course Settings.")
                     .accessibilityIdentifier("course-agent-connection-lifecycle")
                     .accessibilityValue(statusValue)
             } icon: {
@@ -939,6 +943,14 @@ private struct CourseAgentSetupPickerContent: View {
     let onSelectAgent: (String) -> Void
     let onAddServer: () -> Void
     let onOpenCustomProvider: () -> Void
+    @State private var showsAgentChoices = false
+
+    private var usesHostedDefault: Bool {
+        selectedAgentID == CourseAgentProvider.hosted
+            && agentOptions.contains { $0.id == CourseAgentProvider.hosted && $0.available }
+    }
+
+    private var showsAllAgents: Bool { showsAgentChoices || !usesHostedDefault }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
@@ -958,13 +970,15 @@ private struct CourseAgentSetupPickerContent: View {
                         .foregroundStyle(.white)
                 }
 
-                Text("Choose your course agent")
+                Text(usesHostedDefault && !showsAgentChoices ? "Ready to start learning" : "Choose your course agent")
                     .font(.system(size: 38, weight: .bold, design: .rounded))
                     .tracking(-1.1)
                     .accessibilityIdentifier("course-agent-setup-picker")
                     .accessibilityValue(availabilityValue)
 
-                Text("Hosted is ready by default during the beta. You can also choose Apple On‑Device, Apple Private Cloud Compute, Codex, or your own provider.")
+                Text(usesHostedDefault && !showsAgentChoices
+                    ? "Your Hosted course agent is ready. Start with a topic, a question, or a link."
+                    : "Choose the agent you'd like to use for your courses. You can change it later.")
                     .font(.system(size: 18))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -986,36 +1000,44 @@ private struct CourseAgentSetupPickerContent: View {
                 }
             }
 
-            Button(action: onAddServer) {
-                HStack(spacing: 14) {
-                    Image(systemName: "server.rack")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(.indigo)
-                        .frame(width: 42, height: 42)
-                        .background(.indigo.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Connect Hermes on a server")
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                        Text("Pair with Learnfold Link. Connecting authorizes Hermes to use phone-side tools confined to this course. The shell is read-only until plan approval, read-write afterward, and has no outbound network access.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.leading)
-                    }
-                    Spacer(minLength: 0)
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(16)
-                .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.black.opacity(0.07))
-                }
+            if !showsAllAgents {
+                Button("Change agent") { showsAgentChoices = true }
+                    .font(.subheadline.weight(.semibold))
+                    .accessibilityIdentifier("course-agent-change")
             }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("course-agent-add-server")
+
+            if showsAllAgents {
+                Button(action: onAddServer) {
+                    HStack(spacing: 14) {
+                        Image(systemName: "server.rack")
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(.indigo)
+                            .frame(width: 42, height: 42)
+                            .background(.indigo.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Connect Hermes on a server")
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+                            Text("Pair with Learnfold Link. Connecting authorizes Hermes to use phone-side tools confined to this course. The shell is read-only until plan approval, read-write afterward, and has no outbound network access.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.leading)
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(16)
+                    .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .stroke(Color.black.opacity(0.07))
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("course-agent-add-server")
+            }
 
             if selectedAgentID == CourseAgentProvider.codex {
                 CourseAgentCustomProviderButton(
@@ -1028,7 +1050,10 @@ private struct CourseAgentSetupPickerContent: View {
     }
 
     private var visibleAgentOptions: [CourseAgentOption] {
-        showsUnavailableOptions
+        if !showsAllAgents {
+            return agentOptions.filter { $0.id == CourseAgentProvider.hosted }
+        }
+        return showsUnavailableOptions
             ? agentOptions
             : agentOptions.filter(\.available)
     }
@@ -1162,17 +1187,6 @@ private struct CourseAgentSetupView: View {
             if !hasExplicitUserSelection {
                 selectedAgent = resolution.agentID
             }
-            if resolution.isAutomatic,
-               !hasExplicitUserSelection,
-               selectedAgent == CourseAgentProvider.hosted,
-               store.agentOptions.first(where: { $0.id == CourseAgentProvider.hosted })?.available == true {
-                _ = await store.connectLocalAgent(
-                    appModel: appModel,
-                    agentID: CourseAgentProvider.hosted,
-                    modelID: SystemHostedCourseAgentRuntime.modelID
-                )
-                return
-            }
             let automaticAgentIDBeforeRefresh =
                 resolution.isAutomatic && !hasExplicitUserSelection
                     ? selectedAgent
@@ -1218,17 +1232,20 @@ private struct CourseHomeView: View {
     var onConnectRemoteAgent: () -> Void
     @State private var showsCourseSettings = false
     @State private var showsAppSettings = false
+    @State private var showsDraftReplacementConfirmation = false
 
     var body: some View {
         CourseLibraryContent(
             courses: store.courses,
             selectedAgentID: store.selectedAgentID ?? "codex",
+            resumableDraft: store.resumableCourseDraft,
             onOpenAppSettings: { showsAppSettings = true },
             onOpenAgentSettings: { showsCourseSettings = true },
             onOpenCourse: { courseID in
                 store.navigationPath.append(.course(courseID))
             },
-            onNewCourse: { store.beginNewCourse() }
+            onResumeDraft: { store.resumeCourseDraft() },
+            onNewCourse: requestNewCourse
         )
         .navigationBarHidden(true)
         .sheet(isPresented: $showsCourseSettings) {
@@ -1243,15 +1260,41 @@ private struct CourseHomeView: View {
                 .environment(appModel)
                 .environment(appState)
         }
+        .alert(
+            "Start a new course?",
+            isPresented: $showsDraftReplacementConfirmation
+        ) {
+            Button("Continue Draft") {
+                store.resumeCourseDraft()
+            }
+            Button("Discard Draft and Start New", role: .destructive) {
+                store.beginNewCourse()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "You already have an unfinished course conversation. Starting a new course will remove that workspace and anything saved in it."
+            )
+        }
+    }
+
+    private func requestNewCourse() {
+        if store.requiresDraftReplacementConfirmation {
+            showsDraftReplacementConfirmation = true
+        } else {
+            store.beginNewCourse()
+        }
     }
 }
 
 private struct CourseLibraryContent: View {
     let courses: [LearningCourse]
     let selectedAgentID: String
+    let resumableDraft: CourseDraftResumePresentation?
     let onOpenAppSettings: () -> Void
     let onOpenAgentSettings: () -> Void
     let onOpenCourse: (String) -> Void
+    let onResumeDraft: () -> Void
     let onNewCourse: () -> Void
 
     private let columns = [
@@ -1299,6 +1342,13 @@ private struct CourseLibraryContent: View {
                     }
                     .zIndex(10)
 
+                    if let resumableDraft {
+                        CourseDraftResumeCard(
+                            presentation: resumableDraft,
+                            onResume: onResumeDraft
+                        )
+                    }
+
                     if let featured = courses.first {
                         CourseFeaturedCard(course: featured) {
                             onOpenCourse(featured.id)
@@ -1345,6 +1395,62 @@ private struct CourseLibraryContent: View {
             .padding(.bottom, 22)
             .accessibilityIdentifier("new-course-button")
         }
+    }
+}
+
+private struct CourseDraftResumeCard: View {
+    let presentation: CourseDraftResumePresentation
+    let onResume: () -> Void
+
+    var body: some View {
+        Button(action: onResume) {
+            HStack(spacing: 16) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(.blue.opacity(0.12))
+                    Image(
+                        systemName: presentation.isAgentWorking
+                            ? "ellipsis.message.fill"
+                            : "bubble.left.and.text.bubble.right.fill"
+                    )
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.blue)
+                }
+                .frame(width: 54, height: 54)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Continue course draft")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    if let courseTitle = presentation.courseTitle {
+                        Text(courseTitle)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                    }
+                    Text(presentation.detail)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "chevron.right")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.background, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(.blue.opacity(0.18))
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("continue-course-draft-button")
+        .accessibilityValue(presentation.isAgentWorking ? "agent-working" : "saved")
     }
 }
 
@@ -4272,9 +4378,11 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
             CourseLibraryContent(
                 courses: [],
                 selectedAgentID: "codex",
+                resumableDraft: nil,
                 onOpenAppSettings: recordMemoryOnlyAction,
                 onOpenAgentSettings: recordMemoryOnlyAction,
                 onOpenCourse: { _ in recordMemoryOnlyAction() },
+                onResumeDraft: recordMemoryOnlyAction,
                 onNewCourse: recordMemoryOnlyAction
             )
             .navigationBarHidden(true)

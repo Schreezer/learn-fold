@@ -313,7 +313,7 @@ dependencies = [
 [[package]]
 name = "alleycat-bridge-core"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#4768825ef274b00fdc9454cec5e4e364fcbf1f99"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#81f5d5e1c869a5e61ba8cc0b5a7cba7ca8e2e1d7"
 dependencies = [
  "alleycat-codex-proto",
  "anyhow",
@@ -331,7 +331,7 @@ dependencies = [
 [[package]]
 name = "alleycat-claude-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#4768825ef274b00fdc9454cec5e4e364fcbf1f99"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#81f5d5e1c869a5e61ba8cc0b5a7cba7ca8e2e1d7"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",
@@ -353,7 +353,7 @@ dependencies = [
 [[package]]
 name = "alleycat-codex-proto"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#4768825ef274b00fdc9454cec5e4e364fcbf1f99"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#81f5d5e1c869a5e61ba8cc0b5a7cba7ca8e2e1d7"
 dependencies = [
  "serde",
  "serde_json",
@@ -362,7 +362,7 @@ dependencies = [
 [[package]]
 name = "alleycat-opencode-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#4768825ef274b00fdc9454cec5e4e364fcbf1f99"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#81f5d5e1c869a5e61ba8cc0b5a7cba7ca8e2e1d7"
 dependencies = [
  "alleycat-bridge-core",
  "anyhow",
@@ -386,7 +386,7 @@ dependencies = [
 [[package]]
 name = "alleycat-pi-bridge"
 version = "0.1.0"
-source = "git+https://github.com/dnakov/alleycat.git?branch=main#4768825ef274b00fdc9454cec5e4e364fcbf1f99"
+source = "git+https://github.com/dnakov/alleycat.git?branch=main#81f5d5e1c869a5e61ba8cc0b5a7cba7ca8e2e1d7"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-codex-proto",

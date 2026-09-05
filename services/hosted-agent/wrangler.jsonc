@@ -5,6 +5,7 @@
   "compatibility_date": "2026-07-29",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  "vars": { "GUEST_BETA_ENABLED": "true" },
   "observability": {
     "enabled": true
   },
@@ -13,13 +14,15 @@
       {
         "name": "HostedCourseAgent",
         "class_name": "HostedCourseAgent"
-      }
+      },
+      { "name": "GuestUsage", "class_name": "GuestUsage" }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["HostedCourseAgent"]
-    }
+    },
+    { "tag": "v2", "new_sqlite_classes": ["GuestUsage"] }
   ]
 }

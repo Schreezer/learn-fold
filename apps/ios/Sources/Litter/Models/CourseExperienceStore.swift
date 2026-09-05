@@ -18,6 +18,12 @@ enum CourseRoute: Hashable {
     case coursePage(courseID: String, pageID: String)
 }
 
+struct CourseDraftResumePresentation: Equatable {
+    let courseTitle: String?
+    let detail: String
+    let isAgentWorking: Bool
+}
+
 struct LearningCourse: Identifiable, Codable, Equatable {
     enum Status: String, Codable {
         case inProgress
@@ -336,7 +342,7 @@ enum CourseAgentTranscriptVisibility: Equatable {
     case internalInstruction
 }
 
-struct CourseChatMessage: Identifiable {
+struct CourseChatMessage: Identifiable, Equatable {
     enum Role {
         case learner
         case agent
@@ -458,7 +464,12 @@ enum CourseChatTranscriptPolicy {
             case .agent where hidesFollowingInternalResponse:
                 hidesFollowingInternalResponse = false
             case .agent:
-                visible.append(message)
+                // Keep the streaming placeholder in state, but show its bubble
+                // only once it contains something the learner can read.
+                if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !message.sources.isEmpty {
+                    visible.append(message)
+                }
             }
         }
         return visible
@@ -2787,6 +2798,53 @@ final class CourseExperienceStore {
         chatRuns.hasActiveRun
     }
 
+    var resumableCourseDraft: CourseDraftResumePresentation? {
+        guard generatedCourseID == nil, !currentWorkspaceWasBuilt else { return nil }
+
+        let normalizedDraft = courseChatDraft?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let hasTypedDraft = normalizedDraft?.isEmpty == false
+        let hasConversation = !messages.isEmpty || agentThreadKey != nil
+        let hasPlan = showsBrief || !brief.planID.isEmpty || !brief.title.isEmpty
+        let hasPendingSubmission = pendingMainSubmission != nil
+            || mainSubmissionRecoveryState != nil
+        let isWorking = isAgentRequestPending(for: nil)
+        guard hasTypedDraft
+                || !sources.isEmpty
+                || hasConversation
+                || hasPlan
+                || hasPendingSubmission
+                || isWorking else {
+            return nil
+        }
+
+        let normalizedTitle = brief.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail: String
+        if isWorking {
+            detail = "The course agent is still working. Open the draft to see its progress."
+        } else if mainSubmissionRecoveryState != nil {
+            detail = "Your conversation needs attention before you send another message."
+        } else if hasPlan {
+            detail = "Your course plan and conversation are saved."
+        } else if hasTypedDraft {
+            detail = "Your unsent message is saved."
+        } else if !sources.isEmpty {
+            detail = "Your attached source is saved."
+        } else {
+            detail = "Continue your saved conversation with the course agent."
+        }
+        return CourseDraftResumePresentation(
+            courseTitle: normalizedTitle.isEmpty ? nil : normalizedTitle,
+            detail: detail,
+            isAgentWorking: isWorking
+        )
+    }
+
+    var requiresDraftReplacementConfirmation: Bool {
+        resumableCourseDraft != nil
+    }
+
     func agentRunPhase(for selectionDiscussionID: UUID?) -> CourseChatRunPhase {
         chatRuns.phase(for: CourseChatScope(selectionDiscussionID: selectionDiscussionID))
     }
@@ -3817,6 +3875,11 @@ final class CourseExperienceStore {
         prepareCourseWorkspace()
         persistCurrentHostedSession()
         persistDraftSources()
+    }
+
+    func resumeCourseDraft() {
+        guard resumableCourseDraft != nil else { return }
+        navigationPath = [.newCourse]
     }
 
     func hasPendingHermesRecovery(selectionDiscussionID: UUID? = nil) -> Bool {
@@ -6036,6 +6099,7 @@ final class CourseExperienceStore {
             }
         }
         if persistedDiscussionKey == nil, runtimeID == CourseAgentProvider.hosted {
+            guard !chatRuns.phase(for: .selection(discussionID)).isWorking else { return }
             let sessionID: UUID
             if let persisted = discussion.hostedSessionID {
                 sessionID = persisted
@@ -6046,11 +6110,22 @@ final class CourseExperienceStore {
                     persistSelectionDiscussions()
                 }
             }
+            let binding = selectionDiscussion(id: discussionID)
+            let transcript = selectionLocalMessages[discussionID] ?? []
+            func canApplyRestoration() -> Bool {
+                !Task.isCancelled
+                    && selectionDiscussion(id: discussionID) == binding
+                    && self.course(withID: discussion.courseID)?.workspaceID == workspaceID
+                    && !chatRuns.phase(for: .selection(discussionID)).isWorking
+                    && (selectionLocalMessages[discussionID] ?? []) == transcript
+            }
             do {
                 let restored = try await hostedRuntime.restoredMessages(sessionID: sessionID)
+                guard canApplyRestoration() else { return }
                 selectionLocalMessages[discussionID] = restored.map(Self.localMessage(from:))
                 selectionConnectionStates[discussionID] = .connected
             } catch {
+                guard canApplyRestoration() else { return }
                 let message = "The Hosted discussion couldn’t be restored: \(error.localizedDescription)"
                 selectionDiscussionErrors[discussionID] = message
                 selectionConnectionStates[discussionID] = .failed(message)
@@ -6058,6 +6133,7 @@ final class CourseExperienceStore {
             return
         }
         if persistedDiscussionKey == nil, CourseAgentProvider.isApple(runtimeID) {
+            guard !chatRuns.phase(for: .selection(discussionID)).isWorking else { return }
             let sessionID: UUID
             if let persisted = discussion.appleSessionID {
                 sessionID = persisted
@@ -6068,10 +6144,17 @@ final class CourseExperienceStore {
                     persistSelectionDiscussions()
                 }
             }
+            let binding = selectionDiscussion(id: discussionID)
+            let transcript = selectionLocalMessages[discussionID] ?? []
             let restored = await appleRuntime.restoredMessages(
                 sessionID: sessionID,
                 workspaceID: workspaceID
             )
+            guard !Task.isCancelled,
+                  selectionDiscussion(id: discussionID) == binding,
+                  self.course(withID: discussion.courseID)?.workspaceID == workspaceID,
+                  !chatRuns.phase(for: .selection(discussionID)).isWorking,
+                  (selectionLocalMessages[discussionID] ?? []) == transcript else { return }
             selectionLocalMessages[discussionID] = Self.localMessages(from: restored)
             selectionConnectionStates[discussionID] = .connected
             return
@@ -6608,6 +6691,9 @@ final class CourseExperienceStore {
         preservesLearnerDraft: Bool = true
     ) -> String {
         if turnWasAccepted {
+            if agentName == CourseAgentProvider.hosted.displayLabel {
+                return "Hosted received your message, but its reply was interrupted. Reload the conversation to recover the latest response."
+            }
             return "\(agentName) started this request, but the reply did not finish loading. Reopen the chat to check the thread."
         }
         if dispatchMayHaveOccurred {
@@ -7087,18 +7173,32 @@ final class CourseExperienceStore {
 
     func hydrateCourseThread(appModel: AppModel, appState: AppState) async {
         if activeAgentID == CourseAgentProvider.hosted {
+            guard !chatRuns.phase(for: .main).isWorking else { return }
             if currentHostedSessionID == nil {
                 currentHostedSessionID = UUID()
                 persistCurrentHostedSession()
                 persistDraftSources()
             }
             guard let sessionID = currentHostedSessionID else { return }
+            let identity = mainCourseAgentReadinessIdentity()
+            let transcript = messages
+            // Loading history yields while the learner can send or switch courses.
+            // Only replace the UI transcript if it is still the one we loaded for.
+            func canApplyRestoration() -> Bool {
+                !Task.isCancelled
+                    && isCurrentMainAgentReadinessIdentity(identity)
+                    && currentHostedSessionID == sessionID
+                    && !chatRuns.phase(for: .main).isWorking
+                    && messages == transcript
+            }
             do {
                 let restored = try await hostedRuntime.restoredMessages(sessionID: sessionID)
+                guard canApplyRestoration() else { return }
                 messages = restored.map(Self.localMessage(from:))
                 connectionState = .connected
                 clearMainReadinessError()
             } catch {
+                guard canApplyRestoration() else { return }
                 let message = "The Hosted conversation couldn’t be restored: \(error.localizedDescription)"
                 connectionState = .failed(message)
                 recordMainReadinessError(message)
@@ -7106,16 +7206,24 @@ final class CourseExperienceStore {
             return
         }
         if CourseAgentProvider.isApple(activeAgentID) {
+            guard !chatRuns.phase(for: .main).isWorking else { return }
             if currentAppleSessionID == nil {
                 currentAppleSessionID = UUID()
                 persistCurrentAppleSession()
                 persistDraftSources()
             }
             if let sessionID = currentAppleSessionID {
+                let identity = mainCourseAgentReadinessIdentity()
+                let transcript = messages
                 let restored = await appleRuntime.restoredMessages(
                     sessionID: sessionID,
                     workspaceID: currentCourseWorkspaceID
                 )
+                guard !Task.isCancelled,
+                      isCurrentMainAgentReadinessIdentity(identity),
+                      currentAppleSessionID == sessionID,
+                      !chatRuns.phase(for: .main).isWorking,
+                      messages == transcript else { return }
                 messages = Self.localMessages(from: restored)
             }
             return
@@ -8795,6 +8903,17 @@ final class CourseExperienceStore {
                     workspaceID: workspaceID,
                     sessionID: sessionID,
                     transcriptVisibility: transcriptVisibility,
+                    onAccepted: {
+                        guard !turnWasAccepted else { return }
+                        turnWasAccepted = true
+                        if isLearnerSubmission {
+                            self.setSubmissionRecoveryState(
+                                .acceptedReplyIncomplete,
+                                for: selectionDiscussionID,
+                                matching: attempt.id
+                            )
+                        }
+                    },
                     selectionContextID: selectionContextID,
                     selectionDiscussionID: selectionDiscussionID
                 )
@@ -9461,6 +9580,7 @@ final class CourseExperienceStore {
         workspaceID: String,
         sessionID: UUID,
         transcriptVisibility: CourseAgentTranscriptVisibility,
+        onAccepted: @escaping @MainActor () -> Void,
         selectionContextID: UUID?,
         selectionDiscussionID: UUID?
     ) async throws {
@@ -9479,9 +9599,10 @@ final class CourseExperienceStore {
             try await hostedRuntime.send(
                 sessionID: sessionID,
                 workspaceID: workspaceID,
-                courseDirectory: nativeCourseDirectory(),
+                courseDirectory: coursesRootURL.appendingPathComponent(workspaceID, isDirectory: true),
                 prompt: text,
                 onPartialResponse: { [weak self] partial in
+                    if !partial.isEmpty { onAccepted() }
                     self?.updateLocalAgentMessage(
                         id: responseMessage.id,
                         text: partial,
@@ -9489,6 +9610,7 @@ final class CourseExperienceStore {
                     )
                 },
                 onCoursePlan: { [weak self] plan in
+                    onAccepted()
                     guard let self else {
                         throw HostedCourseAgentRuntimeError.toolFailed(
                             "The course screen closed before the plan could be presented."

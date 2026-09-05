@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 struct HostedCourseAgentAvailability: Equatable {
     let available: Bool
@@ -61,18 +62,14 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         guard baseURL != nil else {
             return .init(
                 available: false,
-                reason: "Set LEARNFOLD_HOSTED_AGENT_URL to the deployed Worker URL."
-            )
-        }
-        guard accessToken != nil else {
-            return .init(
-                available: false,
-                reason: "Sign in to receive a Hosted access token."
+                reason: "Hosted isn't available in this build. Choose another agent."
             )
         }
         return .init(
             available: true,
-            reason: "Cloud-hosted · \(Self.modelID) · durable session"
+            reason: accessToken == nil
+                ? "Ready to use during the beta. No login needed."
+                : "Cloud-hosted · \(Self.modelID) · durable session"
         )
     }
 
@@ -128,7 +125,15 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
             activeTasks[sessionID] = nil
             activeClients[sessionID] = nil
         }
-        _ = try await task.value
+        do {
+            _ = try await task.value
+            await listener.finishDelivery()
+        } catch {
+            // Deliver received text before the caller decides whether the
+            // request was accepted. The stream can fail right after a delta.
+            await listener.finishDelivery()
+            throw error
+        }
     }
 
     func cancel(sessionID: UUID) {
@@ -141,10 +146,16 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
     }
 
     private func client() throws -> HostedAgentClient {
-        guard let baseURL, let accessToken else {
+        guard let baseURL else {
             throw HostedCourseAgentRuntimeError.unavailable(availability().reason)
         }
-        return try HostedAgentClient(baseUrl: baseURL, accessToken: accessToken)
+        if let accessToken {
+            return try HostedAgentClient(baseUrl: baseURL, accessToken: accessToken)
+        }
+        return try HostedAgentClient.guest(
+            baseUrl: baseURL,
+            guestSecret: HostedGuestIdentity.loadOrCreate(serviceURL: baseURL)
+        )
     }
 
     private static func configurationValue(
@@ -153,12 +164,51 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         environment: [String: String],
         bundle: Bundle
     ) -> String? {
-        if let value = environment[environmentKey]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-            return value
+        if let value = environment[environmentKey] {
+            return value.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         }
         return (bundle.object(forInfoDictionaryKey: bundleKey) as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+}
+
+/// Platform persistence only. Token minting and authentication stay in Rust.
+enum HostedGuestIdentity {
+    static func loadOrCreate(serviceURL: String) throws -> String {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.chirag.learnfold.hosted-guest",
+            kSecAttrAccount as String: serviceURL,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query.merging([
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]) { _, new in new } as CFDictionary, &item)
+        if status == errSecSuccess, let data = item as? Data,
+           let secret = String(data: data, encoding: .utf8), secret.count == 64 {
+            return secret
+        }
+        guard status == errSecItemNotFound else {
+            throw keychainError(status == errSecSuccess ? errSecDecode : status)
+        }
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let randomStatus = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard randomStatus == errSecSuccess else { throw keychainError(randomStatus) }
+        let secret = bytes.map { String(format: "%02x", $0) }.joined()
+        let saved = SecItemAdd(query.merging([
+            kSecValueData as String: Data(secret.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]) { _, new in new } as CFDictionary, nil)
+        if saved == errSecDuplicateItem { return try loadOrCreate(serviceURL: serviceURL) }
+        guard saved == errSecSuccess else { throw keychainError(saved) }
+        return secret
+    }
+
+    private static func keychainError(_ status: OSStatus) -> NSError {
+        NSError(domain: NSOSStatusErrorDomain, code: Int(status), userInfo: [
+            NSLocalizedDescriptionKey: "Couldn't access your Hosted guest identity. Please unlock your device and try again.",
+        ])
     }
 }
 
@@ -175,9 +225,10 @@ enum HostedCourseAgentRuntimeError: LocalizedError {
     }
 }
 
-private final class HostedCourseEventListener: HostedAgentEventListener, @unchecked Sendable {
+final class HostedCourseEventListener: HostedAgentEventListener, @unchecked Sendable {
     private let lock = NSLock()
     private var response = ""
+    private var pendingDelivery: Task<Void, Never>?
     private let onPartialResponse: @MainActor (String) -> Void
 
     init(onPartialResponse: @escaping @MainActor (String) -> Void) {
@@ -188,10 +239,22 @@ private final class HostedCourseEventListener: HostedAgentEventListener, @unchec
         lock.lock()
         response += delta
         let partial = response
-        lock.unlock()
-        Task { @MainActor [onPartialResponse] in
+        let previous = pendingDelivery
+        pendingDelivery = Task { @MainActor [onPartialResponse] in
+            await previous?.value
             onPartialResponse(partial)
         }
+        lock.unlock()
+    }
+
+    func finishDelivery() async {
+        await latestDelivery()?.value
+    }
+
+    private func latestDelivery() -> Task<Void, Never>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingDelivery
     }
 
     func onRecoveringChanged(recovering: Bool) {}

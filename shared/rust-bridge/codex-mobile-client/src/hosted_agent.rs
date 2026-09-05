@@ -89,6 +89,7 @@ pub trait HostedAgentEventListener: Send + Sync {
 pub struct HostedAgentClient {
     base_url: Url,
     access_token: String,
+    guest_secret: Option<String>,
     active_cancellations: Arc<Mutex<HashMap<String, ActiveCancellation>>>,
 }
 
@@ -130,6 +131,39 @@ impl HostedAgentClient {
         Ok(Self {
             base_url,
             access_token,
+            guest_secret: None,
+            active_cancellations: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// The platform persists this installation's random secret in its secure
+    /// credential store. Rust owns the guest token exchange and wire protocol.
+    #[uniffi::constructor]
+    pub fn guest(base_url: String, guest_secret: String) -> Result<Self, HostedAgentError> {
+        let base_url = validated_base_url(&base_url)?;
+        if !matches!(base_url.scheme(), "https" | "wss")
+            && !matches!(
+                base_url.host_str(),
+                Some("localhost" | "127.0.0.1" | "[::1]")
+            )
+        {
+            return Err(HostedAgentError::InvalidConfiguration {
+                detail: "guest access requires HTTPS except on localhost".into(),
+            });
+        }
+        if guest_secret.len() != 64
+            || !guest_secret
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(HostedAgentError::InvalidConfiguration {
+                detail: "guest identity must be a 256-bit hexadecimal secret".into(),
+            });
+        }
+        Ok(Self {
+            base_url,
+            access_token: String::new(),
+            guest_secret: Some(guest_secret),
             active_cancellations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -218,12 +252,12 @@ impl HostedAgentClient {
         let listener: Arc<dyn HostedAgentEventListener> = Arc::from(listener);
         let mut response_text = String::new();
         let mut handled_tool_calls = HashSet::new();
-        let mut tool_continuation_pending = false;
-        let mut saw_tool_call = false;
+        let mut stream = HostedStreamState::new(request_id);
 
         loop {
             let frame =
-                next_json_or_cancel(&mut socket, &mut cancellation.receiver, &request_id).await?;
+                next_json_or_cancel(&mut socket, &mut cancellation.receiver, &stream.request_id)
+                    .await?;
             match frame.get("type").and_then(Value::as_str) {
                 Some("cf_agent_stream_resuming") => {
                     if let Some(id) = frame.get("id").and_then(Value::as_str) {
@@ -246,15 +280,8 @@ impl HostedAgentClient {
                     );
                 }
                 Some("cf_agent_use_chat_response") => {
-                    let continuation = frame
-                        .get("continuation")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if continuation
-                        && tool_continuation_pending
-                        && frame.get("done").and_then(Value::as_bool) != Some(true)
-                    {
-                        tool_continuation_pending = false;
+                    if !stream.accept_frame(&frame) {
+                        continue;
                     }
                     if frame.get("error").and_then(Value::as_bool) == Some(true) {
                         let detail = frame
@@ -268,7 +295,7 @@ impl HostedAgentClient {
                     }
 
                     if frame.get("done").and_then(Value::as_bool) == Some(true) {
-                        if !tool_continuation_pending && (!saw_tool_call || continuation) {
+                        if !stream.awaiting_continuation {
                             break;
                         }
                         continue;
@@ -283,6 +310,9 @@ impl HostedAgentClient {
                         continue;
                     };
 
+                    if let Some(error) = stream_chunk_error(&chunk) {
+                        return Err(error);
+                    }
                     if chunk.get("type").and_then(Value::as_str) == Some("text-delta") {
                         if let Some(delta) = chunk.get("delta").and_then(Value::as_str) {
                             response_text.push_str(delta);
@@ -294,7 +324,6 @@ impl HostedAgentClient {
                         if !handled_tool_calls.insert(tool_call_id.to_string()) {
                             continue;
                         }
-                        saw_tool_call = true;
                         let result = tool_handler.execute_hosted_tool(HostedAgentToolInvocation {
                             session_id: session_id.clone(),
                             tool_call_id: tool_call_id.to_string(),
@@ -322,7 +351,7 @@ impl HostedAgentClient {
                             }),
                         )
                         .await?;
-                        tool_continuation_pending = true;
+                        stream.awaiting_continuation = true;
                     }
                 }
                 _ => {}
@@ -335,6 +364,56 @@ impl HostedAgentClient {
             response_text,
         })
     }
+}
+
+/// A tool result starts a new response with a new request ID. Trailing chunks
+/// from the tool's own response must not satisfy that continuation wait.
+struct HostedStreamState {
+    request_id: String,
+    awaiting_continuation: bool,
+    seen_request_ids: HashSet<String>,
+}
+
+impl HostedStreamState {
+    fn new(request_id: String) -> Self {
+        Self {
+            seen_request_ids: HashSet::from([request_id.clone()]),
+            request_id,
+            awaiting_continuation: false,
+        }
+    }
+
+    fn accept_frame(&mut self, frame: &Value) -> bool {
+        let Some(id) = frame.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        if id == self.request_id {
+            return true;
+        }
+        if self.awaiting_continuation
+            && !self.seen_request_ids.contains(id)
+            && frame.get("continuation").and_then(Value::as_bool) == Some(true)
+        {
+            self.request_id = id.to_string();
+            self.seen_request_ids.insert(id.to_string());
+            self.awaiting_continuation = false;
+            return true;
+        }
+        false
+    }
+}
+
+fn stream_chunk_error(chunk: &Value) -> Option<HostedAgentError> {
+    (chunk.get("type").and_then(Value::as_str) == Some("error")).then(|| {
+        HostedAgentError::Request {
+            detail: chunk
+                .get("errorText")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("the hosted model returned an error")
+                .to_string(),
+        }
+    })
 }
 
 type Socket =
@@ -362,6 +441,7 @@ impl HostedAgentClient {
     }
 
     async fn connect(&self, session_id: &str) -> Result<(Socket, Vec<Value>), HostedAgentError> {
+        let access_token = self.session_access_token(session_id).await?;
         let url = websocket_url(&self.base_url, session_id)?;
         let mut request = url
             .as_str()
@@ -369,7 +449,7 @@ impl HostedAgentClient {
             .map_err(connection_error)?;
         request.headers_mut().insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.access_token)).map_err(|error| {
+            HeaderValue::from_str(&format!("Bearer {access_token}")).map_err(|error| {
                 HostedAgentError::InvalidConfiguration {
                     detail: format!("invalid access token: {error}"),
                 }
@@ -408,6 +488,65 @@ impl HostedAgentClient {
                 _ => {}
             }
         }
+    }
+
+    async fn session_access_token(&self, session_id: &str) -> Result<String, HostedAgentError> {
+        let Some(secret) = &self.guest_secret else {
+            return Ok(self.access_token.clone());
+        };
+        let mut url = self
+            .base_url
+            .join("/guest-session")
+            .map_err(connection_error)?;
+        let scheme = if matches!(url.scheme(), "https" | "wss") {
+            "https"
+        } else {
+            "http"
+        };
+        url.set_scheme(scheme)
+            .map_err(|_| HostedAgentError::InvalidConfiguration {
+                detail: "invalid guest service URL".into(),
+            })?;
+        url.query_pairs_mut().append_pair("sessionId", session_id);
+        let response = reqwest::Client::builder()
+            .timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(connection_error)?
+            .post(url)
+            .header("authorization", format!("Guest {secret}"))
+            .send()
+            .await
+            .map_err(connection_error)?;
+        if !response.status().is_success() {
+            return Err(HostedAgentError::Request {
+                detail: match response.status().as_u16() {
+                    429 => {
+                        "Hosted beta connection limit reached. Please try again tomorrow.".into()
+                    }
+                    503 => {
+                        "Hosted guest access is temporarily unavailable. Please try again later."
+                            .into()
+                    }
+                    _ => format!(
+                        "Hosted guest connection failed ({}). Please try again.",
+                        response.status()
+                    ),
+                },
+            });
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct GuestSession {
+            access_token: String,
+        }
+        let session: GuestSession = response.json().await.map_err(protocol_error)?;
+        if session.access_token.is_empty() {
+            return Err(HostedAgentError::Protocol {
+                detail: "guest service returned an empty token".into(),
+            });
+        }
+        Ok(session.access_token)
     }
 }
 
@@ -618,6 +757,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn guest_identity_requires_a_secure_endpoint_and_random_secret() {
+        assert!(HostedAgentClient::guest("https://agent.test".into(), "a".repeat(64)).is_ok());
+        assert!(HostedAgentClient::guest("https://agent.test".into(), "short".into()).is_err());
+        assert!(HostedAgentClient::guest("http://agent.test".into(), "a".repeat(64)).is_err());
+    }
+
+    #[tokio::test]
+    async fn guest_exchange_binds_the_token_to_the_requested_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        let expected_session = session_id.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains(&format!("POST /guest-session?sessionId={expected_session}")));
+            assert!(request.contains(&format!("authorization: Guest {}", "a".repeat(64))));
+            let body = r#"{"accessToken":"session-token"}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let client = HostedAgentClient::guest(format!("http://{address}"), "a".repeat(64)).unwrap();
+        assert_eq!(
+            client.session_access_token(&session_id).await.unwrap(),
+            "session-token"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
     fn builds_canonical_think_websocket_route() {
         let base = validated_base_url("https://agent.learnfold.example/runtime").unwrap();
         let session = "123e4567-e89b-12d3-a456-426614174000";
@@ -671,6 +842,134 @@ mod tests {
         assert_eq!(id, "call-1");
         assert_eq!(name, "present_course_plan");
         assert_eq!(input["plan_id"], "rust");
+    }
+
+    #[test]
+    fn chained_tools_wait_for_a_new_continuation_request() {
+        let mut stream = HostedStreamState::new("initial".into());
+        stream.awaiting_continuation = true;
+        assert!(stream.accept_frame(&json!({"id":"initial", "done":true})));
+        assert!(stream.awaiting_continuation);
+        assert!(stream.accept_frame(&json!({"id":"continuation-1", "continuation":true})));
+        assert!(!stream.awaiting_continuation);
+        // A second tool ran in continuation-1. Its trailing chunks and done
+        // marker still belong to that response, not to continuation-2.
+        stream.awaiting_continuation = true;
+        assert!(stream.accept_frame(&json!({"id":"continuation-1", "continuation":true})));
+        assert!(
+            stream.accept_frame(&json!({"id":"continuation-1", "continuation":true, "done":true}))
+        );
+        assert!(stream.awaiting_continuation);
+        assert!(stream.accept_frame(&json!({"id":"continuation-2", "continuation":true})));
+        assert!(!stream.awaiting_continuation);
+        assert_eq!(stream.request_id, "continuation-2");
+    }
+
+    #[test]
+    fn stale_stream_frames_cannot_finish_or_fail_the_current_response() {
+        let mut stream = HostedStreamState::new("current".into());
+        assert!(!stream.accept_frame(&json!({"id":"old", "done":true})));
+        assert!(!stream.accept_frame(&json!({"id":"old", "error":true, "continuation":true})));
+        assert!(!stream.accept_frame(&json!({"done":true})));
+        assert!(stream.accept_frame(&json!({"id":"current", "done":true})));
+    }
+
+    #[test]
+    fn model_error_chunks_are_failures_even_without_an_outer_error_flag() {
+        let error =
+            stream_chunk_error(&json!({"type":"error", "errorText":"Model unavailable"})).unwrap();
+        assert!(error.to_string().contains("Model unavailable"));
+        assert!(stream_chunk_error(&json!({"type":"error"})).is_some());
+        assert!(stream_chunk_error(&json!({"type":"text-delta", "delta":"Hello"})).is_none());
+    }
+
+    struct TestToolHandler;
+    impl HostedAgentToolHandler for TestToolHandler {
+        fn execute_hosted_tool(&self, _: HostedAgentToolInvocation) -> HostedAgentToolResult {
+            HostedAgentToolResult {
+                success: true,
+                output: "{}".into(),
+                error_message: None,
+            }
+        }
+    }
+    struct TestListener;
+    impl HostedAgentEventListener for TestListener {
+        fn on_response_delta(&self, _: String) {}
+        fn on_recovering_changed(&self, _: bool) {}
+    }
+
+    #[tokio::test]
+    async fn websocket_turn_waits_through_two_tools_and_surfaces_stream_errors() {
+        for fails in [false, true] {
+            let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = server.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (tcp, _) = server.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                ws.send(WsMessage::Text(
+                    json!({"type":"cf_agent_chat_messages", "messages":[]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                let request: Value =
+                    serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                let initial = request["id"].as_str().unwrap().to_string();
+                for (index, id) in [initial.as_str(), "continuation-1"].iter().enumerate() {
+                    let chunk = json!({"type":"tool-input-available", "toolCallId":format!("call-{index}"), "toolName":"native-editor-fetch", "input":{}});
+                    ws.send(WsMessage::Text(json!({"type":"cf_agent_use_chat_response", "id":id, "continuation":index > 0, "body":chunk.to_string()}).to_string().into())).await.unwrap();
+                    let result: Value =
+                        serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                            .unwrap();
+                    assert_eq!(result["type"], "cf_agent_tool_result");
+                    assert_eq!(result["toolCallId"], format!("call-{index}"));
+                    // These trailing frames belong to the response that called
+                    // the tool, even though continuation=true for the second.
+                    let trailing = json!({"type":"finish-step"});
+                    ws.send(WsMessage::Text(json!({"type":"cf_agent_use_chat_response", "id":id, "continuation":index > 0, "body":trailing.to_string()}).to_string().into())).await.unwrap();
+                    ws.send(WsMessage::Text(json!({"type":"cf_agent_use_chat_response", "id":id, "continuation":index > 0, "done":true}).to_string().into())).await.unwrap();
+                }
+                let chunk = if fails {
+                    json!({"type":"error", "errorText":"Model unavailable"})
+                } else {
+                    json!({"type":"text-delta", "delta":"Final answer after both tools"})
+                };
+                ws.send(WsMessage::Text(json!({"type":"cf_agent_use_chat_response", "id":"continuation-2", "continuation":true, "body":chunk.to_string()}).to_string().into())).await.unwrap();
+                let _ = ws.send(WsMessage::Text(json!({"type":"cf_agent_use_chat_response", "id":"continuation-2", "continuation":true, "done":true}).to_string().into())).await;
+            });
+            let client =
+                HostedAgentClient::new(format!("http://{address}"), "test-token".into()).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.send(
+                    Uuid::new_v4().to_string(),
+                    "course-a".into(),
+                    "Read the lesson".into(),
+                    vec![],
+                    Box::new(TestToolHandler),
+                    Box::new(TestListener),
+                ),
+            )
+            .await
+            .expect("turn stalled");
+            if fails {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Model unavailable")
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap().response_text,
+                    "Final answer after both tools"
+                );
+            }
+            task.await.unwrap();
+        }
     }
 
     #[test]

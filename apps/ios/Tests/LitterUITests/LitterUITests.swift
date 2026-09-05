@@ -6,6 +6,31 @@ final class LitterUITests: XCTestCase {
     }
 
     @MainActor
+    func testGuestHostedSetupContinuesWithoutLoginAndOffersChangeAgent() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["SNAPPY_RESET_ONBOARDING"] = "1"
+        app.launchEnvironment["LEARNFOLD_HOSTED_ACCESS_TOKEN"] = ""
+        app.launch()
+        continuePastIntroIfNeeded(in: app)
+        XCTAssertTrue(app.staticTexts["Ready to start learning"].waitForExistence(timeout: 10))
+        let hosted = identifiedElement("course-agent-option-hosted", in: app)
+        XCTAssertEqual(hosted.value as? String, "available-selected")
+        XCTAssertFalse(identifiedElement("course-agent-option-codex", in: app).exists)
+        let changeAgent = app.buttons["course-agent-change"]
+        XCTAssertTrue(waitUntilHittable(changeAgent, timeout: 5))
+        attachScreenshot(named: "Hosted guest default without login", app: app)
+        changeAgent.tap()
+        XCTAssertTrue(identifiedElement("course-agent-option-codex", in: app).exists)
+        let connect = identifiedElement("course-agent-connect", in: app)
+        XCTAssertTrue(scrollUntilHittable(connect, in: app))
+        XCTAssertEqual(connect.label, "Continue")
+        connect.tap()
+        XCTAssertTrue(app.staticTexts["My Courses"].waitForExistence(timeout: 8))
+        attachScreenshot(named: "Hosted guest course library", app: app)
+    }
+
+    @MainActor
     func testFirstLaunchIntroContinuesToCourseAgentSetup() throws {
         let app = appleCourseSetupApp(onDeviceAvailable: true, privateCloudAvailable: true)
         app.launch()
@@ -732,6 +757,61 @@ final class LitterUITests: XCTestCase {
     }
 
     @MainActor
+    func testCourseDraftSurvivesSwipeBackAndRequiresDiscardConfirmation() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["SNAPPY_RESET_ONBOARDING"] = "1"
+        app.launchEnvironment["SNAPPY_SKIP_AGENT_SETUP"] = "1"
+        app.launch()
+
+        let library = app.staticTexts["course-library-root"]
+        XCTAssertTrue(library.waitForExistence(timeout: 15))
+        let newCourse = app.buttons["new-course-button"]
+        XCTAssertTrue(waitUntilHittable(newCourse, timeout: 5))
+        newCourse.tap()
+
+        let draftText = "Build me a course about actor isolation"
+        let composer = app.textFields["course-chat-composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        composer.tap()
+        composer.typeText(draftText)
+
+        let swipeStart = app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.5))
+        let swipeEnd = app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5))
+        swipeStart.press(forDuration: 0.05, thenDragTo: swipeEnd)
+
+        XCTAssertTrue(library.waitForExistence(timeout: 10))
+        let continueDraft = app.buttons["continue-course-draft-button"]
+        XCTAssertTrue(continueDraft.waitForExistence(timeout: 5))
+        XCTAssertEqual(continueDraft.value as? String, "saved")
+        attachScreenshot(named: "Course draft available after swipe back", app: app)
+
+        XCTAssertTrue(waitUntilHittable(newCourse, timeout: 5))
+        newCourse.tap()
+        let replacementAlert = app.alerts["Start a new course?"]
+        XCTAssertTrue(replacementAlert.waitForExistence(timeout: 5))
+        XCTAssertTrue(replacementAlert.buttons["Continue Draft"].exists)
+        XCTAssertTrue(replacementAlert.buttons["Discard Draft and Start New"].exists)
+        attachScreenshot(named: "Course draft replacement confirmation", app: app)
+
+        replacementAlert.buttons["Continue Draft"].tap()
+        let restoredComposer = app.textFields["course-chat-composer"]
+        XCTAssertTrue(restoredComposer.waitForExistence(timeout: 10))
+        XCTAssertEqual(restoredComposer.value as? String, draftText)
+
+        swipeStart.press(forDuration: 0.05, thenDragTo: swipeEnd)
+        XCTAssertTrue(library.waitForExistence(timeout: 10))
+        XCTAssertTrue(waitUntilHittable(newCourse, timeout: 5))
+        newCourse.tap()
+        XCTAssertTrue(replacementAlert.waitForExistence(timeout: 5))
+        replacementAlert.buttons["Discard Draft and Start New"].tap()
+
+        let replacementComposer = app.textFields["course-chat-composer"]
+        XCTAssertTrue(replacementComposer.waitForExistence(timeout: 10))
+        XCTAssertNotEqual(replacementComposer.value as? String, draftText)
+    }
+
+    @MainActor
     func testConversationDisplayExpandedModeShowsAllDetails() throws {
         let app = conversationDisplayHarnessApp(reasoning: "expanded", commands: "expanded", tools: "expanded")
         app.launch()
@@ -1176,6 +1256,7 @@ final class LitterUITests: XCTestCase {
     ) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["LEARNFOLD_HOSTED_AGENT_URL"] = ""
         app.launchEnvironment["SNAPPY_RESET_ONBOARDING"] = "1"
         app.launchEnvironment["SNAPPY_APPLE_ON_DEVICE_AVAILABLE"] = onDeviceAvailable ? "1" : "0"
         app.launchEnvironment["SNAPPY_APPLE_PRIVATE_CLOUD_AVAILABLE"] =

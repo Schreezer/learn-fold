@@ -2221,6 +2221,10 @@ private struct CourseAgentErrorCard: View {
         if blockingAction == .missingThread {
             return "Discussion thread missing"
         }
+        if agentName == CourseAgentProvider.hosted.displayLabel,
+           submissionRecoveryState == .acceptedReplyIncomplete {
+            return "Reply interrupted"
+        }
         return "\(agentName) couldn’t continue"
     }
 
@@ -2364,7 +2368,10 @@ private struct CourseAgentErrorCard: View {
                 }
             case .acceptedReplyIncomplete:
                 Button(action: onCheckStatus) {
-                    actionLabel("Check Status", expandsHorizontally: expandsHorizontally)
+                    actionLabel(
+                        agentName == CourseAgentProvider.hosted.displayLabel ? "Reload Conversation" : "Check Status",
+                        expandsHorizontally: expandsHorizontally
+                    )
                 }
                 .buttonStyle(.borderedProminent)
                 .accessibilityIdentifier("course-agent-error.action.check-status")
