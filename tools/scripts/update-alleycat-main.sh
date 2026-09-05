@@ -53,11 +53,18 @@ update_shared() {
 }
 
 update_kittylitter() {
-  echo "==> Resolving Learnfold Link's pinned public Alleycat dependency..."
+  if grep -Eq '^alleycat[[:space:]]*=.*rev[[:space:]]*=' \
+    "$REPO_DIR/services/kittylitter/Cargo.toml"; then
+    echo "==> Learnfold Link pins a reviewed Alleycat revision; leaving Cargo.lock unchanged."
+    return
+  fi
+
+  echo "==> Resolving Learnfold Link Alleycat dep to dnakov/alleycat main ($ALLEYCAT_MAIN_SHA)..."
   cargo update \
     --quiet \
     --manifest-path "$REPO_DIR/services/kittylitter/Cargo.toml" \
-    -p alleycat
+    -p alleycat \
+    --precise "$ALLEYCAT_MAIN_SHA"
 }
 
 case "$MODE" in

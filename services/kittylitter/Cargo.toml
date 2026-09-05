@@ -2,7 +2,7 @@
 
 [package]
 name = "learnfold-link"
-version = "0.3.7"
+version = "0.3.10"
 edition = "2024"
 license = "GPL-3.0-only"
 authors = ["Learnfold"]
@@ -22,11 +22,12 @@ name = "learnfold-link"
 path = "src/main.rs"
 
 [dependencies]
-# One reviewed, reproducible Alleycat revision: iroh 1.0.3 Happy Eyeballs,
-# durable Hermes continuity, and the authenticated production Runs lifecycle.
-alleycat = { git = "https://github.com/Schreezer/alleycat.git", rev = "e2edae8061c1ab6f7af255ef3d6583c6605159bd" }
+# Pin the reviewed public connector commit so every npm install gets the same
+# durable Hermes transcript and service-profile behavior.
+alleycat = { git = "https://github.com/Schreezer/alleycat.git", rev = "3fd3be461a1fa63944e277074ba1d9dce6f02ef6" }
 anyhow = "1"
 libc = "0.2"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"
 url = "2"

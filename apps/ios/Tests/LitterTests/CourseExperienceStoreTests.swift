@@ -7930,6 +7930,47 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
     }
 
+    func testCourseChatRemovesOnlyLocalMessagesRepresentedByLiveThread() {
+        let olderLearner = CourseChatMessage(role: .learner, text: "Start with actors.")
+        let olderAgent = CourseChatMessage(role: .agent, text: "Actors protect isolated state.")
+        let currentLearner = CourseChatMessage(role: .learner, text: "Why does await yield?")
+        let currentAgent = CourseChatMessage(role: .agent, text: "It lets other work run.")
+        let liveItems = [
+            ConversationItem(
+                id: "live-user",
+                content: .user(
+                    ConversationUserMessageData(text: currentLearner.text, images: [])
+                )
+            ),
+            ConversationItem(
+                id: "live-assistant",
+                content: .assistant(
+                    ConversationAssistantMessageData(
+                        text: currentAgent.text,
+                        agentNickname: nil,
+                        agentRole: nil,
+                        phase: nil
+                    )
+                )
+            ),
+        ]
+
+        let beforeThread = CourseChatTimelinePolicy.localMessages(
+            [olderLearner, olderAgent, currentLearner, currentAgent],
+            representedBy: []
+        )
+        let afterThread = CourseChatTimelinePolicy.localMessages(
+            [olderLearner, olderAgent, currentLearner, currentAgent],
+            representedBy: liveItems
+        )
+
+        XCTAssertEqual(
+            beforeThread.map(\.id),
+            [olderLearner.id, olderAgent.id, currentLearner.id, currentAgent.id]
+        )
+        XCTAssertEqual(afterThread.map(\.id), [olderLearner.id, olderAgent.id])
+    }
+
     func testCourseChatPartialLiveSnapshotCannotEraseLocalTranscript() {
         let firstLearner = CourseChatMessage(role: .learner, text: "Explain actors.")
         let firstAgent = CourseChatMessage(role: .agent, text: "Actors protect isolated state.")
@@ -9932,7 +9973,9 @@ final class CourseExperienceStoreTests: XCTestCase {
 
     func testCourseChatRejectsLegacySyntheticThreadIDs() {
         XCTAssertFalse(CourseExperienceStore.isValidAppServerThreadID("selection-qa-thread"))
+        XCTAssertFalse(CourseExperienceStore.isValidAppServerThreadID("thread_not-hex"))
         XCTAssertFalse(CourseExperienceStore.isValidAppServerThreadID(""))
+        XCTAssertTrue(CourseExperienceStore.isValidAppServerThreadID("thread_0123456789abcdef01234567"))
         XCTAssertTrue(CourseExperienceStore.isValidAppServerThreadID("019f7e41-81cf-7f22-b5a7-3c00009cec20"))
         XCTAssertTrue(CourseExperienceStore.isValidAppServerThreadID("urn:uuid:019f7e41-81cf-7f22-b5a7-3c00009cec20"))
     }

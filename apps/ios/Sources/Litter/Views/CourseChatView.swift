@@ -180,6 +180,28 @@ enum CourseHermesRecoveryProgressPolicy {
 }
 
 enum CourseChatTimelinePolicy {
+    static func localMessages(
+        _ messages: [CourseChatMessage],
+        representedBy liveItems: [ConversationItem]
+    ) -> [CourseChatMessage] {
+        var liveCounts = liveItems.reduce(into: [MessageSignature: Int]()) { counts, item in
+            guard let signature = messageSignature(for: item) else { return }
+            counts[signature, default: 0] += 1
+        }
+
+        return messages.filter { message in
+            let signature = MessageSignature(
+                role: message.role == .learner ? .learner : .agent,
+                text: normalizedMessageText(message.text)
+            )
+            guard let count = liveCounts[signature], count > 0 else {
+                return true
+            }
+            liveCounts[signature] = count - 1
+            return false
+        }
+    }
+
     static func projectLiveItems(
         _ items: [ConversationItem],
         hidesSelectionEnvelope: Bool = false
@@ -311,8 +333,8 @@ enum CourseChatTimelinePolicy {
             })
     }
 
-    private struct MessageSignature {
-        enum Role {
+    private struct MessageSignature: Hashable {
+        enum Role: Hashable {
             case learner
             case agent
         }
@@ -778,7 +800,10 @@ struct CourseChatView: View {
     }
 
     private var localMessages: [CourseChatMessage] {
-        store.localMessages(for: selectionDiscussionID)
+        CourseChatTimelinePolicy.localMessages(
+            store.localMessages(for: selectionDiscussionID),
+            representedBy: liveConversationItems
+        )
     }
 
     private var remoteTimelineItems: [ConversationItem] {
