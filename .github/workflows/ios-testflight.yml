@@ -84,6 +84,11 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE=0 brew install asc
           xcodebuild -version
           asc --version
+          # Use Homebrew LLD for the embedded Linux helper. The runner
+          # rust-lld binary can have an unresolved libLLVM.dylib dependency.
+          linker="$(brew --prefix lld)/bin/ld.lld"
+          "$linker" --version
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$linker" >> "$GITHUB_ENV"
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -93,7 +98,11 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,i686-unknown-linux-musl
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,i686-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - name: Verify embedded helper cross-linking
+        working-directory: shared/third_party/litter-ish/embed/supervisor
+        run: cargo build --profile supervisor --target aarch64-unknown-linux-musl --target-dir "$RUNNER_TEMP/supervisor-preflight"
 
       - name: Cache Rust compilation
         uses: Swatinem/rust-cache@v2
@@ -147,8 +156,7 @@ jobs:
       - name: Build, upload, and assign to TestFlight
         run: |
           set -euo pipefail
-          # Rebuild the bundled helper on this host before the release target
-          # verifies it. Zig embeds host-specific build metadata in the binary.
+          # Build and verify the bundled helper from source on this runner.
           make course-exec
           make testflight 2>&1 | tee "$RUNNER_TEMP/testflight.log"
           {
