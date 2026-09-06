@@ -1,6 +1,6 @@
 # Learnfold Hosted Agent
 
-Cloudflare Worker + Durable Object runtime for Learnfold course conversations. It uses Cloudflare Think for server-authoritative transcripts, stream recovery, tool-result continuation, and automatic compaction. The model adapter targets `deepseek-v4-flash` through OpenCode Zen Go's OpenAI-compatible Chat Completions endpoint.
+Cloudflare Worker + Durable Object runtime for Learnfold course conversations. It uses Cloudflare Think for server-authoritative transcripts, stream recovery, tool-result continuation, and automatic compaction. The model adapter targets `muse-spark-1.3-contributor` through OpenCode Go's Responses endpoint (`https://opencode.ai/zen/go/v1/responses`). Think replays complete conversation/tool history with `store: false`; provider response IDs are not used as the durable conversation store.
 
 Pi is intentionally not part of this service. Think owns the durable agent loop, while the iOS app executes the allowlisted native course tools and returns their results to the same durable session.
 
@@ -49,11 +49,11 @@ Correlate the opaque Durable Object `sessionID`, chat `requestID`, and per-provi
 
 Learner text, reasoning text, tool names/arguments/results, request URLs, credentials and raw error messages are excluded from this telemetry. SSE inspection buffers at most 64 KiB per line and forwards the original bytes with backpressure and cancellation intact. These records apply only to traffic after the telemetry deployment; they cannot reconstruct earlier uninstrumented requests.
 
-Focused selected-passage questions use `reasoningEffort: low`, including their tool continuations. The phone's existing selected-passage prompt envelope identifies this path. Course planning and approved lesson generation retain the provider defaults. Reasoning remains enabled; lowering effort is a latency tradeoff, not a guarantee of a response deadline.
+Muse uses its provider defaults for all course turns and compaction; the former DeepSeek-only low reasoning override is removed. No lesson prompts or tool authorization rules changed with the model switch. OpenCode documents Contributor prompts/completions as usable for Meta model training; `store: false` controls response storage/replay and does not opt out of that Contributor policy.
 
 ### Provider reasoning activity and timeouts
 
-The configured provider emits DeepSeek `reasoning_content`; the current OpenAI chat adapter does not expose that field as AI SDK reasoning. `sendReasoning: false` also deliberately hides reasoning from the UI. Those are separate behaviors; this transport fix does not claim full DeepSeek reasoning-history/tool-replay compatibility.
+The observer handles Responses reasoning text/summary deltas, answer deltas, function calls, completion/failure and nested usage. It retains legacy Chat Completions observation for regression coverage. `sendReasoning: false` deliberately hides reasoning from the UI; only real nonempty reasoning deltas produce activity markers. A provider that does not emit reasoning events will not produce invented progress.
 
 The raw SSE observer now forwards only an activity signal for nonempty reasoning deltas. `ProviderProgress` merges a transient `data-hosted-provider-progress` chunk into Think's UI stream, at most once per second while real deltas arrive. It never emits periodic keepalives on silence, and sends no reasoning text. The transient chunk is absent from conversation history; late callbacks are isolated to the original stream. The Rust client recognizes this exact marker as response progress without displaying it as answer text.
 

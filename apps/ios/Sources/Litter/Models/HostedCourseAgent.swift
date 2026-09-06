@@ -47,7 +47,7 @@ protocol HostedCourseAgentRuntime: AnyObject {
 
 @MainActor
 final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
-    static let modelID = "deepseek-v4-flash"
+    static let modelID = "muse-spark-1.3-contributor"
 
     private let baseURL: String?
     private let accessToken: String?

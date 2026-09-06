@@ -1,4 +1,4 @@
-import { generateText } from "ai"
+import { generateText, jsonSchema, tool } from "ai"
 import { getAgentByName } from "agents"
 import type { TurnContext } from "@cloudflare/think"
 import { SELF, env, runInDurableObject } from "cloudflare:test"
@@ -98,7 +98,7 @@ describe("hosted agent worker", () => {
     expect(await health.json()).toMatchObject({
       ok: true,
       runtime: "cloudflare-think",
-      model: "deepseek-v4-flash",
+      model: "muse-spark-1.3-contributor",
       capabilities: ["durable-session", "stream-resume", "auto-compaction", "client-tools"],
     })
 
@@ -108,26 +108,70 @@ describe("hosted agent worker", () => {
     expect(missing.status).toBe(404)
   })
 
-  it("sends the selected reasoning effort through the provider adapter", async () => {
+  it("uses Responses with full transcript replay and no provider storage", async () => {
     let sent: Record<string, unknown> = {}
+    let url = ""
     const transport: typeof fetch = async (_input, init) => {
+      url = String(_input)
       sent = JSON.parse(String(init?.body))
-      return Response.json({ id: "test", model: DEFAULT_MODEL, created: 1,
-        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })
+      return Response.json({ id: "resp_test", model: DEFAULT_MODEL, created_at: 1,
+        output: [{ type: "message", id: "msg_test", role: "assistant", content: [
+          { type: "output_text", text: "ok", annotations: [] },
+        ] }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } })
     }
-    await generateText({ model: createHostedModel("test-key", transport), prompt: "Question",
-      providerOptions: { openai: { reasoningEffort: "low" } } })
-    expect(sent.reasoning_effort).toBe("low")
+    const result = await generateText({ model: createHostedModel("test-key", transport), prompt: "Question" })
+    expect(result.text).toBe("ok")
+    expect(url).toBe(`${OPENCODE_BASE_URL}/responses`)
+    expect(sent.store).toBe(false)
+    expect(sent).not.toHaveProperty("reasoning")
+    expect(sent).not.toHaveProperty("messages")
+    expect(sent.input).toBeDefined()
     expect(sent.model).toBe(DEFAULT_MODEL)
   })
 
-  it("uses the OpenCode Zen Go chat-completions adapter", () => {
+  it("uses the OpenCode Zen Go Responses adapter", () => {
     const model = createHostedModel("not-a-real-key")
     expect(OPENCODE_BASE_URL).toBe("https://opencode.ai/zen/go/v1")
-    expect(DEFAULT_MODEL).toBe("deepseek-v4-flash")
-    expect(model.modelId).toBe("deepseek-v4-flash")
+    expect(DEFAULT_MODEL).toBe("muse-spark-1.3-contributor")
+    expect(model.modelId).toBe("muse-spark-1.3-contributor")
     expect(model.provider).toContain("opencode-zen-go")
+  })
+
+  it("replays legacy text history and client tool results through Responses without item references", async () => {
+    const requests: Record<string, unknown>[] = []
+    const model = createHostedModel("test-key", async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)))
+      return Response.json({ id: `resp_${requests.length}`, model: DEFAULT_MODEL, created_at: 1,
+        output: requests.length === 1
+          ? [{ type: "function_call", id: "fc_test", call_id: "call_test", name: "native-editor-fetch", arguments: '{"id":"lesson"}' }]
+          : [{ type: "message", id: "msg_test", role: "assistant", content: [
+              { type: "output_text", text: "The lesson says hello.", annotations: [] },
+            ] }],
+        usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 } })
+    })
+    const tools = { "native-editor-fetch": tool({
+      inputSchema: jsonSchema<{ id: string }>({ type: "object", properties: { id: { type: "string" } }, required: ["id"] }),
+    }) }
+    const messages = [
+      { role: "user" as const, content: "An older DeepSeek question" },
+      { role: "assistant" as const, content: "An older DeepSeek answer" },
+      { role: "user" as const, content: "Fetch my lesson" },
+    ]
+    const first = await generateText({ model, messages, tools })
+    expect(first.toolCalls[0]).toMatchObject({ toolCallId: "call_test", toolName: "native-editor-fetch", input: { id: "lesson" } })
+    const second = await generateText({ model, tools, messages: [
+      ...messages, ...first.response.messages,
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "call_test", toolName: "native-editor-fetch",
+        output: { type: "json", value: { content: "hello" } } }] },
+    ] })
+    expect(second.text).toBe("The lesson says hello.")
+    expect(requests[1].store).toBe(false)
+    expect(requests[1].input).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "function_call", call_id: "call_test" }),
+      expect.objectContaining({ type: "function_call_output", call_id: "call_test", output: '{"content":"hello"}' }),
+    ]))
+    expect(JSON.stringify(requests[1].input)).not.toContain("item_reference")
+    expect(JSON.stringify(requests[1].input)).toContain("An older DeepSeek answer")
   })
 })
 
@@ -149,14 +193,14 @@ describe("Hosted course workspace continuity", () => {
     })
   })
 
-  it("uses low reasoning for passage questions and their tool continuations only", async () => {
+  it("leaves Muse reasoning at its default for passage questions and continuations", async () => {
     const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
     await runInDurableObject(stub, async (agent) => {
       const focused = context({ workspaceId: "course-a" })
       focused.messages = [{ role: "user", content: 'I selected the following passage from the native course page `Lesson` while studying.\n\n<selected_course_passage page_id="lesson" title="Lesson">\nA passage\n</selected_course_passage>\n\nMy question: Explain this.' }]
-      expect((await agent.beforeTurn(focused)).providerOptions).toEqual({ openai: { reasoningEffort: "low" } })
+      expect((await agent.beforeTurn(focused)).providerOptions).toBeUndefined()
       const continuation = { ...focused, body: undefined, continuation: true }
-      expect((await agent.beforeTurn(continuation)).providerOptions).toEqual({ openai: { reasoningEffort: "low" } })
+      expect((await agent.beforeTurn(continuation)).providerOptions).toBeUndefined()
       for (const text of ["Build a deep course", "I approve course plan plan-1 revision 1", "Explain what selected_course_passage means"]) {
         const planning = { ...focused, messages: [{ role: "user" as const, content: text }] }
         expect((await agent.beforeTurn(planning)).providerOptions).toBeUndefined()

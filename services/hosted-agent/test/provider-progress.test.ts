@@ -3,9 +3,7 @@ import { getAgentByName } from "agents"
 import { describe, expect, it } from "vitest"
 import { ProviderProgress, PROVIDER_PROGRESS_TYPE } from "../src/provider-progress"
 
-const encode = (value: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(value)}\n\n`)
-const delta = (value: Record<string, unknown>) => ({ id: "test", object: "chat.completion.chunk", created: 1,
-  model: "deepseek-v4-flash", choices: [{ index: 0, delta: value, finish_reason: null }] })
+import { encode, reasoningStart, reasoningDelta, answerEvents } from "./responses-fixtures"
 
 // The production Think agent, production fetch observer, actual OpenAI adapter,
 // real SDK UI stream, real Think watchdog, and real authenticated WebSocket.
@@ -36,14 +34,12 @@ async function runStream(mode: "answer" | "silent" | "cancel" | "bound") {
               aborted = true; stop(); controller.error(init.signal?.reason)
             }, { once: true })
             if (mode !== "silent") {
-              controller.enqueue(encode(delta({ reasoning_content: "PRIVATE SYNTHETIC REASONING" })))
-              tick = setInterval(() => controller.enqueue(encode(delta({ reasoning_content: "PRIVATE SYNTHETIC REASONING" }))), 100)
+              for (const event of [...reasoningStart, reasoningDelta]) controller.enqueue(encode(event))
+              tick = setInterval(() => controller.enqueue(encode(reasoningDelta)), 100)
             }
             if (mode === "answer") end = setTimeout(() => {
               stop()
-              controller.enqueue(encode(delta({ content: "Visible answer" })))
-              controller.enqueue(encode({ ...delta({}), choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }))
-              controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"))
+              for (const event of answerEvents()) controller.enqueue(encode(event))
               controller.close()
             }, 2_200)
           },

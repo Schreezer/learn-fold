@@ -130,9 +130,6 @@ export class HostedCourseAgent extends Think<HostedEnv> {
       name === "present_course_plan" || name.startsWith("native-editor-"),
     )
     const userText = lastUserText(context)
-    const focusedQuestion = userText?.startsWith("I selected the following passage from the native course page `") === true
-      && userText.includes("\n<selected_course_passage ")
-      && userText.includes("</selected_course_passage>\n\nMy question:")
     const approval = userText?.trimStart().startsWith("I approve course plan ") === true
     const directLessonUpdate = approval
       && userText?.includes("Call native-editor-update-page directly") === true
@@ -156,9 +153,6 @@ export class HostedCourseAgent extends Think<HostedEnv> {
       sendReasoning: false,
       // Genuine activity extends idle waits, but each model step stays bounded.
       timeout: { stepMs: PROVIDER_STEP_TIMEOUT_MS },
-      // Focused clarification should not spend minutes on default-high reasoning.
-      // Keep planning/generation defaults and reasoning enabled for correctness.
-      ...(focusedQuestion ? { providerOptions: { openai: { reasoningEffort: "low" } } } : {}),
     }
   }
 }

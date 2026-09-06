@@ -4,6 +4,34 @@ import { HostedTelemetry, observedProviderFetch, ProviderStreamObserver } from "
 const encode = (text: string) => new TextEncoder().encode(text)
 
 describe("Hosted telemetry", () => {
+  it("observes Responses reasoning, text, tools and nested usage without logging content", () => {
+    const logs: unknown[] = []
+    let activity = 0
+    const observer = new ProviderStreamObserver((event, fields) => logs.push({ event, ...fields }), () => activity++)
+    const events = [
+      { type: "response.reasoning_summary_text.delta", delta: "PRIVATE reasoning" },
+      { type: "response.reasoning_text.delta", delta: "PRIVATE reasoning" },
+      { type: "response.reasoning_summary_text.delta", delta: "" },
+      { type: "response.output_text.delta", delta: "PRIVATE answer" },
+      { type: "response.output_item.added", item: { type: "function_call", arguments: "PRIVATE arguments" } },
+      { type: "response.completed", response: { output: "PRIVATE full answer", usage: {
+        input_tokens: 10, output_tokens: 20, total_tokens: 30,
+        input_tokens_details: { cached_tokens: 5 }, output_tokens_details: { reasoning_tokens: 12 },
+      } } },
+    ]
+    const bytes = encode(events.map(value => `data: ${JSON.stringify(value)}\n\n`).join(""))
+    for (let i = 0; i < bytes.length; i += 7) observer.observe(bytes.slice(i, i + 7))
+    observer.finish()
+    expect(activity).toBe(2)
+    expect(logs).toEqual([
+      { event: "provider.first_byte" }, { event: "provider.first_reasoning" },
+      { event: "provider.first_text" }, { event: "provider.first_tool" },
+      { event: "provider.usage", prompt_tokens: 10, completion_tokens: 20, total_tokens: 30,
+        cached_tokens: 5, reasoning_tokens: 12 }, { event: "provider.done" },
+    ])
+    expect(JSON.stringify(logs)).not.toContain("PRIVATE")
+  })
+
   it("records split SSE milestones without leaking text, reasoning, arguments or errors", () => {
     const logs: unknown[] = []
     const observer = new ProviderStreamObserver((event, fields) => logs.push({ event, ...fields }))
