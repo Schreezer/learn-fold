@@ -98,7 +98,7 @@ describe("hosted agent worker", () => {
     expect(await health.json()).toMatchObject({
       ok: true,
       runtime: "cloudflare-think",
-      model: "muse-spark-1.3-contributor",
+      model: "gpt-5.6-luna",
       capabilities: ["durable-session", "stream-resume", "auto-compaction", "client-tools"],
     })
 
@@ -133,8 +133,8 @@ describe("hosted agent worker", () => {
   it("uses the OpenCode Zen Go Responses adapter", () => {
     const model = createHostedModel("not-a-real-key")
     expect(OPENCODE_BASE_URL).toBe("https://opencode.ai/zen/go/v1")
-    expect(DEFAULT_MODEL).toBe("muse-spark-1.3-contributor")
-    expect(model.modelId).toBe("muse-spark-1.3-contributor")
+    expect(DEFAULT_MODEL).toBe("gpt-5.6-luna")
+    expect(model.modelId).toBe("gpt-5.6-luna")
     expect(model.provider).toContain("opencode-zen-go")
   })
 
@@ -205,7 +205,7 @@ describe("Hosted course workspace continuity", () => {
     })
   })
 
-  it("leaves Muse reasoning at its default for passage questions and continuations", async () => {
+  it("leaves Luna reasoning at its default for passage questions and continuations", async () => {
     const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
     await runInDurableObject(stub, async (agent) => {
       const focused = context({ workspaceId: "course-a" })

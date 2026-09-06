@@ -1,6 +1,6 @@
 # Learnfold Hosted Agent
 
-Cloudflare Worker + Durable Object runtime for Learnfold course conversations. It uses Cloudflare Think for server-authoritative transcripts, stream recovery, tool-result continuation, and automatic compaction. The model adapter targets `muse-spark-1.3-contributor` through OpenCode Go's Responses endpoint (`https://opencode.ai/zen/go/v1/responses`). Think replays complete conversation/tool history with `store: false`; provider response IDs are not used as the durable conversation store.
+Cloudflare Worker + Durable Object runtime for Learnfold course conversations. It uses Cloudflare Think for server-authoritative transcripts, stream recovery, tool-result continuation, and automatic compaction. The model adapter targets `gpt-5.6-luna` through OpenCode Go's Responses endpoint (`https://opencode.ai/zen/go/v1/responses`). Think replays complete conversation/tool history with `store: false`; provider response IDs are not used as the durable conversation store.
 
 Pi is intentionally not part of this service. Think owns the durable agent loop, while the iOS app executes the allowlisted native course tools and returns their results to the same durable session.
 
@@ -49,7 +49,7 @@ Correlate the opaque Durable Object `sessionID`, chat `requestID`, and per-provi
 
 Learner text, reasoning text, tool names/arguments/results, request URLs, credentials and raw error messages are excluded from this telemetry. SSE inspection buffers at most 64 KiB per line and forwards the original bytes with backpressure and cancellation intact. These records apply only to traffic after the telemetry deployment; they cannot reconstruct earlier uninstrumented requests.
 
-Muse uses its provider defaults for all course turns and compaction; the former DeepSeek-only low reasoning override is removed. No lesson prompts or tool authorization rules changed with the model switch. OpenCode documents Contributor prompts/completions as usable for Meta model training; `store: false` controls response storage/replay and does not opt out of that Contributor policy.
+Luna uses its provider defaults for all course turns and compaction, with no reasoning-effort override or app-defined output-token cap. Existing conversations replay their complete history through the same Responses adapter. The model switch preserves lesson prompts and tool authorization rules.
 
 ### Provider reasoning activity and timeouts
 

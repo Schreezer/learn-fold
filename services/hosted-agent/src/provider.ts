@@ -2,7 +2,7 @@ import { createOpenAI } from "@ai-sdk/openai"
 import { defaultSettingsMiddleware, wrapLanguageModel } from "ai"
 
 export const OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
-export const DEFAULT_MODEL = "muse-spark-1.3-contributor"
+export const DEFAULT_MODEL = "gpt-5.6-luna"
 
 export function createHostedModel(apiKey: string, providerFetch?: typeof fetch) {
   const model = createOpenAI({

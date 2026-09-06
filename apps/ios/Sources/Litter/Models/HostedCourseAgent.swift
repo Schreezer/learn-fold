@@ -47,7 +47,7 @@ protocol HostedCourseAgentRuntime: AnyObject {
 
 @MainActor
 final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
-    static let modelID = "muse-spark-1.3-contributor"
+    static let modelID = "gpt-5.6-luna"
 
     private let baseURL: String?
     private let accessToken: String?
