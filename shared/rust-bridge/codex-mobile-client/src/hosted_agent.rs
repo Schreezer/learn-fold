@@ -774,6 +774,10 @@ fn chunk_makes_progress(chunk: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|delta| !delta.is_empty()),
         Some("tool-input-available" | "tool-call") => tool_call(chunk).is_some(),
+        Some("data-hosted-provider-progress") => {
+            chunk.get("transient").and_then(Value::as_bool) == Some(true)
+                && chunk.pointer("/data/phase").and_then(Value::as_str) == Some("reasoning")
+        }
         _ => false,
     }
 }
@@ -802,7 +806,14 @@ mod tests {
         assert!(chunk_makes_progress(
             &json!({"type":"tool-input-delta", "inputTextDelta":"{}"})
         ));
+        assert!(chunk_makes_progress(&json!({
+            "type":"data-hosted-provider-progress", "transient":true,
+            "data":{"phase":"reasoning"}
+        })));
         for chunk in [
+            json!({"type":"data-hosted-provider-progress", "data":{"phase":"reasoning"}}),
+            json!({"type":"data-hosted-provider-progress", "transient":true, "data":{"phase":"unknown"}}),
+            json!({"type":"data-unrelated", "transient":true, "data":{"phase":"reasoning"}}),
             json!({"type":"text-delta", "delta":""}),
             json!({"type":"start"}),
             json!({"type":"finish-step"}),

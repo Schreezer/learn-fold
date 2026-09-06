@@ -4,6 +4,7 @@ import { routeAgentRequest } from "agents"
 import { createCompactFunction } from "agents/experimental/memory/utils"
 import { generateText } from "ai"
 
+import { ProviderProgress, PROVIDER_STEP_TIMEOUT_MS } from "./provider-progress"
 import { HostedTelemetry, observedProviderFetch } from "./telemetry"
 import { isAuthorized, unauthorized } from "./auth"
 import { COURSE_AGENT_PROMPT } from "./course-prompt"
@@ -50,6 +51,7 @@ function lastUserText(context: TurnContext): string | null {
 }
 
 export class HostedCourseAgent extends Think<HostedEnv> {
+  private readonly providerProgress = new ProviderProgress()
   private readonly telemetry = new HostedTelemetry(() => this.ctx.id.toString())
   override observability = {
     emit: (event: { type: string; payload: Record<string, unknown> }) => this.telemetry.lifecycle(event),
@@ -57,6 +59,12 @@ export class HostedCourseAgent extends Think<HostedEnv> {
 
   override onChunk(context: ChunkContext) {
     this.telemetry.chunk(context.chunk.type)
+  }
+
+  // Pinned Think 0.15.1 exposes this protected hook. Keep the real Think stream
+  // regression test when upgrading: its watchdog must receive activity chunks.
+  protected override _transformInferenceResult(result: Parameters<ProviderProgress["wrap"]>[0]) {
+    return this.providerProgress.wrap(result)
   }
 
   override workspaceBash = false
@@ -74,7 +82,8 @@ export class HostedCourseAgent extends Think<HostedEnv> {
 
   override getModel() {
     return createHostedModel(this.env.OPENCODE_API_KEY,
-      observedProviderFetch(() => this.telemetry.providerObservation()))
+      observedProviderFetch(() => this.telemetry.providerObservation(), fetch,
+        () => this.providerProgress.observer()))
   }
 
   override getSystemPrompt(): string {
@@ -145,6 +154,8 @@ export class HostedCourseAgent extends Think<HostedEnv> {
       maxSteps: this.name.startsWith("guest-") ? 12 : 24,
       maxOutputTokens: this.name.startsWith("guest-") ? 8192 : undefined,
       sendReasoning: false,
+      // Genuine activity extends idle waits, but each model step stays bounded.
+      timeout: { stepMs: PROVIDER_STEP_TIMEOUT_MS },
       // Focused clarification should not spend minutes on default-high reasoning.
       // Keep planning/generation defaults and reasoning enabled for correctness.
       ...(focusedQuestion ? { providerOptions: { openai: { reasoningEffort: "low" } } } : {}),

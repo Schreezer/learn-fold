@@ -64,7 +64,7 @@ export class ProviderStreamObserver {
   private usage: Fields = {}
   private usageReported = false
 
-  constructor(private readonly log: Log) {}
+  constructor(private readonly log: Log, private readonly onReasoning: () => void = () => {}) {}
 
   private first(event: string) {
     if (this.seen.has(event)) return
@@ -106,7 +106,10 @@ export class ProviderStreamObserver {
       if (value.error) this.first("provider.error_frame")
       for (const choice of Array.isArray(value.choices) ? value.choices : []) {
         const delta = choice?.delta
-        if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length) this.first("provider.first_reasoning")
+        if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length) {
+          this.first("provider.first_reasoning")
+          this.onReasoning()
+        }
         if (typeof delta?.content === "string" && delta.content.length) this.first("provider.first_text")
         if (Array.isArray(delta?.tool_calls) && delta.tool_calls.length) this.first("provider.first_tool")
       }
@@ -122,16 +125,21 @@ export class ProviderStreamObserver {
   }
 }
 
-export function observedProviderFetch(start: () => Log, transport: typeof fetch = fetch): typeof fetch {
+export function observedProviderFetch(
+  start: () => Log,
+  transport: typeof fetch = fetch,
+  reasoningObserver: () => (() => void) = () => () => {},
+): typeof fetch {
   return async (input, init) => {
     const log = start()
+    const onReasoning = reasoningObserver()
     log("provider.request")
     let response: Response
     try { response = await transport(input, init) }
     catch (error) { log("provider.transport_error"); throw error }
     log("provider.headers", { status: response.status })
     if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) return response
-    const observer = new ProviderStreamObserver(log)
+    const observer = new ProviderStreamObserver(log, onReasoning)
     const reader = response.body.getReader()
     let closed = false
     const body = new ReadableStream<Uint8Array>({

@@ -50,3 +50,13 @@ Correlate the opaque Durable Object `sessionID`, chat `requestID`, and per-provi
 Learner text, reasoning text, tool names/arguments/results, request URLs, credentials and raw error messages are excluded from this telemetry. SSE inspection buffers at most 64 KiB per line and forwards the original bytes with backpressure and cancellation intact. These records apply only to traffic after the telemetry deployment; they cannot reconstruct earlier uninstrumented requests.
 
 Focused selected-passage questions use `reasoningEffort: low`, including their tool continuations. The phone's existing selected-passage prompt envelope identifies this path. Course planning and approved lesson generation retain the provider defaults. Reasoning remains enabled; lowering effort is a latency tradeoff, not a guarantee of a response deadline.
+
+### Provider reasoning activity and timeouts
+
+The configured provider emits DeepSeek `reasoning_content`; the current OpenAI chat adapter does not expose that field as AI SDK reasoning. `sendReasoning: false` also deliberately hides reasoning from the UI. Those are separate behaviors; this transport fix does not claim full DeepSeek reasoning-history/tool-replay compatibility.
+
+The raw SSE observer now forwards only an activity signal for nonempty reasoning deltas. `ProviderProgress` merges a transient `data-hosted-provider-progress` chunk into Think's UI stream, at most once per second while real deltas arrive. It never emits periodic keepalives on silence, and sends no reasoning text. The transient chunk is absent from conversation history; late callbacks are isolated to the original stream. The Rust client recognizes this exact marker as response progress without displaying it as answer text.
+
+Think 0.15.1's 120-second watchdog watches the filtered UI stream. The activity bridge prevents it from treating active hidden reasoning as silence. An AI SDK `timeout.stepMs` of 180 seconds bounds each model step even if reasoning continues. SDK timeout abort chunks are normalized into explicit errors because this Think version otherwise completes them without failure. This preserves user cancellation and genuine inactivity failures; it does not make the model generate its first visible answer faster. Existing app builds still have their prior 180-second content inactivity budget; the Rust activity recognition ships with the next app build.
+
+The bridge uses Think's protected `_transformInferenceResult` hook because this pinned version has no public pre-watchdog UI transform. Keep the real Think/WebSocket regression tests when upgrading Think: they verify sustained reasoning, actual silence, user cancellation, bounded model steps, and no private reasoning in wire messages/history.

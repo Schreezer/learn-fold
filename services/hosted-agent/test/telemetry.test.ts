@@ -28,6 +28,17 @@ describe("Hosted telemetry", () => {
     expect(JSON.stringify(logs)).not.toContain("PRIVATE")
   })
 
+  it("reports activity only for real nonempty reasoning deltas, including split frames", () => {
+    let activity = 0
+    const observer = new ProviderStreamObserver(() => {}, () => { activity++ })
+    observer.observe(encode('data: {"choices":[{"delta":{"reasoning_'))
+    observer.observe(encode('content":"PRIVATE"}}]}\n\n'))
+    observer.observe(encode('data: {"choices":[{"delta":{"reasoning_content":""}}]}\n\n'))
+    observer.observe(encode('data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'))
+    observer.observe(encode(': keepalive\n\ndata: {"usage":{"completion_tokens":42}}\n\n'))
+    expect(activity).toBe(1)
+  })
+
   it("aggregates providers that emit cumulative usage on every token", () => {
     const logs: unknown[] = []
     const observer = new ProviderStreamObserver((event, fields) => logs.push({ event, ...fields }))
