@@ -1,3 +1,4 @@
+import { generateText } from "ai"
 import { getAgentByName } from "agents"
 import type { TurnContext } from "@cloudflare/think"
 import { SELF, env, runInDurableObject } from "cloudflare:test"
@@ -107,6 +108,20 @@ describe("hosted agent worker", () => {
     expect(missing.status).toBe(404)
   })
 
+  it("sends the selected reasoning effort through the provider adapter", async () => {
+    let sent: Record<string, unknown> = {}
+    const transport: typeof fetch = async (_input, init) => {
+      sent = JSON.parse(String(init?.body))
+      return Response.json({ id: "test", model: DEFAULT_MODEL, created: 1,
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })
+    }
+    await generateText({ model: createHostedModel("test-key", transport), prompt: "Question",
+      providerOptions: { openai: { reasoningEffort: "low" } } })
+    expect(sent.reasoning_effort).toBe("low")
+    expect(sent.model).toBe(DEFAULT_MODEL)
+  })
+
   it("uses the OpenCode Zen Go chat-completions adapter", () => {
     const model = createHostedModel("not-a-real-key")
     expect(OPENCODE_BASE_URL).toBe("https://opencode.ai/zen/go/v1")
@@ -131,6 +146,21 @@ describe("Hosted course workspace continuity", () => {
     await runInDurableObject(stub, async (agent) => {
       const result = await agent.beforeTurn(context(undefined, true))
       expect(result.instructions).toContain("Current Learnfold workspace_id: course-a")
+    })
+  })
+
+  it("uses low reasoning for passage questions and their tool continuations only", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    await runInDurableObject(stub, async (agent) => {
+      const focused = context({ workspaceId: "course-a" })
+      focused.messages = [{ role: "user", content: 'I selected the following passage from the native course page `Lesson` while studying.\n\n<selected_course_passage page_id="lesson" title="Lesson">\nA passage\n</selected_course_passage>\n\nMy question: Explain this.' }]
+      expect((await agent.beforeTurn(focused)).providerOptions).toEqual({ openai: { reasoningEffort: "low" } })
+      const continuation = { ...focused, body: undefined, continuation: true }
+      expect((await agent.beforeTurn(continuation)).providerOptions).toEqual({ openai: { reasoningEffort: "low" } })
+      for (const text of ["Build a deep course", "I approve course plan plan-1 revision 1", "Explain what selected_course_passage means"]) {
+        const planning = { ...focused, messages: [{ role: "user" as const, content: text }] }
+        expect((await agent.beforeTurn(planning)).providerOptions).toBeUndefined()
+      }
     })
   })
 

@@ -1,9 +1,10 @@
 import { Think, Session, defaultContextOverflowClassifier } from "@cloudflare/think"
-import type { TurnContext, TurnConfig } from "@cloudflare/think"
+import type { TurnContext, TurnConfig, ChunkContext } from "@cloudflare/think"
 import { routeAgentRequest } from "agents"
 import { createCompactFunction } from "agents/experimental/memory/utils"
 import { generateText } from "ai"
 
+import { HostedTelemetry, observedProviderFetch } from "./telemetry"
 import { isAuthorized, unauthorized } from "./auth"
 import { COURSE_AGENT_PROMPT } from "./course-prompt"
 import { createHostedModel, DEFAULT_MODEL } from "./provider"
@@ -49,6 +50,15 @@ function lastUserText(context: TurnContext): string | null {
 }
 
 export class HostedCourseAgent extends Think<HostedEnv> {
+  private readonly telemetry = new HostedTelemetry(() => this.ctx.id.toString())
+  override observability = {
+    emit: (event: { type: string; payload: Record<string, unknown> }) => this.telemetry.lifecycle(event),
+  }
+
+  override onChunk(context: ChunkContext) {
+    this.telemetry.chunk(context.chunk.type)
+  }
+
   override workspaceBash = false
   override includeMcpTools = false
   override chatRecovery = {
@@ -63,7 +73,8 @@ export class HostedCourseAgent extends Think<HostedEnv> {
   override classifyChatError = defaultContextOverflowClassifier
 
   override getModel() {
-    return createHostedModel(this.env.OPENCODE_API_KEY)
+    return createHostedModel(this.env.OPENCODE_API_KEY,
+      observedProviderFetch(() => this.telemetry.providerObservation()))
   }
 
   override getSystemPrompt(): string {
@@ -110,6 +121,9 @@ export class HostedCourseAgent extends Think<HostedEnv> {
       name === "present_course_plan" || name.startsWith("native-editor-"),
     )
     const userText = lastUserText(context)
+    const focusedQuestion = userText?.startsWith("I selected the following passage from the native course page `") === true
+      && userText.includes("\n<selected_course_passage ")
+      && userText.includes("</selected_course_passage>\n\nMy question:")
     const approval = userText?.trimStart().startsWith("I approve course plan ") === true
     const directLessonUpdate = approval
       && userText?.includes("Call native-editor-update-page directly") === true
@@ -124,12 +138,16 @@ export class HostedCourseAgent extends Think<HostedEnv> {
         ? "\n\nThis is an approved-plan generation turn. The phone has already created the course shell and freshly fetched the exact pending Chapter 1 lesson. You MUST call native-editor-update-page once with the page ID and expected revision in the learner message. Do not fetch, and do not answer with prose before the update succeeds."
         : "\n\nThis is an approved-plan generation turn. The phone has already created the course shell and identified exactly one pending Chapter 1 lesson in the learner message. You MUST use native-editor-fetch, then native-editor-update-page to write that lesson and mark it generated. Do not answer with prose before both tool calls succeed."
       : ""
+    this.telemetry.prepared(context.continuation, context.messages.length, activeTools.length)
     return {
       instructions: `${context.system}\n\nCurrent Learnfold workspace_id: ${workspaceID}${approvalInstructions}`,
       activeTools,
       maxSteps: this.name.startsWith("guest-") ? 12 : 24,
       maxOutputTokens: this.name.startsWith("guest-") ? 8192 : undefined,
       sendReasoning: false,
+      // Focused clarification should not spend minutes on default-high reasoning.
+      // Keep planning/generation defaults and reasoning enabled for correctness.
+      ...(focusedQuestion ? { providerOptions: { openai: { reasoningEffort: "low" } } } : {}),
     }
   }
 }
