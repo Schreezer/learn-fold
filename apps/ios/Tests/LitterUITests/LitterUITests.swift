@@ -634,7 +634,28 @@ final class LitterUITests: XCTestCase {
 
         let pageTitle = app.staticTexts["Save recovery evidence"]
         XCTAssertTrue(pageTitle.exists)
-        XCTAssertTrue(app.staticTexts["Editable course page"].exists)
+        XCTAssertFalse(app.staticTexts["Editable course page"].exists)
+        let editToggle = app.buttons["course-page-edit-toggle"]
+        XCTAssertTrue(waitUntilHittable(editToggle, timeout: 8))
+        XCTAssertEqual(editToggle.label, "Edit page")
+        XCTAssertFalse(identifiedElement("native-editor-add-block", in: app).exists)
+        XCTAssertFalse(identifiedElement("native-editor-document-actions", in: app).exists)
+        attachScreenshot(named: "Course page reading mode", app: app)
+        editToggle.tap()
+        XCTAssertTrue(
+            identifiedElement("native-editor-document-actions", in: app)
+                .waitForExistence(timeout: 5)
+        )
+        XCTAssertEqual(editToggle.label, "Finish editing")
+        XCTAssertTrue(identifiedElement("native-editor-continue-writing", in: app).exists)
+        XCTAssertFalse(identifiedElement("native-editor-add-block", in: app).exists)
+        editToggle.tap()
+        XCTAssertTrue(
+            waitUntil(timeout: 5) {
+                !identifiedElement("native-editor-document-actions", in: app).exists
+            }
+        )
+        XCTAssertEqual(editToggle.label, "Edit page")
         XCTAssertTrue(
             elementContainingText("First pending recovery edit", in: app)
                 .waitForExistence(timeout: 5)

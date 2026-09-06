@@ -18,6 +18,9 @@ public struct NativeBlockEditorConfiguration {
     public var showsFormattingToolbar: Bool
     public var showsDocumentToolbar: Bool
     public var allowsBlockReordering: Bool
+    public var isEditable: Bool
+    public var showsTrailingAddBlockRow: Bool
+    public var hiddenBlockIDs: Set<UUID>
     public var enabledBlockTypes: Set<String>?
 
     public init(
@@ -28,6 +31,9 @@ public struct NativeBlockEditorConfiguration {
         showsFormattingToolbar: Bool = true,
         showsDocumentToolbar: Bool = true,
         allowsBlockReordering: Bool = true,
+        isEditable: Bool = true,
+        showsTrailingAddBlockRow: Bool = true,
+        hiddenBlockIDs: Set<UUID> = [],
         enabledBlockTypes: Set<String>? = nil
     ) {
         self.accentColor = accentColor
@@ -37,6 +43,9 @@ public struct NativeBlockEditorConfiguration {
         self.showsFormattingToolbar = showsFormattingToolbar
         self.showsDocumentToolbar = showsDocumentToolbar
         self.allowsBlockReordering = allowsBlockReordering
+        self.isEditable = isEditable
+        self.showsTrailingAddBlockRow = showsTrailingAddBlockRow
+        self.hiddenBlockIDs = hiddenBlockIDs
         self.enabledBlockTypes = enabledBlockTypes
     }
 
@@ -176,7 +185,7 @@ public struct NativeBlockEditorView: View {
         onAskAboutSelection: ((NativeBlockEditorSelection) -> Void)? = nil,
         textAnnotations: [NativeBlockEditorTextAnnotation] = [],
         onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)? = nil,
-        wrapsCodeLines: Binding<Bool> = .constant(true)
+        wrapsCodeLines: Binding<Bool> = .constant(false)
     ) {
         _document = document
         self.configuration = configuration
@@ -201,7 +210,15 @@ public struct NativeBlockEditorView: View {
                 ForEach(visibleBlocks) { block in
                     blockRow(block)
                 }
-                addBlockRow
+                if configuration.isEditable {
+                    if visibleBlocks.isEmpty {
+                        emptyDocumentActions
+                    } else if configuration.showsTrailingAddBlockRow {
+                        addBlockRow
+                    } else {
+                        trailingWritingArea
+                    }
+                }
                 if let footer { footer.padding(.top, 24) }
             }
             .frame(maxWidth: configuration.contentMaxWidth, alignment: .leading)
@@ -212,9 +229,15 @@ public struct NativeBlockEditorView: View {
         }
         .background(Color(uiColor: .systemBackground))
         .tint(configuration.accentColor)
-        .toolbar { if configuration.showsDocumentToolbar { documentToolbar } }
+        .toolbar {
+            if configuration.isEditable, configuration.showsDocumentToolbar {
+                documentToolbar
+            }
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if configuration.showsFormattingToolbar, editingSession.activePath != nil {
+            if configuration.isEditable,
+               configuration.showsFormattingToolbar,
+               editingSession.activePath != nil {
                 formattingToolbar
             }
         }
@@ -245,7 +268,10 @@ public struct NativeBlockEditorView: View {
 
     private var visibleBlocks: [EditorVisibleBlock] {
         _ = revision
-        return Self.flatten(engine.document.root.children)
+        return Self.flatten(
+            engine.document.root.children,
+            hiddenBlockIDs: configuration.hiddenBlockIDs
+        )
     }
 
     @ToolbarContentBuilder
@@ -300,13 +326,13 @@ public struct NativeBlockEditorView: View {
                 }
             }
             .overlay(alignment: .topLeading) {
-                if isManaged, block.depth == 0 {
+                if configuration.isEditable, isManaged, block.depth == 0 {
                     managedBlockHandle(block, isSelected: isSelected)
                 }
             }
             .simultaneousGesture(
                 TapGesture().onEnded {
-                    guard isManaged else { return }
+                    guard configuration.isEditable, isManaged else { return }
                     editingSession.dismissKeyboard()
                     selectedManagedBlockID = block.id
                 }
@@ -325,7 +351,7 @@ public struct NativeBlockEditorView: View {
             }
         }
 
-        if configuration.allowsBlockReordering, block.depth == 0 {
+        if configuration.isEditable, configuration.allowsBlockReordering, block.depth == 0 {
             content.overlay {
                 if draggedBlockID != nil {
                     GeometryReader { geometry in
@@ -666,6 +692,7 @@ public struct NativeBlockEditorView: View {
             accessibilityLabel: block.node.type.replacingOccurrences(of: "_", with: " ").capitalized,
             accessibilityIdentifier: "native-editor-block-\(block.path.identifier)",
             session: editingSession,
+            isEditable: configuration.isEditable,
             onDeltaChange: { replaceText(at: block.path, with: $0) },
             splitsOnReturn: !["code", "nbe/formula"].contains(block.node.type),
             focusRequestID: focusRequest?.path == block.path ? focusRequest?.id : nil,
@@ -722,6 +749,7 @@ public struct NativeBlockEditorView: View {
                 .frame(width: 22, height: 22)
             }
             .buttonStyle(.plain)
+            .disabled(!configuration.isEditable)
         case "bulleted_list":
             Text("•").font(.system(size: 18, weight: .semibold))
         case "numbered_list":
@@ -867,6 +895,38 @@ public struct NativeBlockEditorView: View {
                 .padding(.vertical, 12)
         }
         .accessibilityIdentifier("native-editor-add-block")
+    }
+
+    private var trailingWritingArea: some View {
+        Button {
+            addBlock(.paragraph(), focus: true)
+        } label: {
+            Color.clear
+                .frame(maxWidth: .infinity, minHeight: 52)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Continue writing")
+        .accessibilityHint("Adds a text block at the end of the page")
+        .accessibilityIdentifier("native-editor-continue-writing")
+    }
+
+    private var emptyDocumentActions: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button("Start writing", systemImage: "square.and.pencil") {
+                addBlock(.paragraph(), focus: true)
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("native-editor-start-writing")
+
+            Menu {
+                addBlockButtons
+            } label: {
+                Label("Add another block type", systemImage: "plus")
+            }
+            .accessibilityIdentifier("native-editor-empty-add-block")
+        }
+        .padding(.vertical, 12)
     }
 
     @ViewBuilder
@@ -1266,11 +1326,13 @@ public struct NativeBlockEditorView: View {
     private static func flatten(
         _ nodes: [BlockNode],
         parent: BlockPath = [],
-        depth: Int = 0
+        depth: Int = 0,
+        hiddenBlockIDs: Set<UUID> = []
     ) -> [EditorVisibleBlock] {
         var result: [EditorVisibleBlock] = []
         var nextNumber = 1
         for (index, node) in nodes.enumerated() {
+            guard !hiddenBlockIDs.contains(node.id) else { continue }
             let path = parent.appending(index)
             let number: Int?
             if node.type == "numbered_list" {
@@ -1282,7 +1344,12 @@ public struct NativeBlockEditorView: View {
             }
             result.append(EditorVisibleBlock(node: node, path: path, depth: depth, number: number))
             if !["table", "columns", "column"].contains(node.type) {
-                result.append(contentsOf: flatten(node.children, parent: path, depth: depth + 1))
+                result.append(contentsOf: flatten(
+                    node.children,
+                    parent: path,
+                    depth: depth + 1,
+                    hiddenBlockIDs: hiddenBlockIDs
+                ))
             }
         }
         return result

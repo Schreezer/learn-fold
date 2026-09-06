@@ -421,6 +421,14 @@ private enum MarkdownInlineCodec {
                 index = match.end
                 continue
             }
+            if let match = delimited(source, at: index, opener: "*", closer: "*") {
+                appendPlain()
+                var nested = attributes
+                nested["italic"] = true
+                result.append(contentsOf: parse(match.content, attributes: nested))
+                index = match.end
+                continue
+            }
             if source[index] == "[",
                let closeLabel = source[index...].firstIndex(of: "]"),
                source.index(after: closeLabel) < source.endIndex,

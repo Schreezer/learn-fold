@@ -360,6 +360,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
     let accessibilityLabel: String
     let accessibilityIdentifier: String
     let session: RichTextEditingSession
+    let isEditable: Bool
     let onDeltaChange: (TextDelta) -> Void
     let splitsOnReturn: Bool
     let focusRequestID: UUID?
@@ -389,6 +390,8 @@ struct RichTextBlockEditor: UIViewRepresentable {
         textView.textContainer.lineFragmentPadding = 0
         textView.adjustsFontForContentSizeCategory = true
         textView.keyboardDismissMode = .interactive
+        textView.isEditable = isEditable
+        textView.isSelectable = true
         textView.accessibilityLabel = accessibilityLabel
         textView.accessibilityIdentifier = accessibilityIdentifier
         textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -414,6 +417,11 @@ struct RichTextBlockEditor: UIViewRepresentable {
         context.coordinator.parent = self
         textView.accessibilityLabel = accessibilityLabel
         textView.accessibilityIdentifier = accessibilityIdentifier
+        textView.isEditable = isEditable
+        textView.isSelectable = true
+        if !isEditable, textView.isFirstResponder {
+            textView.resignFirstResponder()
+        }
         configureClipboardCallbacks(textView)
         configureKeyboardCallbacks(textView, coordinator: context.coordinator)
         configureLinkTap(textView, coordinator: context.coordinator)
@@ -434,7 +442,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
             context.coordinator.renderedAnnotationSignature = annotationSignature
         }
 
-        if textView.isFirstResponder {
+        if isEditable, textView.isFirstResponder {
             session.updateConfiguration(
                 for: textView,
                 baseFont: textStyle.font,
@@ -444,7 +452,8 @@ struct RichTextBlockEditor: UIViewRepresentable {
             )
         }
 
-        if let focusRequestID,
+        if isEditable,
+           let focusRequestID,
            context.coordinator.handledFocusRequestID != focusRequestID,
            context.coordinator.scheduledFocusRequestID != focusRequestID {
             context.coordinator.scheduleFocus(
@@ -459,15 +468,15 @@ struct RichTextBlockEditor: UIViewRepresentable {
     private func configureClipboardCallbacks(_ textView: UITextView) {
         guard let textView = textView as? DocumentRichTextView else { return }
         textView.copyHandler = onCopy
-        textView.cutHandler = onCut
-        textView.pasteHandler = onPaste
+        textView.cutHandler = isEditable ? onCut : nil
+        textView.pasteHandler = isEditable ? onPaste : nil
     }
 
     private func configureKeyboardCallbacks(_ textView: UITextView, coordinator: Coordinator) {
         guard let textView = textView as? DocumentRichTextView else { return }
-        textView.deleteBackwardAtEmptyHandler = { [weak coordinator] in
-            coordinator?.parent.onDeleteBackwardAtEmpty()
-        }
+        textView.deleteBackwardAtEmptyHandler = isEditable
+            ? { [weak coordinator] in coordinator?.parent.onDeleteBackwardAtEmpty() }
+            : nil
     }
 
     private func configureLinkTap(_ textView: UITextView, coordinator: Coordinator) {

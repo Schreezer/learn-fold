@@ -481,7 +481,9 @@ final class CourseEditorCheckpointUITests: XCTestCase {
 
         let pageTitle = app.staticTexts["Save recovery evidence"]
         XCTAssertTrue(pageTitle.exists)
-        XCTAssertTrue(app.staticTexts["Editable course page"].exists)
+        XCTAssertFalse(app.staticTexts["Editable course page"].exists)
+        XCTAssertTrue(element("course-page-edit-toggle", in: app).exists)
+        XCTAssertFalse(element("native-editor-add-block", in: app).exists)
         assertBlockValue(
             "native-editor-block-1",
             contains: "First pending recovery edit",

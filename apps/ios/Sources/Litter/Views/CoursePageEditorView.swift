@@ -496,8 +496,7 @@ struct CoursePageEditorView: View {
             runtimeProbeOverlay
         }
 #endif
-        .navigationTitle(model?.title ?? "Course page")
-        .navigationBarTitleDisplayMode(.inline)
+        .navigationTitle("")
         .task(id: loadID) {
             await loadPage(requestID: loadID)
         }
@@ -1504,7 +1503,7 @@ private struct CoursePageSaveRecoveryUITestHarnessView: View {
                     ProgressView("Preparing failed save…")
                 }
             }
-            .navigationTitle("Save recovery")
+            .navigationTitle("")
         }
         .accessibilityIdentifier("courseSaveRecoveryHarness.title")
         .task {
@@ -2142,6 +2141,7 @@ private struct CourseEditorCheckpointUITestValidHarnessView: View {
                     onOpenPage: { destination in
                         Task { await openLinkedPage(destination.id) }
                     },
+                    startsInEditingMode: true,
                     onRetrySave: onRetrySave
                 )
             }
@@ -3010,7 +3010,8 @@ private struct CourseEditorCheckpointUITestValidHarnessView: View {
 
 private struct CoursePageEditorCanvas: View {
     @Bindable var model: CoursePageEditorModel
-    @AppStorage("coursePage.wrapsCodeLines") private var wrapsCodeLines = true
+    @AppStorage("coursePage.wrapsCodeLines") private var wrapsCodeLines = false
+    @State private var isEditing: Bool
     let textAnnotations: [NativeBlockEditorTextAnnotation]
     let onAskAboutSelection: (NativeBlockEditorSelection) -> CourseTextReference?
     let onOpenTextAnnotation: (NativeBlockEditorTextAnnotation) -> Bool
@@ -3023,6 +3024,7 @@ private struct CoursePageEditorCanvas: View {
         onAskAboutSelection: @escaping (NativeBlockEditorSelection) -> CourseTextReference?,
         onOpenTextAnnotation: @escaping (NativeBlockEditorTextAnnotation) -> Bool,
         onOpenPage: @escaping (NativeBlockEditorPageDestination) -> Void,
+        startsInEditingMode: Bool = false,
         onRetrySave: (() -> Void)? = nil
     ) {
         self.model = model
@@ -3030,6 +3032,7 @@ private struct CoursePageEditorCanvas: View {
         self.onAskAboutSelection = onAskAboutSelection
         self.onOpenTextAnnotation = onOpenTextAnnotation
         self.onOpenPage = onOpenPage
+        _isEditing = State(initialValue: startsInEditingMode)
         self.onRetrySave = onRetrySave
     }
 
@@ -3065,18 +3068,16 @@ private struct CoursePageEditorCanvas: View {
                     contentMaxWidth: 760,
                     horizontalPadding: 20,
                     verticalPadding: 18,
-                    showsFormattingToolbar: true,
-                    showsDocumentToolbar: true,
-                    allowsBlockReordering: true
+                    showsFormattingToolbar: isEditing,
+                    showsDocumentToolbar: isEditing,
+                    allowsBlockReordering: isEditing,
+                    isEditable: isEditing,
+                    showsTrailingAddBlockRow: false,
+                    hiddenBlockIDs: leadingTitleBlockIDs
                 ),
                 header: AnyView(
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(model.title)
-                            .font(.system(size: 32, weight: .bold, design: .rounded))
-                        Text("Editable course page")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text(model.title)
+                        .font(.system(size: 32, weight: .bold, design: .rounded))
                     .frame(maxWidth: .infinity, alignment: .leading)
                 ),
                 pageResolver: { pageID in
@@ -3107,12 +3108,52 @@ private struct CoursePageEditorCanvas: View {
                 wrapsCodeLines: $wrapsCodeLines
             )
         }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    setEditing(!isEditing)
+                } label: {
+                    Image(systemName: isEditing ? "checkmark" : "pencil")
+                }
+                .accessibilityLabel(isEditing ? "Finish editing" : "Edit page")
+                .accessibilityHint(
+                    isEditing
+                        ? "Returns to reading mode"
+                        : "Shows page editing controls"
+                )
+                .accessibilityIdentifier("course-page-edit-toggle")
+            }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("course-page-editor-\(model.pageID)")
     }
 
     private var displayedSaveState: CoursePageEditorModel.SaveState {
         model.saveState
+    }
+
+    private var leadingTitleBlockIDs: Set<UUID> {
+        guard let first = model.document.root.children.first,
+              first.type == "heading",
+              normalizedTitle(first.delta?.plainText) == normalizedTitle(model.title) else {
+            return []
+        }
+        return [first.id]
+    }
+
+    private func normalizedTitle(_ value: String?) -> String {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            ?? ""
+    }
+
+    private func setEditing(_ editing: Bool) {
+        isEditing = editing
+        UIAccessibility.post(
+            notification: .announcement,
+            argument: editing ? "Editing mode" : "Reading mode"
+        )
     }
 
 }

@@ -4,6 +4,27 @@ import NativeEditorMCP
 import XCTest
 
 final class AtomicPropertiesTests: XCTestCase {
+    func testSingleAsteriskEmphasisDecodesAsItalic() throws {
+        let document = try AppFlowyMarkdownCodec().decode(
+            "Why is a *different* string not the same commitment?"
+        )
+        let paragraph = try XCTUnwrap(document.root.children.first)
+        let delta = try XCTUnwrap(paragraph.delta)
+
+        XCTAssertEqual(
+            delta.plainText,
+            "Why is a different string not the same commitment?"
+        )
+        XCTAssertTrue(delta.operations.contains { operation in
+            guard case let .insert(text, attributes) = operation else { return false }
+            return text == "different" && attributes?["italic"]?.boolValue == true
+        })
+        XCTAssertEqual(
+            AppFlowyMarkdownCodec().encode(document),
+            "Why is a _different_ string not the same commitment?"
+        )
+    }
+
     func testReplaceContentAppliesPropertiesInOneRevisionCheckedCommit() async throws {
         let (service, directory) = try await makeService()
         defer { try? FileManager.default.removeItem(at: directory) }
