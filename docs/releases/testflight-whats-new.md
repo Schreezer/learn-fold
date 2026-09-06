@@ -2,6 +2,7 @@
 
 ## Summary
 
+- Course replies now render bold, italics, headings, lists, links, code blocks, and tables, including while replies stream.
 - Fixed stale history replacing Apple and focused-discussion messages, and kept focused tools in the correct course workspace.
 - Fixed chained Hosted tools finishing early and surfaced model stream errors instead of silently dropping them.
 - Fixed Hosted continuing after plan tools and corrected interrupted-reply recovery so already-sent messages stay in the conversation.
@@ -25,6 +26,7 @@ Learnfold is an early external beta. Visible adaptation, reassessment, citations
 6. Ask a question from inside a course and confirm the response stays scoped to that course.
 7. Pair or reconnect a Hermes server and confirm its connection state is accurate throughout the flow.
 8. Confirm the app icon has a pure black background on the Home Screen and in TestFlight.
+9. Ask Hosted for a formatted explanation with a numbered list and code sample. Check formatting in light and dark mode and with larger text.
 
 ## Feedback
 

@@ -1,4 +1,5 @@
 import PhotosUI
+@preconcurrency import HairballUI
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -2706,10 +2707,14 @@ private struct CourseMessageRow: View {
                 }
 
                 if !message.text.isEmpty {
-                    Text(message.text)
-                        .font(.body)
-                        .foregroundStyle(message.role == .learner ? .white : .primary)
-                        .textSelection(.enabled)
+                    if message.role == .agent {
+                        CourseMarkdownMessageView(markdown: message.text)
+                    } else {
+                        Text(message.text)
+                            .font(.body)
+                            .foregroundStyle(.white)
+                            .textSelection(.enabled)
+                    }
                 }
             }
             .padding(.horizontal, 14)
@@ -2728,6 +2733,77 @@ private struct CourseMessageRow: View {
             if message.role == .agent { Spacer(minLength: 34) }
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+// Course replies use the same Markdown engine as remote-agent messages, with
+// the native course chat typography and semantic colors.
+struct CourseMarkdownMessageView: View {
+    let markdown: String
+    @Environment(\.colorScheme) private var colorScheme
+    @ScaledMetric(relativeTo: .body) private var bodySize: CGFloat = 17
+    @ScaledMetric(relativeTo: .body) private var codeSize: CGFloat = 15
+
+    private var theme: MarkdownTheme {
+        var theme = MarkdownTheme.default
+        theme.bodyFont = .system(size: bodySize)
+        theme.bodyFontSize = bodySize
+        theme.foregroundColor = .primary
+        theme.paragraphSpacing = 10
+        theme.blockSpacing = 10
+        theme.link = LinkStyle(color: .blue, underline: true)
+        theme.inlineCode = InlineCodeStyle(
+            backgroundColor: Color(uiColor: .tertiarySystemFill),
+            textColor: .primary,
+            font: .system(size: codeSize, design: .monospaced),
+            fontSize: codeSize
+        )
+        theme.codeBlock = CodeBlockStyle(
+            backgroundColor: Color(uiColor: .tertiarySystemFill),
+            textColor: .primary,
+            font: .system(size: codeSize, design: .monospaced),
+            fontSize: codeSize,
+            cornerRadius: 8
+        )
+        theme.table = TableStyle(
+            borderStyle: .solid(color: Color(uiColor: .separator), width: 0.5),
+            headerBackground: Color(uiColor: .tertiarySystemFill),
+            backgroundStyle: .none,
+            fontSize: codeSize,
+            cornerRadius: 8
+        )
+        for level in 1...6 {
+            theme.headingStyles[level] = HeadingStyle(
+                fontSize: bodySize * (level == 1 ? 1.4 : level == 2 ? 1.2 : 1),
+                weight: .bold,
+                topSpacing: 10,
+                bottomSpacing: 6,
+                color: .primary
+            )
+        }
+        return theme
+    }
+
+    var body: some View {
+        MarkdownView(markdown)
+            .markdownTheme(theme)
+            .codeSyntaxHighlighter(CourseCodeHighlighter(colorScheme: colorScheme, fontSize: codeSize))
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct CourseCodeHighlighter: CodeSyntaxHighlighter {
+    let colorScheme: ColorScheme
+    let fontSize: CGFloat
+
+    func highlightCode(_ code: String, language: String?) -> AttributedString {
+        let highlighter = colorScheme == .dark
+            ? HighlightrCodeSyntaxHighlighter.githubDark
+            : HighlightrCodeSyntaxHighlighter.github
+        var text = highlighter.highlightCode(code, language: language)
+        text.font = .system(size: fontSize, design: .monospaced)
+        return text
     }
 }
 

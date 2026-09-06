@@ -19103,6 +19103,68 @@ final class HostedCourseTranscriptTests: XCTestCase {
         XCTAssertEqual(store.localMessages(for: nil).last?.text, "Let's start with percentages.")
     }
 
+    func testHostedMarkdownReplyRendersDuringStreamingAndAfterCompletion() async throws {
+        let reply = """
+        Hi again! 😊
+
+        No need to answer everything. The fastest path:
+
+        1. **What topic** do you want to learn?
+        2. **What's your end goal?**
+        3. **Where are you now?** Just one word is fine: *beginner / some experience / comfortable*.
+
+        ### A small example
+        Try `print("Hello")` or read the [Python tutorial](https://docs.python.org/3/tutorial/).
+
+        - Keep the first lesson short.
+        - ~~Memorize everything~~ Practice one thing.
+
+        > We'll build from what you already know.
+
+        ```python
+        print("Hello")
+        ```
+        """
+        XCTAssertTrue(store.sendMessage("Hi", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        runtime.emitPartialResponse("Hi again! 😊\n\n1. **What topic")
+        try await captureChat(named: "Course Markdown with an unfinished streaming span")
+        runtime.emitPartialResponse(reply)
+        XCTAssertEqual(store.localMessages(for: nil).last?.text, reply)
+        try await captureChat(named: "Course Markdown formatted while streaming")
+        runtime.finalResponse = reply
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.localMessages(for: nil).last?.text, reply)
+        try await captureChat(named: "Course Markdown completed reply")
+        try await captureChat(named: "Course Markdown dark appearance", colorScheme: .dark)
+    }
+
+    func testHostedMarkdownCodeAndTablesRemainReadable() async throws {
+        let reply = """
+        ## Try this
+
+        ```python
+        print("Hello, learner!")
+        ```
+
+        | Concept | Meaning |
+        | --- | --- |
+        | **Variable** | A named value |
+        | *Loop* | Repeat a step |
+
+        > Start small, then experiment.
+        """
+        runtime.finalResponse = reply
+        XCTAssertTrue(store.sendMessage("Show an example", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        runtime.finishSend()
+        try await waitForTurn()
+        try await captureChat(named: "Course Markdown code and table")
+        try await captureChat(named: "Course Markdown code and table dark", colorScheme: .dark)
+        try await captureChat(named: "Course Markdown larger text", dynamicTypeSize: .xxxLarge)
+    }
+
     func testHistoryStartedDuringSendDoesNotReplaceActiveTranscript() async throws {
         XCTAssertTrue(store.sendMessage("Teach me percentages", appModel: appModel, appState: AppState()))
         await runtime.waitForSend()
@@ -19309,9 +19371,11 @@ final class HostedCourseTranscriptTests: XCTestCase {
         return discussion
     }
 
-    private func captureChat(named name: String) async throws {
+    private func captureChat(named name: String, colorScheme: ColorScheme = .light, dynamicTypeSize: DynamicTypeSize = .large) async throws {
         let host = UIHostingController(rootView:
             NavigationStack { CourseChatView(store: store) }
+                .preferredColorScheme(colorScheme)
+                .dynamicTypeSize(dynamicTypeSize)
                 .environment(appModel)
                 .environment(AppState())
         )
