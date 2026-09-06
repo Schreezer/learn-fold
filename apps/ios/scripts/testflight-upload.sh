@@ -111,6 +111,19 @@ resolve_requested_testflight_version() {
     echo "$resolved_version"
 }
 
+build_beta_detail_json() {
+    local build_id="$1"
+
+    # Homebrew's `asc` has renamed this subcommand and its build flag across
+    # releases. The CI runner installs the current formula, so support both
+    # command shapes while keeping the rest of the upload flow version-agnostic.
+    if asc builds build-beta-detail get --help >/dev/null 2>&1; then
+        asc builds build-beta-detail get --build "$build_id" --output json
+    else
+        asc builds build-beta-detail view --build-id "$build_id" --output json
+    fi
+}
+
 persist_build_metadata() {
     cat >"$BUILD_METADATA_PATH" <<EOF
 BUILD_NUMBER=$(printf '%q' "$BUILD_NUMBER")
@@ -370,7 +383,7 @@ fi
 
 if [[ -n "$build_id" && "$AUTO_ASSIGN_ENCRYPTION_DECLARATION" == "1" ]]; then
     internal_state="$(
-        asc builds build-beta-detail get --build "$build_id" --output json |
+        build_beta_detail_json "$build_id" |
             jq -r '.data.attributes.internalBuildState // empty'
     )"
     if [[ "$internal_state" == "MISSING_EXPORT_COMPLIANCE" ]]; then
