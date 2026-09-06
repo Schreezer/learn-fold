@@ -149,7 +149,6 @@ export class HostedCourseAgent extends Think<HostedEnv> {
       instructions: `${context.system}\n\nCurrent Learnfold workspace_id: ${workspaceID}${approvalInstructions}`,
       activeTools,
       maxSteps: this.name.startsWith("guest-") ? 12 : 24,
-      maxOutputTokens: this.name.startsWith("guest-") ? 8192 : undefined,
       sendReasoning: false,
       // Genuine activity extends idle waits, but each model step stays bounded.
       timeout: { stepMs: PROVIDER_STEP_TIMEOUT_MS },

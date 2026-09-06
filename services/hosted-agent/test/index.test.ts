@@ -123,6 +123,7 @@ describe("hosted agent worker", () => {
     expect(result.text).toBe("ok")
     expect(url).toBe(`${OPENCODE_BASE_URL}/responses`)
     expect(sent.store).toBe(false)
+    expect(sent).not.toHaveProperty("max_output_tokens")
     expect(sent).not.toHaveProperty("reasoning")
     expect(sent).not.toHaveProperty("messages")
     expect(sent.input).toBeDefined()
@@ -166,6 +167,7 @@ describe("hosted agent worker", () => {
     ] })
     expect(second.text).toBe("The lesson says hello.")
     expect(requests[1].store).toBe(false)
+    expect(requests[1]).not.toHaveProperty("max_output_tokens")
     expect(requests[1].input).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "function_call", call_id: "call_test" }),
       expect.objectContaining({ type: "function_call_output", call_id: "call_test", output: '{"content":"hello"}' }),
@@ -180,6 +182,16 @@ describe("Hosted course workspace continuity", () => {
   function context(body?: Record<string, unknown>, continuation = false): TurnContext {
     return { body, continuation, messages: [], tools: {}, system: "Course agent", model: createHostedModel("test-key") }
   }
+
+  it.each(["guest", "test"])("does not cap output tokens for %s turns or continuations", async (prefix) => {
+    const subject = crypto.randomUUID().replaceAll("-", "").repeat(2)
+    const name = `${prefix}-${subject}-${crypto.randomUUID()}`
+    const stub = await getAgentByName(env.HostedCourseAgent, name)
+    await runInDurableObject(stub, async (agent) => {
+      expect((await agent.beforeTurn(context({ workspaceId: "course-a" }))).maxOutputTokens).toBeUndefined()
+      expect((await agent.beforeTurn(context(undefined, true))).maxOutputTokens).toBeUndefined()
+    })
+  })
 
   it("keeps the workspace for body-less tool continuations in durable storage", async () => {
     const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
