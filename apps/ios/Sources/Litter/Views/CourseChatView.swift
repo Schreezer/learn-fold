@@ -3,6 +3,27 @@ import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
+struct HostedReplyProgressView: View {
+    let progress: HostedReplyProgress
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            if let label = progress.label(at: context.date) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(label)
+                        .font(.subheadline)
+                    Text("You can stop this reply at any time.")
+                        .font(.caption)
+                }
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("hosted-reply-progress")
+            } else {
+                TypingIndicator()
+            }
+        }
+    }
+}
+
 enum CourseRequestLifecycle: String, Equatable {
     case optimistic
     case thinking
@@ -1090,17 +1111,17 @@ struct CourseChatView: View {
                                             Text("Stopping…")
                                                 .font(.subheadline)
                                                 .foregroundStyle(.secondary)
+                                        } else if displayedAgentID == CourseAgentProvider.hosted,
+                                                  let progress = store.hostedReplyProgress[
+                                                    CourseChatScope(selectionDiscussionID: selectionDiscussionID)
+                                                  ] {
+                                            HostedReplyProgressView(progress: progress)
                                         } else {
                                             TypingIndicator()
                                         }
                                         Spacer()
                                     }
                                     .accessibilityElement(children: .combine)
-                                    .accessibilityLabel(
-                                        isStoppingAgent
-                                            ? "Stopping \(displayedAgentID.displayLabel)"
-                                            : "\(displayedAgentID.displayLabel) is thinking"
-                                    )
                                 }
                             }
                             .id("course-agent-working")

@@ -19066,6 +19066,61 @@ final class HostedCourseTranscriptTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testHostedRecoveryIsVisibleAndClearsAfterResponseAndCompletion() async throws {
+        XCTAssertTrue(store.sendMessage("Explain SNARKs", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        XCTAssertNotNil(store.hostedReplyProgress[.main])
+        runtime.recoveryChanged?(true)
+        XCTAssertEqual(store.hostedReplyProgress[.main]?.label(at: Date()), "Hosted is retrying…")
+        try await captureChat(named: "Hosted retry status preserves the learner message")
+        runtime.emitPartialResponse("A SNARK is a short proof.")
+        XCTAssertFalse(try XCTUnwrap(store.hostedReplyProgress[.main]).isRecovering)
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertNil(store.hostedReplyProgress[.main])
+        // A late callback from a finished request cannot revive its indicator.
+        runtime.recoveryChanged?(true)
+        XCTAssertNil(store.hostedReplyProgress[.main])
+    }
+
+    func testHostedLongWaitKeepsTheMessageVisibleAndCompletesNormally() async throws {
+        XCTAssertTrue(store.sendMessage("Build me a deep course on SNARKs", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        try await Task.sleep(for: .seconds(31))
+        XCTAssertEqual(store.hostedReplyProgress[.main]?.label(at: Date()), "Waiting for Hosted…")
+        XCTAssertTrue(store.isAgentRequestPending)
+        XCTAssertEqual(store.localMessages(for: nil).map(\.text), ["Build me a deep course on SNARKs"])
+        try await captureChat(named: "Hosted long wait with visible message and stop control")
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertNil(store.hostedReplyProgress[.main])
+    }
+
+    func testHostedProgressExplainsLongWaitWithoutClaimingFailure() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        var progress = HostedReplyProgress(lastProgressAt: start)
+        XCTAssertNil(progress.label(at: start.addingTimeInterval(29)))
+        XCTAssertEqual(progress.label(at: start.addingTimeInterval(30)), "Waiting for Hosted…")
+        progress.isRecovering = true
+        XCTAssertEqual(progress.label(at: start), "Hosted is retrying…")
+        progress.isRecovering = false
+        progress.lastProgressAt = start.addingTimeInterval(60)
+        XCTAssertNil(progress.label(at: start.addingTimeInterval(61)))
+    }
+
+    func testHostedRecoveryAndTextCallbacksKeepDeliveryOrder() async {
+        var events: [String] = []
+        let listener = HostedCourseEventListener(
+            onPartialResponse: { events.append($0) },
+            onRecoveringChanged: { events.append($0 ? "retrying" : "resumed") }
+        )
+        listener.onRecoveringChanged(recovering: true)
+        listener.onRecoveringChanged(recovering: false)
+        listener.onResponseDelta(delta: "Answer")
+        await listener.finishDelivery()
+        XCTAssertEqual(events, ["retrying", "resumed", "Answer"])
+    }
+
     func testDelayedEmptyHistoryKeepsFirstMessageAndStreamingResponse() async throws {
         let hydration = Task { await store.hydrateCourseThread(appModel: appModel, appState: AppState()) }
         await runtime.waitForRestore()
@@ -19250,7 +19305,7 @@ final class HostedCourseTranscriptTests: XCTestCase {
 
     func testHostedQueuedResponseDeliveryFinishesInOrderBeforeFailureClassification() async {
         var partials: [String] = []
-        let listener = HostedCourseEventListener { partials.append($0) }
+        let listener = HostedCourseEventListener(onPartialResponse: { partials.append($0) })
         listener.onResponseDelta(delta: "First ")
         listener.onResponseDelta(delta: "response")
         await listener.finishDelivery()
@@ -19420,6 +19475,7 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
     private var restoreReleased = false
     private var sendReleased = false
     private var sendStarted = false
+    var recoveryChanged: (@MainActor (Bool) -> Void)?
     private var partialResponse: (@MainActor (String) -> Void)?
 
     func availability() -> HostedCourseAgentAvailability {
@@ -19441,10 +19497,12 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
         workspaceID: String,
         courseDirectory: URL,
         prompt: String,
+        onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
         lastCourseDirectory = courseDirectory
+        recoveryChanged = onRecoveringChanged
         partialResponse = onPartialResponse
         defer { partialResponse = nil }
         sendStarted = true

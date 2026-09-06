@@ -1,6 +1,19 @@
 import Foundation
 import Security
 
+/// Transient presentation of a Hosted request, never persisted as runtime state.
+struct HostedReplyProgress: Equatable {
+    var id = UUID()
+    var lastProgressAt = Date()
+    var isRecovering = false
+
+    func label(at date: Date) -> String? {
+        if isRecovering { return "Hosted is retrying…" }
+        if date.timeIntervalSince(lastProgressAt) >= 30 { return "Waiting for Hosted…" }
+        return nil
+    }
+}
+
 struct HostedCourseAgentAvailability: Equatable {
     let available: Bool
     let reason: String
@@ -25,6 +38,7 @@ protocol HostedCourseAgentRuntime: AnyObject {
         workspaceID: String,
         courseDirectory: URL,
         prompt: String,
+        onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws
@@ -88,6 +102,7 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         workspaceID: String,
         courseDirectory: URL,
         prompt: String,
+        onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
@@ -107,7 +122,10 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
             courseDirectory: courseDirectory,
             onCoursePlan: onCoursePlan
         )
-        let listener = HostedCourseEventListener(onPartialResponse: onPartialResponse)
+        let listener = HostedCourseEventListener(
+            onPartialResponse: onPartialResponse,
+            onRecoveringChanged: onRecoveringChanged
+        )
         let client = try client()
         let task = Task {
             try await client.send(
@@ -231,8 +249,14 @@ final class HostedCourseEventListener: HostedAgentEventListener, @unchecked Send
     private var pendingDelivery: Task<Void, Never>?
     private let onPartialResponse: @MainActor (String) -> Void
 
-    init(onPartialResponse: @escaping @MainActor (String) -> Void) {
+    private let onRecoveringChanged: @MainActor (Bool) -> Void
+
+    init(
+        onPartialResponse: @escaping @MainActor (String) -> Void,
+        onRecoveringChanged: @escaping @MainActor (Bool) -> Void = { _ in }
+    ) {
         self.onPartialResponse = onPartialResponse
+        self.onRecoveringChanged = onRecoveringChanged
     }
 
     func onResponseDelta(delta: String) {
@@ -257,7 +281,15 @@ final class HostedCourseEventListener: HostedAgentEventListener, @unchecked Send
         return pendingDelivery
     }
 
-    func onRecoveringChanged(recovering: Bool) {}
+    func onRecoveringChanged(recovering: Bool) {
+        lock.lock()
+        let previous = pendingDelivery
+        pendingDelivery = Task { @MainActor [onRecoveringChanged] in
+            await previous?.value
+            onRecoveringChanged(recovering)
+        }
+        lock.unlock()
+    }
 }
 
 private final class HostedCourseToolHandler: HostedAgentToolHandler, @unchecked Sendable {

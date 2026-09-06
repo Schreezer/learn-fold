@@ -2709,6 +2709,8 @@ final class CourseExperienceStore {
     var agentNeedsAuthentication = false
     var generationError: String?
     private var chatRuns = CourseChatRunRegistry()
+    // Presentation timestamps only; transport recovery and timeouts are Rust-owned.
+    private(set) var hostedReplyProgress: [CourseChatScope: HostedReplyProgress] = [:]
     private var backgroundGenerations = CourseBackgroundGenerationRegistry()
     var courseChatDraft: String?
     private(set) var mainSubmissionRecoveryState: CourseAgentSubmissionRecoveryState?
@@ -3828,6 +3830,7 @@ final class CourseExperienceStore {
         agentForwardTasks.values.forEach { $0.cancel() }
         agentForwardTasks.removeAll()
         chatRuns.reset()
+        hostedReplyProgress.removeAll()
         backgroundGenerations.reset()
         generationTask?.cancel()
         backgroundNodeGenerationTask?.cancel()
@@ -9588,6 +9591,14 @@ final class CourseExperienceStore {
         selectionContextID: UUID?,
         selectionDiscussionID: UUID?
     ) async throws {
+        let scope = CourseChatScope(selectionDiscussionID: selectionDiscussionID)
+        let progressID = UUID()
+        hostedReplyProgress[scope] = HostedReplyProgress(id: progressID)
+        defer {
+            if hostedReplyProgress[scope]?.id == progressID {
+                hostedReplyProgress[scope] = nil
+            }
+        }
         let responseMessage = CourseChatMessage(
             role: .agent,
             text: "",
@@ -9605,8 +9616,18 @@ final class CourseExperienceStore {
                 workspaceID: workspaceID,
                 courseDirectory: coursesRootURL.appendingPathComponent(workspaceID, isDirectory: true),
                 prompt: text,
+                onRecoveringChanged: { [weak self] recovering in
+                    guard let self, self.hostedReplyProgress[scope]?.id == progressID else { return }
+                    self.hostedReplyProgress[scope]?.isRecovering = recovering
+                },
                 onPartialResponse: { [weak self] partial in
-                    if !partial.isEmpty { onAccepted() }
+                    if !partial.isEmpty {
+                        onAccepted()
+                        if self?.hostedReplyProgress[scope]?.id == progressID {
+                            self?.hostedReplyProgress[scope]?.lastProgressAt = Date()
+                            self?.hostedReplyProgress[scope]?.isRecovering = false
+                        }
+                    }
                     self?.updateLocalAgentMessage(
                         id: responseMessage.id,
                         text: partial,

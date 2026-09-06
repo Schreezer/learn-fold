@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -253,11 +254,16 @@ impl HostedAgentClient {
         let mut response_text = String::new();
         let mut handled_tool_calls = HashSet::new();
         let mut stream = HostedStreamState::new(request_id);
+        let mut progress_deadline = Instant::now() + FRAME_TIMEOUT;
 
         loop {
-            let frame =
-                next_json_or_cancel(&mut socket, &mut cancellation.receiver, &stream.request_id)
-                    .await?;
+            let frame = next_json_or_cancel(
+                &mut socket,
+                &mut cancellation.receiver,
+                &stream.request_id,
+                progress_deadline,
+            )
+            .await?;
             match frame.get("type").and_then(Value::as_str) {
                 Some("cf_agent_stream_resuming") => {
                     if let Some(id) = frame.get("id").and_then(Value::as_str) {
@@ -310,6 +316,11 @@ impl HostedAgentClient {
                         continue;
                     };
 
+                    // Recovery notifications, history snapshots and stale responses
+                    // must not keep an otherwise stalled request alive forever.
+                    if chunk_makes_progress(&chunk) {
+                        progress_deadline = Instant::now() + FRAME_TIMEOUT;
+                    }
                     if let Some(error) = stream_chunk_error(&chunk) {
                         return Err(error);
                     }
@@ -352,6 +363,9 @@ impl HostedAgentClient {
                         )
                         .await?;
                         stream.awaiting_continuation = true;
+                        // Platform tool execution can take time. The continuation
+                        // gets its own full inactivity window after the result.
+                        progress_deadline = Instant::now() + FRAME_TIMEOUT;
                     }
                 }
                 _ => {}
@@ -725,18 +739,42 @@ async fn next_json_or_cancel(
     socket: &mut Socket,
     cancellation: &mut watch::Receiver<bool>,
     request_id: &str,
+    progress_deadline: Instant,
 ) -> Result<Value, HostedAgentError> {
     tokio::select! {
-        result = next_json(socket) => result,
+        // Prefer expiry even when the peer continuously sends irrelevant frames.
+        biased;
         changed = cancellation.changed() => {
             if changed.is_ok() && *cancellation.borrow() {
-                let _ = send_json(socket, &json!({
+                let _ = tokio::time::timeout(CONNECT_TIMEOUT, send_json(socket, &json!({
                     "type": "cf_agent_chat_request_cancel",
                     "id": request_id,
-                })).await;
+                }))).await;
             }
             Err(HostedAgentError::Cancelled)
-        }
+        },
+        _ = tokio::time::sleep_until(progress_deadline) => {
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, send_json(socket, &json!({
+                "type": "cf_agent_chat_request_cancel",
+                "id": request_id,
+            }))).await;
+            Err(HostedAgentError::Connection {
+                detail: "the hosted agent stopped responding".into(),
+            })
+        },
+        result = next_json_without_timeout(socket) => result,
+    }
+}
+
+fn chunk_makes_progress(chunk: &Value) -> bool {
+    match chunk.get("type").and_then(Value::as_str) {
+        Some("text-delta" | "reasoning-delta" | "tool-input-delta") => chunk
+            .get("delta")
+            .or_else(|| chunk.get("inputTextDelta"))
+            .and_then(Value::as_str)
+            .is_some_and(|delta| !delta.is_empty()),
+        Some("tool-input-available" | "tool-call") => tool_call(chunk).is_some(),
+        _ => false,
     }
 }
 
@@ -755,6 +793,78 @@ fn protocol_error(error: impl std::fmt::Display) -> HostedAgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_actual_response_content_extends_the_inactivity_window() {
+        assert!(chunk_makes_progress(
+            &json!({"type":"text-delta", "delta":"Hi"})
+        ));
+        assert!(chunk_makes_progress(
+            &json!({"type":"tool-input-delta", "inputTextDelta":"{}"})
+        ));
+        for chunk in [
+            json!({"type":"text-delta", "delta":""}),
+            json!({"type":"start"}),
+            json!({"type":"finish-step"}),
+            json!({"type":"cf_agent_chat_recovering", "recovering":true}),
+        ] {
+            assert!(!chunk_makes_progress(&chunk));
+        }
+    }
+
+    #[tokio::test]
+    async fn irrelevant_frames_cannot_extend_a_stalled_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            loop {
+                // Send a recovery notification after every frame the client reads.
+                ws.send(WsMessage::Text(
+                    json!({
+                        "type":"cf_agent_chat_recovering", "recovering":true
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {},
+                    frame = ws.next() => {
+                        let frame = frame.unwrap().unwrap();
+                        let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                        assert_eq!(value["type"], "cf_agent_chat_request_cancel");
+                        assert_eq!(value["id"], "stalled-request");
+                        break;
+                    }
+                }
+            }
+        });
+        let (mut socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let (_sender, mut cancellation) = watch::channel(false);
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match next_json_or_cancel(
+                    &mut socket,
+                    &mut cancellation,
+                    "stalled-request",
+                    deadline,
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .expect("background traffic must not postpone timeout");
+        assert!(matches!(result, HostedAgentError::Connection { .. }));
+        server.await.unwrap();
+    }
 
     #[test]
     fn guest_identity_requires_a_secure_endpoint_and_random_secret() {
