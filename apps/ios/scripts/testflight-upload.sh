@@ -114,14 +114,9 @@ resolve_requested_testflight_version() {
 build_beta_detail_json() {
     local build_id="$1"
 
-    # Homebrew's `asc` has renamed this subcommand and its build flag across
-    # releases. The CI runner installs the current formula, so support both
-    # command shapes while keeping the rest of the upload flow version-agnostic.
-    if asc builds build-beta-detail get --help >/dev/null 2>&1; then
-        asc builds build-beta-detail get --build "$build_id" --output json
-    else
-        asc builds build-beta-detail view --build-id "$build_id" --output json
-    fi
+    # Homebrew's current `asc` release exposes beta detail via `view` and
+    # consistently uses `--build-id` across TestFlight build operations.
+    asc builds build-beta-detail view --build-id "$build_id" --output json
 }
 
 persist_build_metadata() {
@@ -395,7 +390,7 @@ if [[ -n "$build_id" && "$AUTO_ASSIGN_ENCRYPTION_DECLARATION" == "1" ]]; then
             echo "==> Assigning build $build_id to encryption declaration $declaration_id"
             asc encryption declarations assign-builds \
                 --id "$declaration_id" \
-                --build "$build_id" \
+                --build-id "$build_id" \
                 --output json >/dev/null || true
         fi
     fi
@@ -405,12 +400,12 @@ if [[ -n "$build_id" && -n "$WHAT_TO_TEST" ]]; then
     echo "==> Ensuring What to Test notes are set for $WHAT_TO_TEST_LOCALE"
     # Try update first (works if localization already exists), fall back to create.
     if ! asc builds test-notes update \
-            --build "$build_id" \
+            --build-id "$build_id" \
             --locale "$WHAT_TO_TEST_LOCALE" \
             --whats-new "$WHAT_TO_TEST" \
             --output json >/dev/null 2>&1; then
         asc builds test-notes create \
-            --build "$build_id" \
+            --build-id "$build_id" \
             --locale "$WHAT_TO_TEST_LOCALE" \
             --whats-new "$WHAT_TO_TEST" \
             --output json >/dev/null
@@ -463,7 +458,7 @@ if [[ "$ASSIGN_BETA_GROUP" == "1" && -n "$build_id" ]]; then
         deadline="$(( $(date +%s) + BUILD_POLL_TIMEOUT_SECONDS ))"
         assigned=0
         while [[ "$(date +%s)" -lt "$deadline" ]]; do
-            if asc builds add-groups --build "$build_id" --group "$group_csv" --output json >/dev/null 2>&1; then
+            if asc builds add-groups --build-id "$build_id" --group "$group_csv" --output json >/dev/null 2>&1; then
                 assigned=1
                 break
             fi
@@ -476,14 +471,14 @@ if [[ "$ASSIGN_BETA_GROUP" == "1" && -n "$build_id" ]]; then
 
         if [[ "$SUBMIT_BETA_REVIEW" == "1" && "$external_group_requested" -eq 1 ]]; then
             echo "==> Submitting build $build_id for Beta App Review"
-            asc testflight review submit --build "$build_id" --confirm --output json >/dev/null
+            asc testflight review submit --build-id "$build_id" --confirm --output json >/dev/null
         fi
     fi
 fi
 
 if [[ -n "$build_id" ]]; then
     echo "==> Validating TestFlight readiness"
-    asc validate testflight --app "$APP_STORE_APP_ID" --build "$build_id" --strict --output json >/dev/null
+    asc validate testflight --app "$APP_STORE_APP_ID" --build-id "$build_id" --strict --output json >/dev/null
 fi
 
 if [[ "$PROJECT_VERSION_BUMP_REQUIRED" == "1" ]]; then
