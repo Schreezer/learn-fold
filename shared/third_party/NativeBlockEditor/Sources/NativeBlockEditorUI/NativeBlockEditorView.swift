@@ -153,6 +153,8 @@ public struct NativeBlockEditorView: View {
     private let configuration: NativeBlockEditorConfiguration
     private let header: AnyView?
     private let footer: AnyView?
+    private let initialReadingPosition: NativeBlockEditorReadingPosition?
+    private let onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)?
     private let pageResolver: PageResolver?
     private let onOpenPage: ((NativeBlockEditorPageDestination) -> Void)?
     private let onOpenURL: ((URL) -> Bool)?
@@ -185,12 +187,16 @@ public struct NativeBlockEditorView: View {
         onAskAboutSelection: ((NativeBlockEditorSelection) -> Void)? = nil,
         textAnnotations: [NativeBlockEditorTextAnnotation] = [],
         onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)? = nil,
-        wrapsCodeLines: Binding<Bool> = .constant(false)
+        wrapsCodeLines: Binding<Bool> = .constant(false),
+        initialReadingPosition: NativeBlockEditorReadingPosition? = nil,
+        onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)? = nil
     ) {
         _document = document
         self.configuration = configuration
         self.header = header
         self.footer = footer
+        self.initialReadingPosition = initialReadingPosition
+        self.onReadingPositionChange = onReadingPositionChange
         self.pageResolver = pageResolver
         self.onOpenPage = onOpenPage
         self.onOpenURL = onOpenURL
@@ -203,23 +209,34 @@ public struct NativeBlockEditorView: View {
         _engine = State(initialValue: BlockDocumentEngine(document: Self.anchored(document.wrappedValue)))
     }
 
+    @ViewBuilder
+    private var canvasContent: some View {
+        if let header { header.padding(.bottom, 12) }
+        ForEach(visibleBlocks) { block in
+            blockRow(block)
+        }
+        if configuration.isEditable {
+            if visibleBlocks.isEmpty {
+                emptyDocumentActions
+            } else if configuration.showsTrailingAddBlockRow {
+                addBlockRow
+            } else {
+                trailingWritingArea
+            }
+        }
+        if let footer { footer.padding(.top, 24) }
+    }
+
     public var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                if let header { header.padding(.bottom, 12) }
-                ForEach(visibleBlocks) { block in
-                    blockRow(block)
+            Group {
+                if onReadingPositionChange != nil {
+                    // Eager reading layout gives restoration stable content geometry,
+                    // including a long block in the middle of an article.
+                    VStack(alignment: .leading, spacing: 0) { canvasContent }
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 0) { canvasContent }
                 }
-                if configuration.isEditable {
-                    if visibleBlocks.isEmpty {
-                        emptyDocumentActions
-                    } else if configuration.showsTrailingAddBlockRow {
-                        addBlockRow
-                    } else {
-                        trailingWritingArea
-                    }
-                }
-                if let footer { footer.padding(.top, 24) }
             }
             .frame(maxWidth: configuration.contentMaxWidth, alignment: .leading)
             .padding(.horizontal, configuration.horizontalPadding)
@@ -227,6 +244,12 @@ public struct NativeBlockEditorView: View {
             .padding(.bottom, 72)
             .frame(maxWidth: .infinity)
         }
+        .modifier(NativeBlockEditorReadingModifier(
+            initialPosition: initialReadingPosition,
+            onChange: onReadingPositionChange.map { callback in
+                { position in if !configuration.isEditable { callback(position) } }
+            }
+        ))
         .background(Color(uiColor: .systemBackground))
         .tint(configuration.accentColor)
         .toolbar {

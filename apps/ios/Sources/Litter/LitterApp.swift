@@ -208,6 +208,7 @@ enum DebugLaunchSignalAuthorityCategory: String, Equatable {
 enum DebugLaunchSignalAuthorityInventory {
     static let legacyPrimaryArguments: Set<String> = [
         "--ui-test-course-draft-recovery",
+        "--ui-test-course-reading",
         "--ui-test-course-generation-control",
         "--ui-test-course-retry",
         "--ui-test-course-save-recovery",
@@ -1957,7 +1958,10 @@ struct ContentView: View {
                 Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
 
                 #if DEBUG
-                if MarketingScreenshotHarnessView.isEnabled {
+                if CourseReadingUITestHarness.isEnabled {
+                    CourseReadingUITestHarness()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if MarketingScreenshotHarnessView.isEnabled {
                     MarketingScreenshotHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseRetryUITestHarnessView.isEnabled {

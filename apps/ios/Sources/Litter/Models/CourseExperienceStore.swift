@@ -7839,6 +7839,40 @@ final class CourseExperienceStore {
         )
     }
 
+    private(set) var readingProgressVersion = 0
+
+    func readingBookmark(for course: LearningCourse) -> CourseReadingBookmark? {
+        _ = readingProgressVersion
+        guard let data = defaults.data(forKey: readingBookmarkKey(for: course)) else { return nil }
+        return try? JSONDecoder().decode(CourseReadingBookmark.self, from: data)
+    }
+
+    func saveReadingBookmark(_ bookmark: CourseReadingBookmark, for course: LearningCourse) {
+        guard bookmark.offset.isFinite, bookmark.offset >= 0,
+              let data = try? JSONEncoder().encode(bookmark) else { return }
+        let previousPageID = readingBookmark(for: course)?.pageID
+        defaults.set(data, forKey: readingBookmarkKey(for: course))
+        // The course action only changes when the destination changes. Offset
+        // saves must not redraw the course tree behind the reader every frame.
+        if previousPageID != bookmark.pageID { readingProgressVersion &+= 1 }
+    }
+
+    private func readingBookmarkKey(for course: LearningCourse) -> String {
+        "courseReading.v1.\(course.workspaceID ?? course.id).\(course.id)"
+    }
+
+    func openReadingPage(courseID: String, pageID: String, replacingCurrentPage: Bool) {
+        guard course(withID: courseID) != nil else { return }
+        let route = CourseRoute.coursePage(courseID: courseID, pageID: pageID)
+        if replacingCurrentPage,
+           case .coursePage(let currentCourseID, _) = navigationPath.last,
+           currentCourseID == courseID {
+            navigationPath[navigationPath.count - 1] = route
+        } else {
+            navigationPath.append(route)
+        }
+    }
+
     func openCoursePage(courseID: String, pageID: String) {
         guard course(withID: courseID) != nil else { return }
         navigationPath.append(.coursePage(courseID: courseID, pageID: pageID))

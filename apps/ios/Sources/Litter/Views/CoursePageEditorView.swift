@@ -434,6 +434,11 @@ struct CourseEditorLF51AnnotationStoreProvenance: Equatable {
 }
 #endif
 
+@MainActor
+private final class CourseReadingViewport {
+    var position: NativeBlockEditorReadingPosition?
+}
+
 struct CoursePageEditorView: View {
     @Environment(AppModel.self) private var appModel
     let course: LearningCourse
@@ -441,6 +446,9 @@ struct CoursePageEditorView: View {
     @Bindable var store: CourseExperienceStore
 
     @State private var model: CoursePageEditorModel?
+    @State private var readingNodes: [CourseLearningNode] = []
+    @State private var initialReadingPosition: NativeBlockEditorReadingPosition?
+    @State private var latestReadingViewport = CourseReadingViewport()
     @State private var loadingError: String?
     @State private var reloadGeneration = 0
     @State private var chatError: String?
@@ -473,8 +481,26 @@ struct CoursePageEditorView: View {
                     },
                     onOpenPage: { destination in
                         store.openCoursePage(courseID: course.id, pageID: destination.id)
+                    },
+                    readingFooter: readingFooter,
+                    initialReadingPosition: initialReadingPosition,
+                    onReadingPositionChange: { position in
+                        guard store.navigationPath.last == .coursePage(courseID: course.id, pageID: pageID),
+                              CourseReadingOrder.lessons(in: readingNodes).contains(where: { $0.pageID == pageID }) else { return }
+                        latestReadingViewport.position = position
+                        store.saveReadingBookmark(CourseReadingBookmark(
+                            pageID: pageID, offset: position.offset, isAtEnd: position.isAtEnd
+                        ), for: course)
                     }
                 )
+                .id(pageID)
+                .onAppear {
+                    if let position = latestReadingViewport.position {
+                        store.saveReadingBookmark(CourseReadingBookmark(
+                            pageID: pageID, offset: position.offset, isAtEnd: position.isAtEnd
+                        ), for: course)
+                    }
+                }
             } else if let loadingError {
                 CoursePageLoadFailureView(pageID: pageID, error: loadingError) {
                     model = nil
@@ -535,6 +561,27 @@ struct CoursePageEditorView: View {
         )
     }
 
+    private var readingFooter: AnyView? {
+        guard CourseReadingOrder.lessons(in: readingNodes).contains(where: { $0.pageID == pageID }) else { return nil }
+        if let next = CourseReadingOrder.next(after: pageID, in: readingNodes) {
+            return AnyView(CourseLessonActionButton(
+                course: course, node: next, store: store,
+                title: "Next lesson", replacesCurrentPage: true
+            ))
+        }
+        return AnyView(VStack(spacing: 12) {
+            Label("You’ve reached the end of this course", systemImage: "checkmark.circle")
+                .font(.headline)
+            Button("Back to course") {
+                store.navigationPath = [.course(course.id)]
+            }
+            .buttonStyle(.bordered)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-reading-end"))
+    }
+
     private func loadPage(requestID: CoursePageEditorLoadID) async {
         guard CoursePageEditorLoadPolicy.acceptsCompletion(
             requestID: requestID,
@@ -563,6 +610,24 @@ struct CoursePageEditorView: View {
             if let error = editorModel.errorMessage {
                 loadingError = error
             } else {
+                let outline = try await repository.outline()
+                guard !Task.isCancelled, requestID == loadID else { return }
+                readingNodes = outline.learningPages
+                let bookmark = store.readingBookmark(for: course)
+                let isLesson = CourseReadingOrder.lessons(in: readingNodes).contains { $0.pageID == pageID }
+                if isLesson {
+                    let saved: CourseReadingBookmark
+                    if let bookmark, bookmark.pageID == pageID {
+                        saved = bookmark
+                    } else {
+                        saved = CourseReadingBookmark(pageID: pageID, offset: 0, isAtEnd: false)
+                    }
+                    initialReadingPosition = NativeBlockEditorReadingPosition(offset: saved.offset, isAtEnd: saved.isAtEnd)
+                    store.saveReadingBookmark(saved, for: course)
+                } else {
+                    initialReadingPosition = nil
+                }
+                latestReadingViewport.position = initialReadingPosition
                 model = editorModel
             }
         } catch {
@@ -3017,6 +3082,9 @@ private struct CoursePageEditorCanvas: View {
     let onOpenTextAnnotation: (NativeBlockEditorTextAnnotation) -> Bool
     let onOpenPage: (NativeBlockEditorPageDestination) -> Void
     var onRetrySave: (() -> Void)?
+    let readingFooter: AnyView?
+    let initialReadingPosition: NativeBlockEditorReadingPosition?
+    let onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)?
 
     init(
         model: CoursePageEditorModel,
@@ -3025,7 +3093,10 @@ private struct CoursePageEditorCanvas: View {
         onOpenTextAnnotation: @escaping (NativeBlockEditorTextAnnotation) -> Bool,
         onOpenPage: @escaping (NativeBlockEditorPageDestination) -> Void,
         startsInEditingMode: Bool = false,
-        onRetrySave: (() -> Void)? = nil
+        onRetrySave: (() -> Void)? = nil,
+        readingFooter: AnyView? = nil,
+        initialReadingPosition: NativeBlockEditorReadingPosition? = nil,
+        onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)? = nil
     ) {
         self.model = model
         self.textAnnotations = textAnnotations
@@ -3034,6 +3105,9 @@ private struct CoursePageEditorCanvas: View {
         self.onOpenPage = onOpenPage
         _isEditing = State(initialValue: startsInEditingMode)
         self.onRetrySave = onRetrySave
+        self.readingFooter = readingFooter
+        self.initialReadingPosition = initialReadingPosition
+        self.onReadingPositionChange = onReadingPositionChange
     }
 
     var body: some View {
@@ -3077,9 +3151,11 @@ private struct CoursePageEditorCanvas: View {
                 ),
                 header: AnyView(
                     Text(model.title)
+                        .accessibilityIdentifier("course-page-title-\(model.pageID)")
                         .font(.system(size: 32, weight: .bold, design: .rounded))
                     .frame(maxWidth: .infinity, alignment: .leading)
                 ),
+                footer: isEditing ? nil : readingFooter,
                 pageResolver: { pageID in
                     model.pageTitle(id: pageID).map {
                         NativeBlockEditorPageDestination(id: pageID, title: $0)
@@ -3105,7 +3181,9 @@ private struct CoursePageEditorCanvas: View {
                 onOpenTextAnnotation: { annotation in
                     _ = onOpenTextAnnotation(annotation)
                 },
-                wrapsCodeLines: $wrapsCodeLines
+                wrapsCodeLines: $wrapsCodeLines,
+                initialReadingPosition: initialReadingPosition,
+                onReadingPositionChange: onReadingPositionChange
             )
         }
         .toolbar {

@@ -2387,10 +2387,19 @@ private enum CourseDetailLayout {
     static let stickyActionScrollClearance: CGFloat = 132
 }
 
+private struct CourseActionHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct CourseDetailPresentation<LearnSection: View, StructureSection: View>: View {
     let course: LearningCourse
     @Binding private var selectedSection: CourseDetailSection
     let onTalkToCourseAgent: () -> Void
+    @State private var actionHeight: CGFloat = CourseDetailLayout.stickyActionScrollClearance
+    private let readingAction: AnyView?
     private let learnSection: LearnSection
     private let structureSection: StructureSection
 
@@ -2398,12 +2407,14 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
         course: LearningCourse,
         selectedSection: Binding<CourseDetailSection>,
         onTalkToCourseAgent: @escaping () -> Void,
+        readingAction: AnyView? = nil,
         @ViewBuilder learnSection: () -> LearnSection,
         @ViewBuilder structureSection: () -> StructureSection
     ) {
         self.course = course
         _selectedSection = selectedSection
         self.onTalkToCourseAgent = onTalkToCourseAgent
+        self.readingAction = readingAction
         self.learnSection = learnSection()
         self.structureSection = structureSection()
     }
@@ -2438,7 +2449,7 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
 
                     if course.workspaceID != nil {
                         Color.clear
-                            .frame(height: CourseDetailLayout.stickyActionScrollClearance)
+                            .frame(height: max(CourseDetailLayout.stickyActionScrollClearance, actionHeight))
                             .accessibilityHidden(true)
                     }
                 }
@@ -2447,13 +2458,22 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
                 .padding(.bottom, 32)
             }
         }
-        .safeAreaInset(edge: .bottom) {
+        .overlay(alignment: .bottom) {
             if course.workspaceID != nil {
                 bottomActionBar
+                    .background {
+                        GeometryReader { geometry in
+                            Color.clear
+                                .preference(key: CourseActionHeightKey.self, value: geometry.size.height)
+                                .allowsHitTesting(false)
+                        }
+                    }
             }
         }
+        .onPreferenceChange(CourseActionHeightKey.self) { actionHeight = $0 }
         .navigationTitle("Course")
         .navigationBarTitleDisplayMode(.inline)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("course-detail-root")
     }
 
@@ -2485,21 +2505,24 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
     }
 
     private var bottomActionBar: some View {
-        Button(action: onTalkToCourseAgent) {
-            Label("Talk to Course Agent", systemImage: "bubble.left.and.bubble.right.fill")
-                .font(.headline)
-                .foregroundStyle(.blue)
-                .frame(maxWidth: .infinity)
-                .frame(height: 52)
-                .background(.thinMaterial, in: Capsule())
+        VStack(spacing: 10) {
+            if let readingAction { readingAction }
+            Button(action: onTalkToCourseAgent) {
+                Label("Talk to Course Agent", systemImage: "bubble.left.and.bubble.right.fill")
+                    .font(.headline)
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 22)
+                    .frame(minHeight: 52)
+                    .background(.regularMaterial, in: Capsule())
+                    .shadow(color: .black.opacity(0.1), radius: 8, y: 3)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("talk-to-course-agent-button")
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("talk-to-course-agent-button")
         .padding(.horizontal, 18)
-        .padding(.top, 10)
         .padding(.bottom, 8)
-        .background(.ultraThinMaterial)
     }
+
 }
 
 private struct CourseDetailStructurePresentation: View {
@@ -2561,6 +2584,8 @@ private struct CourseDetailView: View {
     @State private var documentOutline: CourseDocumentOutline?
     @State private var structureErrors = CourseStructureReloadErrors()
     @State private var structureReloadGeneration = 0
+    @State private var displayedStructureCourseID: String?
+    @State private var displayedStructureWorkspaceID: String?
     @State private var expandedLearningNodeIDs: Set<String> = []
     @State private var courseAgentNavigationError: String?
 
@@ -2634,6 +2659,7 @@ private struct CourseDetailView: View {
             course: course,
             selectedSection: $selectedSection,
             onTalkToCourseAgent: resumeCourseAgent,
+            readingAction: readingAction,
             learnSection: { learnSection },
             structureSection: { structureSection }
         )
@@ -2665,6 +2691,18 @@ private struct CourseDetailView: View {
         } message: {
             Text(courseAgentNavigationError ?? "The course agent is unavailable right now.")
         }
+    }
+
+    private var readingAction: AnyView? {
+        guard let node = CourseReadingOrder.resume(
+            in: learningNodes, bookmark: store.readingBookmark(for: course)
+        ) else { return nil }
+        return AnyView(CourseLessonActionButton(
+            course: course,
+            node: node,
+            store: store,
+            title: store.readingBookmark(for: course) == nil ? "Start course" : "Continue course"
+        ))
     }
 
     private var learnSection: some View {
@@ -2770,8 +2808,14 @@ private struct CourseDetailView: View {
 
     private func reloadCourseStructure(requestID: CourseStructureReloadID) async {
         guard !Task.isCancelled, requestID == structureReloadID else { return }
-        workspaceSnapshot = nil
-        documentOutline = nil
+        // Keep the current actions mounted during a generation refresh so an
+        // in-flight Continue request can finish and open its confirmed page.
+        if displayedStructureCourseID != course.id || displayedStructureWorkspaceID != course.workspaceID {
+            workspaceSnapshot = nil
+            documentOutline = nil
+            displayedStructureCourseID = course.id
+            displayedStructureWorkspaceID = course.workspaceID
+        }
         structureErrors = CourseStructureReloadErrors()
         let result = await CourseStructureReloadCoordinator.reload(
             loadWorkspaceFiles: { loadWorkspaceFiles() },
