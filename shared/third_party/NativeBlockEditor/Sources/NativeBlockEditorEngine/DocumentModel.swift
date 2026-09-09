@@ -353,12 +353,17 @@ public struct BlockNode: Codable, Hashable, Identifiable, Sendable {
 
     /// Raw HTML is intentionally opt-in. The demo renders this node in an
     /// isolated WKWebView for browser CSS fidelity; semantic imports use the codec.
-    public static func html(_ source: String, allowNetwork: Bool = false) -> BlockNode {
+    public static func html(
+        _ source: String,
+        allowNetwork: Bool = false,
+        allowJavaScript: Bool = false
+    ) -> BlockNode {
         BlockNode(
             type: "nbe/html",
             data: [
                 "html": .string(source),
                 "allow_network": .bool(allowNetwork),
+                "allow_javascript": .bool(allowJavaScript),
             ]
         )
     }

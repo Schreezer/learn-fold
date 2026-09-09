@@ -656,13 +656,12 @@ public struct NativeBlockEditorView: View {
                 onAddRow: { perform { try engine.addDatabaseRow(at: block.path) } }
             )
         case "nbe/html":
-            BrowserHTMLBlockView(
+            BrowserHTMLBlockContainer(
                 html: block.node.data["html"]?.stringValue ?? "",
                 allowNetwork: block.node.data["allow_network"]?.boolValue ?? false,
-                identifier: block.path.identifier,
-                height: .constant(220)
+                allowJavaScript: block.node.data["allow_javascript"]?.boolValue ?? false,
+                identifier: block.path.identifier
             )
-            .frame(height: 220)
             .clipShape(RoundedRectangle(cornerRadius: 8))
         default:
             if let rendered = customBlockRenderer?(block.node, block.path) {

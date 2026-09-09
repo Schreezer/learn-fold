@@ -61,8 +61,56 @@ struct CourseReadingUITestHarness: View {
                 let article = (1...18).map { index in
                     "## Idea \(index)\n\nA proof can show that a statement is true while keeping its underlying secret private. Follow the verifier's questions and the prover's responses to see what information each step reveals."
                 }.joined(separator: "\n\n")
+                let visualizationHTML = """
+                <style>
+                .proof-simulation { padding: 12px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 12px; }
+                .proof-round { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; min-height: 82px; }
+                .proof-party { text-align: center; padding: 10px 4px; background: color-mix(in srgb, #007aff 14%, transparent); border-radius: 8px; }
+                .proof-arrow { font-size: 22px; color: #007aff; }
+                .proof-controls { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+                .proof-controls button { min-height: 44px; border: 0; border-radius: 9px; padding: 0 14px; background: #007aff; color: white; font: inherit; font-weight: 600; }
+                .proof-controls output { flex: 1; }
+                </style>
+                <section class="proof-simulation" aria-label="Zero-knowledge proof challenge simulation">
+                  <div class="proof-round" aria-hidden="true">
+                    <div class="proof-party">Prover<br><strong id="proof-secret">commits</strong></div>
+                    <div class="proof-arrow" id="proof-arrow">→</div>
+                    <div class="proof-party">Verifier<br><strong id="proof-action">waits</strong></div>
+                  </div>
+                  <div class="proof-controls">
+                    <button id="advance-proof" type="button">Advance simulation</button>
+                    <output id="proof-state" aria-live="polite">Round 1: prover sends a commitment.</output>
+                  </div>
+                </section>
+                <script>
+                (function () {
+                  var step = 0;
+                  var states = [
+                    ['commits', 'waits', '→', 'Round 1: prover sends a commitment.'],
+                    ['holds secret', 'challenges', '←', 'Round 2: verifier sends a random challenge.'],
+                    ['responds', 'checks proof', '→', 'Round 3: verifier checks the response without learning the secret.']
+                  ];
+                  document.getElementById('advance-proof').addEventListener('click', function () {
+                    step = (step + 1) % states.length;
+                    document.getElementById('proof-secret').textContent = states[step][0];
+                    document.getElementById('proof-action').textContent = states[step][1];
+                    document.getElementById('proof-arrow').textContent = states[step][2];
+                    document.getElementById('proof-state').textContent = states[step][3];
+                  });
+                })();
+                </script>
+                """
+                var articleDocument = try document(article, role: "lesson")
+                articleDocument.root.children.insert(
+                    .html(
+                        visualizationHTML,
+                        allowNetwork: false,
+                        allowJavaScript: true
+                    ),
+                    at: 0
+                )
                 _ = try workspace.createPage(title: "What a proof reveals", parentID: section.id,
-                    document: document(article, role: "lesson"), id: "article-one")
+                    document: articleDocument, id: "article-one")
                 _ = try workspace.createPage(title: "A verifier's challenge", parentID: section.id,
                     document: document("## A challenge\n\nTry describing a verification step without sharing the secret.", role: "lesson"), id: "article-two")
                 let second = try workspace.createPage(title: "Finite Fields", parentID: workspace.rootPageID,

@@ -4,6 +4,57 @@ import NativeEditorMCP
 import XCTest
 
 final class AtomicPropertiesTests: XCTestCase {
+    func testVisualizationFenceCreatesExecutableNetworkIsolatedHTMLBlockAndRoundTrips() async throws {
+        let (service, directory) = try await makeService()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let before = try await service.rootPageSnapshot()
+        let html = """
+        <button id="advance" type="button">Advance</button>
+        <output id="state" aria-live="polite">Round 1</output>
+        <script>
+        document.getElementById('advance').addEventListener('click', function () {
+          document.getElementById('state').textContent = 'Round 2';
+        });
+        </script>
+        """
+
+        let result = try await service.updatePage([
+            "page_id": .string(before.id),
+            "command": "replace_content",
+            "expected_revision": .integer(Int(before.revision)),
+            "new_str": .string("""
+            # Interactive proof
+
+            ```learnfold-visualization
+            \(html)
+            ```
+            """),
+        ])
+
+        let page = try await service.pageSnapshot(id: before.id)
+        let visualization = try XCTUnwrap(
+            page.document.root.children.first(where: { $0.type == "nbe/html" })
+        )
+        XCTAssertEqual(visualization.data["html"]?.stringValue, html)
+        XCTAssertEqual(visualization.data["allow_javascript"]?.boolValue, true)
+        XCTAssertEqual(visualization.data["allow_network"]?.boolValue, false)
+        let markdown = try XCTUnwrap(result.objectValue?["markdown"]?.stringValue)
+        XCTAssertTrue(markdown.contains("```learnfold-visualization"))
+        XCTAssertTrue(markdown.contains("document.getElementById('advance')"))
+    }
+
+    func testSafeMarkdownImportCannotEnableJavaScriptThroughNativeDirective() throws {
+        let source = BlockDocument(root: BlockNode(type: "page", children: [
+            .html("<script>window.enabled = true</script>", allowNetwork: true, allowJavaScript: true),
+        ]))
+        let encoded = AppFlowyMarkdownCodec(nativeDirectivePolicy: .trusted).encode(source)
+
+        let decoded = try AppFlowyMarkdownCodec().decode(encoded)
+        let html = try XCTUnwrap(decoded.root.children.first)
+        XCTAssertEqual(html.data["allow_network"]?.boolValue, false)
+        XCTAssertEqual(html.data["allow_javascript"]?.boolValue, false)
+    }
+
     func testSingleAsteriskEmphasisDecodesAsItalic() throws {
         let document = try AppFlowyMarkdownCodec().decode(
             "Why is a *different* string not the same commitment?"

@@ -5,6 +5,7 @@ public enum NotionEnhancedMarkdownError: Error, Equatable, Sendable {
     case unsafeNativeDirective
     case malformedExtension(String)
     case unknownBlock(String)
+    case visualizationTooLarge(Int)
 }
 
 extension NotionEnhancedMarkdownError: LocalizedError {
@@ -16,6 +17,8 @@ extension NotionEnhancedMarkdownError: LocalizedError {
             "The enhanced Markdown extension is malformed: \(tag)"
         case let .unknownBlock(id):
             "The referenced unknown block could not be resolved: \(id)"
+        case let .visualizationTooLarge(byteCount):
+            "The visualization is \(byteCount) bytes; the maximum is \(NotionEnhancedMarkdownCodec.maximumVisualizationBytes)."
         }
     }
 }
@@ -26,6 +29,8 @@ extension NotionEnhancedMarkdownError: LocalizedError {
 /// are exposed as readable XML-like references, while unknown blocks are opaque
 /// references that can round-trip only when they already exist in the page.
 public struct NotionEnhancedMarkdownCodec: Sendable {
+    public static let maximumVisualizationBytes = 256_000
+
     public init() {}
 
     public func encode(_ document: BlockDocument) -> String {
@@ -78,6 +83,11 @@ public struct NotionEnhancedMarkdownCodec: Sendable {
             let url = node.data["url"]?.stringValue ?? ""
             let title = node.data["title"]?.stringValue ?? url
             return "\(indentation)[\(title)](\(url))"
+        case "nbe/html" where node.data["allow_javascript"]?.boolValue == true:
+            return visualizationFence(
+                html: node.data["html"]?.stringValue ?? "",
+                indentation: indentation
+            )
         case "nbe/plugin", "nbe/html":
             return unknownTag(for: node, indentation: indentation)
         default:
@@ -108,6 +118,16 @@ public struct NotionEnhancedMarkdownCodec: Sendable {
         var index = 0
         while index < lines.count {
             let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
+            if let fenceLength = visualizationFenceLength(in: trimmed) {
+                let result = try parseVisualization(
+                    lines,
+                    startingAt: index,
+                    fenceLength: fenceLength
+                )
+                output.append(try nativeDirective(result.node))
+                index = result.nextIndex
+                continue
+            }
             if trimmed == "<columns>" {
                 let result = try parseColumns(
                     lines,
@@ -169,6 +189,69 @@ public struct NotionEnhancedMarkdownCodec: Sendable {
             index += 1
         }
         return separateTopLevelTextBlocks(output).joined(separator: "\n")
+    }
+
+    private func visualizationFenceLength(in line: String) -> Int? {
+        let backtickCount = line.prefix { $0 == "`" }.count
+        guard backtickCount >= 3 else { return nil }
+        let language = line.dropFirst(backtickCount)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return language == "learnfold-visualization" ? backtickCount : nil
+    }
+
+    private func parseVisualization(
+        _ lines: [String],
+        startingAt start: Int,
+        fenceLength: Int
+    ) throws -> (node: BlockNode, nextIndex: Int) {
+        var index = start + 1
+        var content: [String] = []
+        while index < lines.count {
+            let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
+            let closingLength = trimmed.prefix { $0 == "`" }.count
+            if closingLength >= fenceLength,
+               closingLength == trimmed.count {
+                let html = content.joined(separator: "\n")
+                guard !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw NotionEnhancedMarkdownError.malformedExtension(
+                        "learnfold-visualization cannot be empty"
+                    )
+                }
+                let byteCount = html.lengthOfBytes(using: .utf8)
+                guard byteCount <= Self.maximumVisualizationBytes else {
+                    throw NotionEnhancedMarkdownError.visualizationTooLarge(byteCount)
+                }
+                return (
+                    .html(html, allowNetwork: false, allowJavaScript: true),
+                    index + 1
+                )
+            }
+            content.append(lines[index])
+            index += 1
+        }
+        throw NotionEnhancedMarkdownError.malformedExtension(
+            "learnfold-visualization is missing its closing fence"
+        )
+    }
+
+    private func visualizationFence(html: String, indentation: String) -> String {
+        var longestBacktickRun = 0
+        var currentBacktickRun = 0
+        for character in html {
+            if character == "`" {
+                currentBacktickRun += 1
+                longestBacktickRun = max(longestBacktickRun, currentBacktickRun)
+            } else {
+                currentBacktickRun = 0
+            }
+        }
+        let fence = String(repeating: "`", count: max(3, longestBacktickRun + 1))
+        let body = html
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { indentation + $0 }
+            .joined(separator: "\n")
+        return "\(indentation)\(fence)learnfold-visualization\n\(body)\n\(indentation)\(fence)"
     }
 
     private func parseColumns(

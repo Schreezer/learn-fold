@@ -524,6 +524,35 @@ struct AppleCourseGeneratedLessonContent: Decodable, Equatable, Sendable {
     let explanation: String
     let example: String
     let exercise: String
+    let visualizationHTML: String
+
+    init(
+        explanation: String,
+        example: String,
+        exercise: String,
+        visualizationHTML: String = ""
+    ) {
+        self.explanation = explanation
+        self.example = example
+        self.exercise = exercise
+        self.visualizationHTML = visualizationHTML
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case explanation, example, exercise
+        case visualizationHTML = "visualization_html"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        explanation = try container.decode(String.self, forKey: .explanation)
+        example = try container.decode(String.self, forKey: .example)
+        exercise = try container.decode(String.self, forKey: .exercise)
+        visualizationHTML = try container.decodeIfPresent(
+            String.self,
+            forKey: .visualizationHTML
+        ) ?? ""
+    }
 }
 
 enum AppleCourseLessonSemanticRequirement: Equatable, Sendable {
@@ -958,6 +987,16 @@ enum AppleCourseLessonContentPolicy {
         content: AppleCourseGeneratedLessonContent,
         exampleKind: CourseLessonExampleKind
     ) -> String {
+        let visualization = content.visualizationHTML
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let visualizationSection = visualization.isEmpty ? "" : """
+
+        ## Interactive visualization
+
+        ```learnfold-visualization
+        \(visualization)
+        ```
+        """
         let exampleSection: String
         switch exampleKind {
         case .topicDemonstration:
@@ -992,6 +1031,7 @@ enum AppleCourseLessonContentPolicy {
         \(content.explanation)
 
         \(exampleSection)
+        \(visualizationSection)
 
         ## Exercise
 
@@ -4962,7 +5002,13 @@ private extension SystemAppleCourseAgentRuntime {
         content. Fetch immediately before updating a page and always use its latest \
         expected_revision. Learnfold creates the full approved hierarchy and names the exact initial \
         pending page in its approval instruction. Generate only that page in the approval turn; do \
-        not generate its siblings or recreate the hierarchy. \(courseHierarchyInstructions) For a selected-passage question, \
+        not generate its siblings or recreate the hierarchy. When dynamic behavior, spatial \
+        relationships, a process, or changing values would be easier to understand visually, put \
+        one compact self-contained HTML/CSS/JavaScript visualization in visualization_html. Use \
+        semantic controls and an aria-live result, fit a phone width, make the first frame useful, \
+        and use no network requests, external resources, external links, host bridges, infinite \
+        animation, Markdown fences, or html, head, or body tags. Return an empty string when prose, \
+        a table, or a formula is clearer. \(courseHierarchyInstructions) For a selected-passage question, \
         autonomously choose the \
         smallest sufficient response: answer only in chat for a short-lived clarification; add or \
         revise a focused section on the referenced page when it durably improves that lesson; or \
@@ -5761,11 +5807,16 @@ enum AppleCourseToolFactory {
                     "type": "string",
                     "description": "One short learner exercise.",
                 ],
+                "visualization_html": [
+                    "type": "string",
+                    "description": "A self-contained interactive HTML fragment with inline CSS and JavaScript when dynamic behavior, spatial relationships, or changing values are easier to understand visually; otherwise an empty string. Use semantic controls, fit a phone width without horizontal scrolling, keep prose outside the fragment, use no network requests or external resources, and do not include Markdown fences, html, head, or body tags.",
+                ],
             ],
             "required": [
                 "explanation",
                 "example",
                 "exercise",
+                "visualization_html",
             ],
         ]
         let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])

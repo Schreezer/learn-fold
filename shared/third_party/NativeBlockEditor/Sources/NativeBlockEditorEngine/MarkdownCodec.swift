@@ -336,7 +336,10 @@ private struct MarkdownDocumentParser {
     }
 
     private func sanitizeNativeDirective(_ node: inout BlockNode) -> Bool {
-        if node.type == "nbe/html" { node.data["allow_network"] = .bool(false) }
+        if node.type == "nbe/html" {
+            node.data["allow_network"] = .bool(false)
+            node.data["allow_javascript"] = .bool(false)
+        }
         if node.type == "nbe/media" || node.type == "link_preview" {
             guard let value = node.data["url"]?.stringValue,
                   let scheme = URLComponents(string: value)?.scheme?.lowercased(),

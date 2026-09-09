@@ -10136,6 +10136,9 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(instructions.contains("Do not edit merely because editing tools are available"))
         XCTAssertTrue(instructions.contains("expected_revision"))
         XCTAssertTrue(instructions.contains("Never create Markdown lesson files"))
+        XCTAssertTrue(instructions.contains("learnfold-visualization"))
+        XCTAssertTrue(instructions.contains("inline CSS and JavaScript"))
+        XCTAssertTrue(instructions.contains("Do not use network requests"))
     }
 
     func testAppleInstructionsRequireVisiblePendingHierarchyAndFolderRollup() {
@@ -11262,6 +11265,34 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(genericProgrammingExample.contains("## Runnable example"))
         XCTAssertFalse(genericProgrammingExample.contains("named by the plan example"))
         XCTAssertTrue(swiftExample.contains("```swift"))
+    }
+
+    func testAppleLessonContentPolicyEmitsOptionalInteractiveVisualization() throws {
+        let content = AppleCourseGeneratedLessonContent(
+            explanation: "A challenge changes what the prover must answer.",
+            example: "Compare two challenge rounds.",
+            exercise: "Predict the next response.",
+            visualizationHTML: """
+            <button id="advance" type="button">Advance</button>
+            <output id="state" aria-live="polite">Round 1</output>
+            <script>document.getElementById('advance').onclick = () => document.getElementById('state').textContent = 'Round 2';</script>
+            """
+        )
+
+        let markdown = AppleCourseLessonContentPolicy.markdown(
+            content: content,
+            exampleKind: .topicDemonstration
+        )
+
+        XCTAssertTrue(markdown.contains("## Interactive visualization"))
+        XCTAssertTrue(markdown.contains("```learnfold-visualization"))
+        XCTAssertTrue(markdown.contains("aria-live=\"polite\""))
+
+        let decoded = try JSONDecoder().decode(
+            AppleCourseGeneratedLessonContent.self,
+            from: Data(#"{"explanation":"E","example":"X","exercise":"Q","visualization_html":"<canvas></canvas>"}"#.utf8)
+        )
+        XCTAssertEqual(decoded.visualizationHTML, "<canvas></canvas>")
     }
 
     func testAppleRunnableSwiftValidationIsTopicAwareAndCorrectionIsBounded() async {

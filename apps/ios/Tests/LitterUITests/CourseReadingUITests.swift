@@ -4,6 +4,45 @@ final class CourseReadingUITests: XCTestCase {
     override func setUp() { continueAfterFailure = false }
 
     @MainActor
+    func testInteractiveVisualizationRendersAndRunsJavaScript() {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["SNAPPY_SKIP_AGENT_SETUP"] = "1"
+        app.launchEnvironment["LEARNFOLD_READING_TEST_TOKEN"] = UUID().uuidString
+        app.launchArguments = ["--ui-test-course-reading"]
+        app.launch()
+
+        let start = app.buttons["course-continue"]
+        XCTAssertTrue(start.waitForExistence(timeout: 25), app.debugDescription)
+        XCTAssertTrue(waitForHittable(start))
+        start.tap()
+        XCTAssertTrue(waitForPage("article-one", in: app), app.debugDescription)
+
+        let webView = app.webViews.matching(identifier: "html-block-0").firstMatch
+        XCTAssertTrue(webView.waitForExistence(timeout: 15), app.debugDescription)
+        let advance = app.buttons["Advance simulation"].firstMatch
+        XCTAssertTrue(advance.waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertTrue(waitForHittable(advance))
+        XCTAssertTrue(
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "label == %@", "Round 1: prover sends a commitment."))
+                .firstMatch.exists
+        )
+        capture("Interactive visualization initial state", app)
+
+        advance.tap()
+
+        let changedState = app.descendants(matching: .any)
+            .matching(NSPredicate(
+                format: "label == %@",
+                "Round 2: verifier sends a random challenge."
+            ))
+            .firstMatch
+        XCTAssertTrue(changedState.waitForExistence(timeout: 10), app.debugDescription)
+        capture("Interactive visualization after JavaScript interaction", app)
+    }
+
+    @MainActor
     func testResumeNextGenerationRetryAndCourseEnd() {
         let app = XCUIApplication()
         app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"

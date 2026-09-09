@@ -286,9 +286,29 @@ private struct DatabaseCellField: View {
     }
 }
 
+struct BrowserHTMLBlockContainer: View {
+    let html: String
+    let allowNetwork: Bool
+    let allowJavaScript: Bool
+    let identifier: String
+    @State private var height: CGFloat = 220
+
+    var body: some View {
+        BrowserHTMLBlockView(
+            html: html,
+            allowNetwork: allowNetwork,
+            allowJavaScript: allowJavaScript,
+            identifier: identifier,
+            height: $height
+        )
+        .frame(height: height)
+    }
+}
+
 struct BrowserHTMLBlockView: UIViewRepresentable {
     let html: String
     let allowNetwork: Bool
+    let allowJavaScript: Bool
     let identifier: String
     @Binding var height: CGFloat
 
@@ -297,35 +317,80 @@ struct BrowserHTMLBlockView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
-        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = allowJavaScript
+        if allowJavaScript {
+            configuration.userContentController.add(context.coordinator, name: "contentHeight")
+            configuration.userContentController.addUserScript(WKUserScript(
+                source: Self.heightObserverScript,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true
+            ))
+        }
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = context.coordinator
         view.isOpaque = false
         view.backgroundColor = .clear
         view.scrollView.isScrollEnabled = false
-        view.accessibilityLabel = "Browser HTML block"
+        view.accessibilityLabel = allowJavaScript ? "Interactive visualization" : "Browser HTML block"
         view.accessibilityIdentifier = "html-block-\(identifier)"
-        view.loadHTMLString(HTMLSandbox.sanitize(html, allowNetwork: allowNetwork), baseURL: nil)
+        view.loadHTMLString(
+            HTMLSandbox.sanitize(
+                html,
+                allowNetwork: allowNetwork,
+                allowJavaScript: allowJavaScript
+            ),
+            baseURL: nil
+        )
         return view
+    }
+
+    static func dismantleUIView(_ view: WKWebView, coordinator: Coordinator) {
+        view.navigationDelegate = nil
+        view.configuration.userContentController.removeScriptMessageHandler(forName: "contentHeight")
     }
 
     func updateUIView(_ view: WKWebView, context: Context) {
         context.coordinator.parent = self
-        let fingerprint = "\(allowNetwork)|\(html)"
+        let fingerprint = "\(allowNetwork)|\(allowJavaScript)|\(html)"
         guard context.coordinator.fingerprint != fingerprint else { return }
         context.coordinator.fingerprint = fingerprint
-        view.loadHTMLString(HTMLSandbox.sanitize(html, allowNetwork: allowNetwork), baseURL: nil)
+        view.loadHTMLString(
+            HTMLSandbox.sanitize(
+                html,
+                allowNetwork: allowNetwork,
+                allowJavaScript: allowJavaScript
+            ),
+            baseURL: nil
+        )
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var parent: BrowserHTMLBlockView
         var fingerprint = ""
         init(parent: BrowserHTMLBlockView) { self.parent = parent }
 
         func webView(_ webView: WKWebView, didFinish _: WKNavigation!) {
-            webView.evaluateJavaScript("Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)") { value, _ in
-                guard let measured = value as? Double else { return }
-                DispatchQueue.main.async { self.parent.height = min(640, max(80, measured + 12)) }
+            webView.evaluateJavaScript(Self.measurementScript) { value, _ in
+                self.applyMeasuredHeight(value, webView: webView)
+            }
+        }
+
+        func userContentController(
+            _ userContentController: WKUserContentController,
+            didReceive message: WKScriptMessage
+        ) {
+            guard message.name == "contentHeight", let webView = message.webView else { return }
+            applyMeasuredHeight(message.body, webView: webView)
+        }
+
+        private func applyMeasuredHeight(_ value: Any?, webView: WKWebView) {
+            guard let measured = (value as? NSNumber)?.doubleValue,
+                  measured.isFinite,
+                  measured > 0 else { return }
+            let maximumHeight = 640.0
+            DispatchQueue.main.async {
+                webView.scrollView.isScrollEnabled = measured > maximumHeight
+                self.parent.height = min(maximumHeight, max(80, measured + 12))
             }
         }
 
@@ -334,15 +399,43 @@ struct BrowserHTMLBlockView: UIViewRepresentable {
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
         ) {
-            decisionHandler(navigationAction.navigationType == .other ? .allow : .cancel)
+            let url = navigationAction.request.url
+            let isInitialDocument = url == nil || url?.scheme == "about"
+            decisionHandler(isInitialDocument ? .allow : .cancel)
         }
+
+        private static let measurementScript =
+            "Math.ceil(Math.max(document.body.scrollHeight, document.documentElement.scrollHeight))"
     }
+
+    private static let heightObserverScript = """
+    (function() {
+      window.alert = function() {};
+      window.confirm = function() { return false; };
+      window.prompt = function() { return null; };
+      window.open = function() { return null; };
+      var report = function() {
+        var height = Math.ceil(Math.max(
+          document.body.scrollHeight,
+          document.documentElement.scrollHeight
+        ));
+        window.webkit.messageHandlers.contentHeight.postMessage(height);
+      };
+      new ResizeObserver(report).observe(document.documentElement);
+      report();
+    })();
+    """
 }
 
 private enum HTMLSandbox {
-    static func sanitize(_ html: String, allowNetwork: Bool) -> String {
+    static func sanitize(
+        _ html: String,
+        allowNetwork: Bool,
+        allowJavaScript: Bool = false
+    ) -> String {
         var source = html
-        let forbidden = ["script", "iframe", "frame", "object", "embed", "form", "base"]
+        var forbidden = ["iframe", "frame", "object", "embed", "form", "base"]
+        if !allowJavaScript { forbidden.append("script") }
         for tag in forbidden {
             source = source.replacingOccurrences(
                 of: "<\\s*\(tag)\\b[^>]*>[\\s\\S]*?<\\s*/\\s*\(tag)\\s*>",
@@ -367,8 +460,9 @@ private enum HTMLSandbox {
             options: [.regularExpression, .caseInsensitive]
         )
         let remote = allowNetwork ? "https:" : ""
-        let policy = "default-src 'none'; style-src 'unsafe-inline' \(remote); img-src data: \(remote); font-src data: \(remote); media-src data: \(remote);"
-        let head = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"\(policy)\"><style>html,body{margin:0;padding:0;background:transparent;color:#111;font:-apple-system-body;overflow:hidden}*{box-sizing:border-box;max-width:100%}@media(prefers-color-scheme:dark){html,body{color:#eee}}</style>"
+        let scripts = allowJavaScript ? "'unsafe-inline'" : "'none'"
+        let policy = "default-src 'none'; script-src \(scripts); connect-src 'none'; style-src 'unsafe-inline' \(remote); img-src data: \(remote); font-src data: \(remote); media-src data: blob: \(remote); frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';"
+        let head = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"\(policy)\"><style>html,body{margin:0;padding:0;background:transparent;color:#111;font:-apple-system-body;overflow:hidden}*{box-sizing:border-box;max-width:100%}input,select,textarea{font-size:16px}button{font:inherit}@media(prefers-color-scheme:dark){html,body{color:#eee}}</style>"
         if let range = source.range(of: "<head>", options: .caseInsensitive) {
             source.insert(contentsOf: head, at: range.upperBound)
             return source
