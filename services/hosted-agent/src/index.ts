@@ -83,7 +83,8 @@ export class HostedCourseAgent extends Think<HostedEnv> {
   override getModel() {
     return createHostedModel(this.env.OPENCODE_API_KEY,
       observedProviderFetch(() => this.telemetry.providerObservation(), fetch,
-        () => this.providerProgress.observer()))
+        () => this.providerProgress.observer()),
+      this.ctx.id.toString())
   }
 
   override getSystemPrompt(): string {

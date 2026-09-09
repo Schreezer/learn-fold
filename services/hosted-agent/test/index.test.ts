@@ -110,16 +110,21 @@ describe("hosted agent worker", () => {
 
   it("uses Responses with full transcript replay and no provider storage", async () => {
     let sent: Record<string, unknown> = {}
+    let sentHeaders = new Headers()
     let url = ""
     const transport: typeof fetch = async (_input, init) => {
       url = String(_input)
       sent = JSON.parse(String(init?.body))
+      sentHeaders = new Headers(init?.headers)
       return Response.json({ id: "resp_test", model: DEFAULT_MODEL, created_at: 1,
         output: [{ type: "message", id: "msg_test", role: "assistant", content: [
           { type: "output_text", text: "ok", annotations: [] },
         ] }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } })
     }
-    const result = await generateText({ model: createHostedModel("test-key", transport), prompt: "Question" })
+    const result = await generateText({
+      model: createHostedModel("test-key", transport, "stable-learnfold-session"),
+      prompt: "Question",
+    })
     expect(result.text).toBe("ok")
     expect(url).toBe(`${OPENCODE_BASE_URL}/responses`)
     expect(sent.store).toBe(false)
@@ -128,6 +133,8 @@ describe("hosted agent worker", () => {
     expect(sent).not.toHaveProperty("messages")
     expect(sent.input).toBeDefined()
     expect(sent.model).toBe(DEFAULT_MODEL)
+    expect(sentHeaders.get("x-opencode-session")).toBe("stable-learnfold-session")
+    expect(sentHeaders.get("user-agent")).toBe("learnfold-hosted-agent/1.0")
   })
 
   it("uses the OpenCode Zen Go Responses adapter", () => {
