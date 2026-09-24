@@ -782,6 +782,7 @@ struct CourseChatView: View {
     @State private var isResolvingDiscussion = false
     @State private var resolveError: String?
     @State private var isReconnectingAgent = false
+    @State private var signInTask: Task<Void, Never>?
     @State private var draftWorkspaceID: String?
     @FocusState private var composerFocused: Bool
 
@@ -978,7 +979,7 @@ struct CourseChatView: View {
     }
 
     private var codexNeedsSignIn: Bool {
-        CourseChatAuthPolicy.needsSignIn(
+        let needsAuthentication = CourseChatAuthPolicy.needsSignIn(
             isCodex: displayedAgentID == .codex,
             requiresOpenAIAuth: courseServer?.requiresOpenaiAuth == true,
             hasAccount: courseServer?.account != nil,
@@ -987,11 +988,28 @@ struct CourseChatView: View {
                 for: selectionDiscussionID
             )
         )
+        return needsAuthentication && !usesCodexAPIKeyAuth
+    }
+
+    private var usesCodexAPIKeyAuth: Bool {
+        if appModel.prefersLocalChatGPTAuth { return false }
+        if appModel.localAuthPreference == .apiKey { return true }
+        return AppModel.storedLocalAuthPreference(
+            baseURL: try? OpenAIApiKeyStore.shared.loadBaseURL(),
+            apiKey: try? OpenAIApiKeyStore.shared.load(),
+            hasChatGPTTokens: false,
+            explicitPreference: appModel.localAuthPreference
+        ).prefersAPIKey
     }
 
     private var isAgentReady: Bool {
         if CourseAgentProvider.usesLocalMessages(displayedAgentID) {
             return displayedConnectionState == .connected
+        }
+        if displayedAgentID == .codex,
+           usesCodexAPIKeyAuth,
+           courseServer?.account != .apiKey {
+            return false
         }
         return CourseChatAuthPolicy.isReady(
             isCodex: displayedAgentID == .codex,
@@ -1316,6 +1334,8 @@ struct CourseChatView: View {
                 } ?? false
         }
         .onDisappear {
+            signInTask?.cancel()
+            signInTask = nil
             store.saveDraft(
                 inputText,
                 for: selectionDiscussionID,
@@ -1694,9 +1714,39 @@ struct CourseChatView: View {
     }
 
     private func reconnectAgent() {
-        Task {
-            guard !isReconnectingAgent else { return }
-            isReconnectingAgent = true
+        guard !isReconnectingAgent else { return }
+        isReconnectingAgent = true
+        if codexNeedsSignIn {
+            signInTask = Task { @MainActor in
+                defer {
+                    isReconnectingAgent = false
+                    signInTask = nil
+                }
+                do {
+                    try await appModel.loginLocalChatGPTAccountOnThisDevice()
+                } catch ChatGPTOAuthError.cancelled {
+                    guard !Task.isCancelled else { return }
+                    setDisplayedSignInError("ChatGPT sign-in was cancelled. Try again to continue.")
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    setDisplayedSignInError("ChatGPT sign-in did not finish. Please try again.")
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                setDisplayedSignInError(nil)
+                if let selectionDiscussionID {
+                    await store.reconnectSelectionDiscussion(
+                        id: selectionDiscussionID,
+                        appModel: appModel
+                    )
+                } else {
+                    await store.refreshAgentReadiness(appModel: appModel)
+                }
+            }
+            return
+        }
+        Task { @MainActor in
             defer { isReconnectingAgent = false }
             if let selectionDiscussionID {
                 await store.reconnectSelectionDiscussion(
@@ -1721,6 +1771,14 @@ struct CourseChatView: View {
                     )
                 }
             }
+        }
+    }
+
+    private func setDisplayedSignInError(_ message: String?) {
+        if let selectionDiscussionID {
+            store.selectionDiscussionErrors[selectionDiscussionID] = message
+        } else {
+            store.agentError = message
         }
     }
 

@@ -12,6 +12,8 @@ pub enum ClientError {
     EventClosed(String),
     #[error("Minigame generation failed: {0}")]
     MinigameGenerationFailed(String),
+    #[error("ChatGPT sign-in required")]
+    AuthenticationRequired,
 }
 
 impl From<crate::RpcClientError> for ClientError {

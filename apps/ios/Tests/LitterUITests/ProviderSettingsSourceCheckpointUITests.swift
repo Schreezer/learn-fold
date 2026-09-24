@@ -460,6 +460,13 @@ final class ProviderSettingsSourceCheckpointUITests: XCTestCase {
 
         let error = launch(.lf27AgentError)
         XCTAssertTrue(element("course-settings-agent-error", in: error).exists)
+        XCTAssertTrue(element("course-settings-codex-sign-in", in: error).exists)
+        XCTAssertTrue(element("course-settings-codex-provider-recovery", in: error).exists)
+        let retryCodex = element("course-settings-codex-retry", in: error)
+        for _ in 0..<4 where !retryCodex.isHittable {
+            error.swipeUp()
+        }
+        XCTAssertTrue(retryCodex.isHittable)
         attachScreenshot(named: "LF-27 agent error", app: error)
         assertStrictIsolation(in: error)
         error.terminate()

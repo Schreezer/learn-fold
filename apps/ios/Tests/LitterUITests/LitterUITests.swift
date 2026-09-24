@@ -139,11 +139,15 @@ final class LitterUITests: XCTestCase {
         courseAgentMenu.tap()
 
         XCTAssertTrue(app.navigationBars["Course Settings"].waitForExistence(timeout: 5))
+        let addCustomProvider = identifiedElement("course-settings-byok", in: app)
+        XCTAssertTrue(
+            scrollUntilHittable(addCustomProvider, in: app),
+            "The API key option should be available even when Codex is not selected"
+        )
         let codex = identifiedElement("course-settings-agent-codex", in: app)
         XCTAssertTrue(scrollUntilHittable(codex, in: app))
         codex.tap()
 
-        let addCustomProvider = app.buttons["Add custom provider"]
         XCTAssertTrue(
             scrollUntilHittable(addCustomProvider, in: app),
             "Selecting Codex should update the local draft without launching OAuth"
@@ -156,6 +160,17 @@ final class LitterUITests: XCTestCase {
         XCTAssertEqual(formMarker.label, "Connection")
         XCTAssertEqual(formMarker.value as? String, "ready")
         attachScreenshot(named: "Codex custom provider draft before Save", app: app)
+
+        let providerSave = identifiedElement("custom-provider-save", in: app)
+        XCTAssertFalse(providerSave.isEnabled)
+        let apiKey = identifiedElement("custom-provider-api-key", in: app)
+        XCTAssertTrue(scrollUntilHittable(apiKey, in: app))
+        apiKey.tap()
+        apiKey.typeText("test-key-only")
+        XCTAssertTrue(
+            providerSave.isEnabled,
+            "An API key alone should enable the default OpenAI provider"
+        )
     }
 
     @MainActor

@@ -840,8 +840,8 @@ private struct CourseAgentCustomProviderButton: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(
                         hasCustomEndpoint
-                            ? "Custom provider connected"
-                            : "Use an OpenAI-compatible provider"
+                            ? "Your API key is configured"
+                            : "Use your own API key"
                     )
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.primary)
@@ -875,7 +875,10 @@ private struct CourseAgentSetupConnectionControls: View {
     let agentID: String
     let connectionState: CourseExperienceStore.AgentConnectionState
     let isAgentAvailable: Bool
+    let needsAuthentication: Bool
+    let isSigningIn: Bool
     let onConnect: () -> Void
+    let onSignIn: () -> Void
 
     var body: some View {
         VStack(spacing: 12) {
@@ -901,6 +904,20 @@ private struct CourseAgentSetupConnectionControls: View {
             .buttonStyle(.plain)
             .accessibilityIdentifier("course-agent-connect")
             .disabled(connectionState == .connecting || !isAgentAvailable)
+
+            if agentID == CourseAgentProvider.codex,
+               needsAuthentication {
+                Button(action: onSignIn) {
+                    Label(
+                        isSigningIn ? "Opening ChatGPT sign-in…" : "Sign in again with ChatGPT",
+                        systemImage: "person.crop.circle.badge.checkmark"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isSigningIn || connectionState == .connecting)
+                .accessibilityIdentifier("course-agent-sign-in-again")
+            }
 
             Label {
                 Text(agentID == CourseAgentProvider.hosted
@@ -1112,6 +1129,8 @@ private struct CourseAgentSetupView: View {
     @State private var showsOpenAICompatibleSetup = false
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
     @State private var hasExplicitUserSelection = false
+    @State private var isSigningIn = false
+    @State private var signInTask: Task<Void, Never>?
 
     init(
         store: CourseExperienceStore,
@@ -1153,6 +1172,8 @@ private struct CourseAgentSetupView: View {
                         isAgentAvailable: store.agentOptions.first(where: {
                             $0.id == selectedAgent
                         })?.available == true,
+                        needsAuthentication: store.agentNeedsAuthentication,
+                        isSigningIn: isSigningIn,
                         onConnect: {
                             hasExplicitUserSelection = true
                             Task {
@@ -1162,7 +1183,8 @@ private struct CourseAgentSetupView: View {
                                     modelID: selectedModelID.isEmpty ? nil : selectedModelID
                                 )
                             }
-                        }
+                        },
+                        onSignIn: signInAndConnectCodex
                     )
                 }
                 .padding(.horizontal, 22)
@@ -1221,6 +1243,35 @@ private struct CourseAgentSetupView: View {
                 hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
             }
             .environment(appModel)
+        }
+        .onDisappear {
+            signInTask?.cancel()
+            signInTask = nil
+        }
+    }
+
+    @MainActor
+    private func signInAndConnectCodex() {
+        guard !isSigningIn, selectedAgent == CourseAgentProvider.codex else { return }
+        isSigningIn = true
+        signInTask = Task { @MainActor in
+            defer {
+                isSigningIn = false
+                signInTask = nil
+            }
+            do {
+                try await appModel.loginLocalChatGPTAccountOnThisDevice()
+                guard !Task.isCancelled else { return }
+                await store.connectLocalAgent(
+                    appModel: appModel,
+                    agentID: CourseAgentProvider.codex,
+                    modelID: selectedModelID.isEmpty ? nil : selectedModelID
+                )
+            } catch ChatGPTOAuthError.cancelled {
+                store.agentError = "ChatGPT sign-in was cancelled. Your course agent has not changed."
+            } catch {
+                store.agentError = "ChatGPT sign-in did not finish. Please try again."
+            }
         }
     }
 }
@@ -1633,6 +1684,13 @@ private struct CourseAgentModelSection: View {
 
 private struct CourseAgentSettingsErrorSection: View {
     let message: String
+    let showsCodexRecovery: Bool
+    let showsChatGPTSignIn: Bool
+    let hasCustomEndpoint: Bool
+    let isSigningIn: Bool
+    let onSignIn: () -> Void
+    let onRetry: () -> Void
+    let onOpenProvider: () -> Void
 
     var body: some View {
         Section {
@@ -1643,6 +1701,32 @@ private struct CourseAgentSettingsErrorSection: View {
                     .accessibilityIdentifier("course-settings-agent-error")
             }
             .foregroundStyle(.red)
+
+            if showsCodexRecovery {
+                if showsChatGPTSignIn {
+                    Button(action: onSignIn) {
+                        Label(
+                            isSigningIn ? "Opening ChatGPT sign-in…" : "Sign in again with ChatGPT",
+                            systemImage: "person.crop.circle.badge.checkmark"
+                        )
+                    }
+                    .disabled(isSigningIn)
+                    .accessibilityIdentifier("course-settings-codex-sign-in")
+                }
+
+                Button(action: onOpenProvider) {
+                    Label(
+                        hasCustomEndpoint ? "Edit your API key and endpoint" : "Use your own API key",
+                        systemImage: "key.horizontal"
+                    )
+                }
+                .disabled(isSigningIn)
+                .accessibilityIdentifier("course-settings-codex-provider-recovery")
+
+                Button("Try Codex again", action: onRetry)
+                    .disabled(isSigningIn)
+                    .accessibilityIdentifier("course-settings-codex-retry")
+            }
         }
     }
 }
@@ -1657,6 +1741,11 @@ private struct CourseAgentSettingsView: View {
     @State private var selectedEffort: String
     @State private var showsOpenAICompatibleSetup = false
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
+    @State private var hasStoredAPIKey = OpenAIApiKeyStore.shared.hasStoredKey
+    @State private var configuredProviderModelID = (try? OpenAIApiKeyStore.shared.loadModelID()) ?? ""
+    @State private var pendingCodexDraft: CourseAgentSettingsDraft?
+    @State private var isSigningIn = false
+    @State private var signInTask: Task<Void, Never>?
     @State private var cloudSyncAvailability: CourseCloudSyncAvailability = .missingEntitlement
     @State private var isRetryingCloudSync = false
     @State private var saveTask: Task<Void, Never>?
@@ -1678,6 +1767,10 @@ private struct CourseAgentSettingsView: View {
 
     private var selectedModelInfo: ModelInfo? {
         models.first(where: { $0.id == selectedModel || $0.model == selectedModel })
+    }
+
+    private var usesCustomEndpoint: Bool {
+        hasCustomEndpoint && !appModel.prefersLocalChatGPTAuth
     }
 
     private var connectedHermesServer: AppServerSnapshot? {
@@ -1732,7 +1825,67 @@ private struct CourseAgentSettingsView: View {
                     Text("Only agents currently available through this device or the selected server are shown.")
                 }
 
-                if CourseAgentProvider.usesAppServer(selectedAgent) {
+                if let error = store.agentError {
+                    CourseAgentSettingsErrorSection(
+                        message: error,
+                        showsCodexRecovery: pendingCodexDraft != nil
+                            || store.selectedAgentID == CourseAgentProvider.codex
+                            || (store.agentNeedsAuthentication
+                                && store.activeAgentID == CourseAgentProvider.codex),
+                        showsChatGPTSignIn: store.agentNeedsAuthentication,
+                        hasCustomEndpoint: hasCustomEndpoint,
+                        isSigningIn: isSigningIn,
+                        onSignIn: signInAndRetryCodex,
+                        onRetry: retryCodexSelection,
+                        onOpenProvider: { showsOpenAICompatibleSetup = true }
+                    )
+                }
+
+                Section {
+                    Button {
+                        showsOpenAICompatibleSetup = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "key.horizontal")
+                                .frame(width: 24)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(hasStoredAPIKey ? "Manage your API key" : "Use your own API key")
+                                    .foregroundStyle(.primary)
+                                Text(
+                                    hasCustomEndpoint && !configuredProviderModelID.isEmpty
+                                        ? "Configured for Codex · \(configuredProviderModelID)"
+                                        : hasStoredAPIKey
+                                            ? "OpenAI API key saved on this iPhone"
+                                            : "API key; optional custom URL and model ID"
+                                )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .accessibilityIdentifier("course-settings-byok")
+                } header: {
+                    Text("Your provider")
+                } footer: {
+                    Text("Uses Codex on this iPhone. Endpoint changes affect existing Codex conversations too.")
+                }
+
+                if selectedAgent == CourseAgentProvider.codex, usesCustomEndpoint {
+                    Section("Model") {
+                        LabeledContent(
+                            "Your model",
+                            value: selectedModel.isEmpty ? "Choose a model ID" : selectedModel
+                        )
+                        Button("Change model or provider") {
+                            showsOpenAICompatibleSetup = true
+                        }
+                        .accessibilityIdentifier("course-settings-custom-model")
+                    }
+                } else if CourseAgentProvider.usesAppServer(selectedAgent) {
                     CourseAgentModelSection(
                         agentID: selectedAgent,
                         models: models,
@@ -1745,7 +1898,9 @@ private struct CourseAgentSettingsView: View {
                     )
                 }
 
-                if let selectedModelInfo, !selectedModelInfo.supportedReasoningEfforts.isEmpty {
+                if !(selectedAgent == CourseAgentProvider.codex && usesCustomEndpoint),
+                   let selectedModelInfo,
+                   !selectedModelInfo.supportedReasoningEfforts.isEmpty {
                     Section("Reasoning") {
                         Picker("Effort", selection: $selectedEffort) {
                             ForEach(selectedModelInfo.supportedReasoningEfforts) { option in
@@ -1753,41 +1908,6 @@ private struct CourseAgentSettingsView: View {
                                     .tag(option.reasoningEffort.wireValue)
                             }
                         }
-                    }
-                }
-
-                if selectedAgent == "codex" {
-                    Section {
-                        Button {
-                            showsOpenAICompatibleSetup = true
-                        } label: {
-                            HStack {
-                                Label(
-                                    hasCustomEndpoint ? "Manage custom provider" : "Add custom provider",
-                                    systemImage: "point.3.connected.trianglepath.dotted"
-                                )
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-
-                        if hasCustomEndpoint {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("OpenAI-compatible endpoint active")
-                                    .font(.subheadline.weight(.semibold))
-                                if !selectedModel.isEmpty {
-                                    Text("New courses will request model “\(selectedModel)”.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    } header: {
-                        Text("Custom provider")
-                    } footer: {
-                        Text("Uses Learnfold’s existing local Codex runtime. Endpoint changes are app-wide and affect existing Codex conversations too.")
                     }
                 }
 
@@ -1828,9 +1948,6 @@ private struct CourseAgentSettingsView: View {
                     Text("Connecting Hermes authorizes it to use Learnfold’s phone-side course tools for your course turns. The shell is confined to the active course folder, read-only until you approve the course plan and read-write afterward. It cannot access sibling courses or make outbound network connections.")
                 }
 
-                if let error = store.agentError {
-                    CourseAgentSettingsErrorSection(message: error)
-                }
             }
             .task {
                 cloudSyncAvailability = await CourseCloudSyncEngine.shared.availability
@@ -1862,12 +1979,33 @@ private struct CourseAgentSettingsView: View {
                     selectedModel = store.presentedDefaultModelID(for: selectedAgent) ?? ""
                 }
                 hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
+                hasStoredAPIKey = OpenAIApiKeyStore.shared.hasStoredKey
+                configuredProviderModelID = (try? OpenAIApiKeyStore.shared.loadModelID()) ?? ""
+                if selectedAgent == CourseAgentProvider.codex,
+                   usesCustomEndpoint,
+                   !configuredProviderModelID.isEmpty {
+                    selectedModel = configuredProviderModelID
+                    selectedEffort = ""
+                }
             }
             .sheet(isPresented: $showsOpenAICompatibleSetup) {
-                OpenAICompatibleProviderSheet(initialModelID: selectedModel) { modelID in
-                    selectedModel = modelID
-                    selectedEffort = ""
+                OpenAICompatibleProviderSheet(
+                    initialModelID: selectedAgent == CourseAgentProvider.codex ? selectedModel : ""
+                ) { modelID in
                     hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
+                    hasStoredAPIKey = OpenAIApiKeyStore.shared.hasStoredKey
+                    configuredProviderModelID = (try? OpenAIApiKeyStore.shared.loadModelID()) ?? ""
+                    if hasStoredAPIKey {
+                        selectedAgent = CourseAgentProvider.codex
+                        selectedModel = modelID.isEmpty
+                            ? store.presentedDefaultModelID(for: CourseAgentProvider.codex) ?? ""
+                            : modelID
+                        selectedEffort = ""
+                    } else if selectedAgent == CourseAgentProvider.codex {
+                        selectedModel = store.presentedDefaultModelID(for: CourseAgentProvider.codex) ?? ""
+                    }
+                    store.agentError = nil
+                    pendingCodexDraft = nil
                 }
                 .environment(appModel)
             }
@@ -1875,6 +2013,8 @@ private struct CourseAgentSettingsView: View {
             .onDisappear {
                 saveTask?.cancel()
                 saveTask = nil
+                signInTask?.cancel()
+                signInTask = nil
             }
         }
     }
@@ -1894,6 +2034,7 @@ private struct CourseAgentSettingsView: View {
     private func startSave() {
         guard saveTask == nil else { return }
         let draft = currentDraft
+        pendingCodexDraft = draft.agentID == CourseAgentProvider.codex ? draft : nil
         saveTask = Task { @MainActor in
             let didSave = await store.connectLocalAgent(
                 appModel: appModel,
@@ -1919,6 +2060,8 @@ private struct CourseAgentSettingsView: View {
     }
 
     private func selectAgent(_ option: CourseAgentOption) {
+        store.agentError = nil
+        pendingCodexDraft = nil
         let optionModels = store.presentedModels(for: option.id)
         let defaultModel = optionModels.first(where: \.isDefault) ?? optionModels.first
         let proposed = CourseAgentSettingsDraft(
@@ -1927,6 +2070,47 @@ private struct CourseAgentSettingsView: View {
             effortID: defaultModel?.defaultReasoningEffort.wireValue ?? ""
         )
         applyDraft(CourseAgentSettingsDraftPolicy.afterSelection(proposed: proposed))
+    }
+
+    @MainActor
+    private func retryCodexSelection() {
+        let draft = pendingCodexDraft ?? currentDraft
+        if draft.agentID == CourseAgentProvider.codex {
+            applyDraft(draft)
+            startSave()
+        } else if store.activeAgentID == CourseAgentProvider.codex {
+            Task { await store.refreshAgentReadiness(appModel: appModel) }
+        }
+    }
+
+    @MainActor
+    private func signInAndRetryCodex() {
+        let draft = pendingCodexDraft ?? currentDraft
+        guard !isSigningIn,
+              draft.agentID == CourseAgentProvider.codex
+                || store.activeAgentID == CourseAgentProvider.codex else { return }
+        isSigningIn = true
+        signInTask = Task { @MainActor in
+            defer {
+                isSigningIn = false
+                signInTask = nil
+            }
+            do {
+                try await appModel.loginLocalChatGPTAccountOnThisDevice()
+                guard !Task.isCancelled else { return }
+                store.agentError = nil
+                if draft.agentID == CourseAgentProvider.codex {
+                    applyDraft(draft)
+                    startSave()
+                } else {
+                    await store.refreshAgentReadiness(appModel: appModel)
+                }
+            } catch ChatGPTOAuthError.cancelled {
+                store.agentError = "ChatGPT sign-in was cancelled. Your course agent has not changed."
+            } catch {
+                store.agentError = "ChatGPT sign-in did not finish. Please try again."
+            }
+        }
     }
 
     @MainActor
@@ -2022,26 +2206,41 @@ private struct OpenAICompatibleProviderForm: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("https://provider.example/v1", text: $baseURL)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Base URL (optional)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("https://provider.example/v1", text: $baseURL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.URL)
+                            .accessibilityIdentifier("custom-provider-base-url")
+                    }
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("API key")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        SecureField(
+                            hasStoredKey
+                                ? "Saved — enter a new key to replace"
+                                : "Enter API key",
+                            text: $apiKey
+                        )
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                        .accessibilityIdentifier("custom-provider-base-url")
+                        .accessibilityIdentifier("custom-provider-api-key")
+                    }
 
-                    SecureField(
-                        hasStoredKey
-                            ? "API key saved — enter to replace"
-                            : "API key",
-                        text: $apiKey
-                    )
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .accessibilityIdentifier("custom-provider-api-key")
-
-                    TextField("Model ID, for example gpt-oss-120b", text: $modelID)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .accessibilityIdentifier("custom-provider-model-id")
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Model ID (for a custom URL)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("For example gpt-oss-120b", text: $modelID)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("custom-provider-model-id")
+                    }
                 } header: {
                     Text("Connection")
                         .accessibilityIdentifier("custom-provider-form")
@@ -2049,7 +2248,7 @@ private struct OpenAICompatibleProviderForm: View {
                             isSaving ? "saving" : (errorMessage == nil ? "ready" : "error")
                         )
                 } footer: {
-                    Text("The API key and base URL are stored securely on this iPhone. The model ID is sent exactly as entered.")
+                    Text("For OpenAI, enter only your API key. For another provider, add its base URL and model ID. These settings are saved on this iPhone.")
                 }
 
                 Section {
@@ -2059,7 +2258,7 @@ private struct OpenAICompatibleProviderForm: View {
                 } header: {
                     Text("How it works")
                 } footer: {
-                    Text("Compatibility requires the OpenAI Responses API, streaming, and tool calling. A chat-completions-only endpoint may not work with Codex. Changing this endpoint restarts local Codex and affects existing Codex conversations too.")
+                    Text("A custom endpoint needs the OpenAI Responses API, streaming, and tool calling. A chat-completions-only endpoint may not work with Codex. Changing the key or endpoint restarts local Codex and affects existing Codex conversations too.")
                 }
 
                 if isSaving {
@@ -2077,7 +2276,7 @@ private struct OpenAICompatibleProviderForm: View {
                 if hasStoredBaseURL {
                     Section {
                         Button(
-                            "Use Default OpenAI Endpoint",
+                            "Remove custom endpoint",
                             role: .destructive,
                             action: onClearCustomEndpoint
                         )
@@ -2130,10 +2329,49 @@ private struct OpenAICompatibleProviderSheet: View {
     @State private var isSaving = false
     @State private var errorMessage: String?
 
+    private struct SavedConfiguration {
+        let baseURL: String?
+        let apiKey: String?
+        let modelID: String?
+
+        static func load() throws -> Self {
+            let credentials = OpenAIApiKeyStore.shared
+            return Self(
+                baseURL: try credentials.loadBaseURL(),
+                apiKey: try credentials.load(),
+                modelID: try credentials.loadModelID()
+            )
+        }
+
+        func restore() throws {
+            let credentials = OpenAIApiKeyStore.shared
+            if let apiKey {
+                try credentials.save(apiKey)
+            } else {
+                try credentials.clear()
+            }
+            if let baseURL {
+                try credentials.saveBaseURL(baseURL)
+            } else {
+                try credentials.clearBaseURL()
+            }
+            if let modelID {
+                try credentials.saveModelID(modelID)
+            } else {
+                try credentials.clearModelID()
+            }
+        }
+    }
+
     init(initialModelID: String, onSaved: @escaping (String) -> Void) {
         self.onSaved = onSaved
-        _baseURL = State(initialValue: (try? OpenAIApiKeyStore.shared.loadBaseURL()) ?? "")
-        _modelID = State(initialValue: initialModelID)
+        let savedBaseURL = (try? OpenAIApiKeyStore.shared.loadBaseURL()) ?? ""
+        _baseURL = State(initialValue: savedBaseURL)
+        _modelID = State(
+            initialValue: savedBaseURL.isEmpty
+                ? ""
+                : (try? OpenAIApiKeyStore.shared.loadModelID()) ?? initialModelID
+        )
     }
 
     var body: some View {
@@ -2155,17 +2393,36 @@ private struct OpenAICompatibleProviderSheet: View {
     }
 
     private var canSave: Bool {
-        OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL) != nil
+        let hasKey = hasStoredKey || !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedBaseURL.isEmpty {
+            return hasKey && trimmedModelID.isEmpty
+        }
+        return hasKey
+            && OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL) != nil
             && OpenAICompatibleProviderConfiguration.normalizedModelID(modelID) != nil
-            && (hasStoredKey || !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     @MainActor
     private func save() async {
-        guard let normalizedBaseURL = OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL),
-              let normalizedModelID = OpenAICompatibleProviderConfiguration.normalizedModelID(modelID) else {
-            errorMessage = "Enter a valid http or https base URL and a model ID."
-            return
+        let normalizedBaseURL: String?
+        let normalizedModelID: String?
+        if baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                errorMessage = "Add a base URL for a custom model, or leave both fields blank for OpenAI."
+                return
+            }
+            normalizedBaseURL = nil
+            normalizedModelID = nil
+        } else {
+            guard let baseURL = OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL),
+                  let modelID = OpenAICompatibleProviderConfiguration.normalizedModelID(modelID) else {
+                errorMessage = "Enter a valid http or https base URL and a model ID."
+                return
+            }
+            normalizedBaseURL = baseURL
+            normalizedModelID = modelID
         }
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard hasStoredKey || !trimmedKey.isEmpty else {
@@ -2175,8 +2432,11 @@ private struct OpenAICompatibleProviderSheet: View {
 
         isSaving = true
         defer { isSaving = false }
+        var previousConfiguration: SavedConfiguration?
+        let previousAuthPreference = appModel.localAuthPreference
         do {
             errorMessage = nil
+            previousConfiguration = try SavedConfiguration.load()
             #if DEBUG
             switch LF05LiveAcceptanceControl.current() {
             case .saving:
@@ -2193,14 +2453,34 @@ private struct OpenAICompatibleProviderSheet: View {
             if !trimmedKey.isEmpty {
                 try OpenAIApiKeyStore.shared.save(trimmedKey)
             }
-            try OpenAIApiKeyStore.shared.saveBaseURL(normalizedBaseURL)
+            if let normalizedBaseURL {
+                try OpenAIApiKeyStore.shared.saveBaseURL(normalizedBaseURL)
+            } else {
+                try OpenAIApiKeyStore.shared.clearBaseURL()
+            }
+            if let normalizedModelID {
+                try OpenAIApiKeyStore.shared.saveModelID(normalizedModelID)
+            } else {
+                try OpenAIApiKeyStore.shared.clearModelID()
+            }
+            appModel.setLocalAuthPreference(.apiKey)
             try await appModel.restartLocalServer()
             hasStoredKey = OpenAIApiKeyStore.shared.hasStoredKey
             hasStoredBaseURL = OpenAIApiKeyStore.shared.hasStoredBaseURL
-            onSaved(normalizedModelID)
+            onSaved(normalizedModelID ?? "")
             dismiss()
         } catch {
-            errorMessage = error.localizedDescription
+            if let previousConfiguration {
+                do {
+                    try previousConfiguration.restore()
+                    appModel.setLocalAuthPreference(previousAuthPreference)
+                    try await appModel.restartLocalServer()
+                } catch {
+                    errorMessage = "Provider settings could not be restored. Check the saved key and endpoint before retrying."
+                    return
+                }
+            }
+            errorMessage = "The provider could not be saved. Your previous settings were restored; try again."
         }
     }
 
@@ -2208,15 +2488,27 @@ private struct OpenAICompatibleProviderSheet: View {
     private func clearCustomEndpoint() async {
         isSaving = true
         defer { isSaving = false }
+        var previousConfiguration: SavedConfiguration?
         do {
             errorMessage = nil
+            previousConfiguration = try SavedConfiguration.load()
             try OpenAIApiKeyStore.shared.clearBaseURL()
+            try OpenAIApiKeyStore.shared.clearModelID()
             try await appModel.restartLocalServer()
             hasStoredBaseURL = false
             onSaved("")
             dismiss()
         } catch {
-            errorMessage = error.localizedDescription
+            if let previousConfiguration {
+                do {
+                    try previousConfiguration.restore()
+                    try await appModel.restartLocalServer()
+                } catch {
+                    errorMessage = "The previous endpoint could not be restored. Check provider settings before retrying."
+                    return
+                }
+            }
+            errorMessage = "The custom endpoint could not be removed. Your previous settings were restored; try again."
         }
     }
 }
@@ -4363,7 +4655,10 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
                         agentID: "codex",
                         connectionState: .idle,
                         isAgentAvailable: true,
-                        onConnect: recordMemoryOnlyAction
+                        needsAuthentication: false,
+                        isSigningIn: false,
+                        onConnect: recordMemoryOnlyAction,
+                        onSignIn: recordMemoryOnlyAction
                     )
                 }
                 .padding(20)
@@ -4392,10 +4687,13 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
                         agentID: "codex",
                         connectionState: setupConnectionState,
                         isAgentAvailable: true,
+                        needsAuthentication: false,
+                        isSigningIn: false,
                         onConnect: {
                             recordMemoryOnlyAction()
                             didRetry = true
-                        }
+                        },
+                        onSignIn: recordMemoryOnlyAction
                     )
                 }
                 .padding(20)
@@ -4517,7 +4815,14 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
 
                     if scenario == .lf27AgentError {
                         CourseAgentSettingsErrorSection(
-                            message: "The selected agent’s model catalog could not be loaded. Try again."
+                            message: "ChatGPT sign-in could not be verified. Sign in again or try again.",
+                            showsCodexRecovery: true,
+                            showsChatGPTSignIn: true,
+                            hasCustomEndpoint: false,
+                            isSigningIn: false,
+                            onSignIn: recordMemoryOnlyAction,
+                            onRetry: recordMemoryOnlyAction,
+                            onOpenProvider: recordMemoryOnlyAction
                         )
                     }
                 }

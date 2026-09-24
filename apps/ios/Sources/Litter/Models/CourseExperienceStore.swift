@@ -133,6 +133,7 @@ private enum CourseAgentSelectionError: LocalizedError {
 enum CourseAgentReadinessOutcome: Equatable {
     case ready(serverID: String)
     case cancelled
+    case authenticationRequired(String)
     case failed(String)
 }
 
@@ -180,17 +181,25 @@ enum CourseCodexLiveProbePolicy {
     static func strategy(
         auth: AuthStatus,
         storedBaseURL: String?,
-        storedAPIKey: String?
+        storedAPIKey: String?,
+        prefersChatGPT: Bool = false
     ) -> CourseCodexLiveProbeStrategy {
+        if prefersChatGPT,
+           auth.authMethod == .chatgpt || auth.authMethod == .chatgptAuthTokens {
+            return .rateLimits
+        }
+        if let storedBaseURL {
+            guard let storedAPIKey else { return .credentialsUnavailable }
+            return .openAICompatible(baseURL: storedBaseURL, apiKey: storedAPIKey)
+        }
+        if let storedAPIKey {
+            return .openAICompatible(
+                baseURL: "https://api.openai.com/v1",
+                apiKey: storedAPIKey
+            )
+        }
         guard auth.requiresOpenaiAuth == true else {
-            switch (storedBaseURL, storedAPIKey) {
-            case (nil, nil):
-                return .noProbeRequired
-            case let (storedBaseURL?, storedAPIKey?):
-                return .openAICompatible(baseURL: storedBaseURL, apiKey: storedAPIKey)
-            default:
-                return .credentialsUnavailable
-            }
+            return .noProbeRequired
         }
 
         switch auth.authMethod {
@@ -198,11 +207,8 @@ enum CourseCodexLiveProbePolicy {
             guard let token = auth.authToken, !token.isEmpty else {
                 return .credentialsUnavailable
             }
-            guard (storedBaseURL == nil) == (storedAPIKey == nil) else {
-                return .credentialsUnavailable
-            }
             return .openAICompatible(
-                baseURL: storedBaseURL ?? "https://api.openai.com/v1",
+                baseURL: "https://api.openai.com/v1",
                 apiKey: token
             )
         case .chatgpt, .chatgptAuthTokens:
@@ -275,33 +281,73 @@ struct LiveCourseAgentReadinessProbe: CourseAgentReadinessProbing {
                 return .cancelled
             }
 
-            let auth = try await appModel.client.authStatus(
+            var auth = try await appModel.client.authStatus(
                 serverId: serverID,
                 params: AuthStatusRequest(includeToken: true, refreshToken: true)
             )
+            if providerConfiguration.apiKey != nil,
+               !appModel.prefersLocalChatGPTAuth,
+               auth.requiresOpenaiAuth == true,
+               auth.authMethod != .apiKey {
+                // An older launch may still have ChatGPT attached even though
+                // this device has a saved API key for local Codex.
+                await appModel.restoreStoredLocalAuthState(serverId: serverID)
+                auth = try await appModel.client.authStatus(
+                    serverId: serverID,
+                    params: AuthStatusRequest(includeToken: true, refreshToken: true)
+                )
+                guard auth.authMethod == .apiKey else {
+                    return .failed(
+                        "The custom provider could not be activated. Check its settings and try again."
+                    )
+                }
+            }
             let strategy = CourseCodexLiveProbePolicy.strategy(
                 auth: auth,
                 storedBaseURL: providerConfiguration.baseURL,
-                storedAPIKey: providerConfiguration.apiKey
+                storedAPIKey: providerConfiguration.apiKey,
+                prefersChatGPT: appModel.prefersLocalChatGPTAuth
             )
             switch strategy {
             case .openAICompatible(let baseURL, let apiKey):
-                try await appModel.client.probeOpenaiCompatibleCredentials(
-                    baseUrl: baseURL,
-                    apiKey: apiKey
-                )
+                do {
+                    try await appModel.client.probeOpenaiCompatibleCredentials(
+                        baseUrl: baseURL,
+                        apiKey: apiKey
+                    )
+                } catch {
+                    return .failed(
+                        "The API endpoint could not be verified. Check its URL and key, then try again."
+                    )
+                }
             case .rateLimits:
-                try await appModel.client.refreshRateLimits(serverId: serverID)
+                do {
+                    try await appModel.client.refreshRateLimits(serverId: serverID)
+                } catch ClientError.AuthenticationRequired {
+                    if auth.authMethod == .chatgpt || auth.authMethod == .chatgptAuthTokens {
+                        return .authenticationRequired(
+                            "ChatGPT sign-in could not be verified. Sign in again or try again."
+                        )
+                    }
+                    return .failed("Codex credentials could not be verified. Try again.")
+                } catch {
+                    return .failed("Codex could not be checked right now. Check its connection and try again.")
+                }
             case .noProbeRequired:
                 break
             case .credentialsUnavailable:
-                return .failed(CourseAgentSelectionError.codexCredentialsUnavailable.localizedDescription)
+                if providerConfiguration.baseURL != nil || providerConfiguration.apiKey != nil {
+                    return .failed("The custom provider needs a valid base URL and API key.")
+                }
+                return .authenticationRequired(
+                    "Sign in with ChatGPT or add your own API key to use Codex."
+                )
             }
 
             await appModel.refreshSnapshot()
             return .ready(serverID: serverID)
         } catch {
-            return .failed(error.localizedDescription)
+            return .failed("Codex could not be checked right now. Check its connection and try again.")
         }
     }
 }
@@ -3027,6 +3073,36 @@ final class CourseExperienceStore {
     }
 
     @discardableResult
+    func applyMainAgentAuthenticationRequired(
+        identity: MainCourseAgentReadinessIdentity
+    ) -> Bool {
+        guard isCurrentMainAgentReadinessIdentity(identity),
+              identity.runtimeID == .codex else { return false }
+        clearMainReadinessError()
+        agentNeedsAuthentication = true
+        connectionState = .idle
+        if agentError == nil {
+            agentError = "Your ChatGPT session needs to be renewed. Sign in again to continue with Codex."
+        }
+        return true
+    }
+
+    @discardableResult
+    func applySelectionDiscussionAuthenticationRequired(id discussionID: UUID) -> Bool {
+        guard let discussion = selectionDiscussion(id: discussionID),
+              discussion.status == .unresolved,
+              (discussion.agentRuntimeKind ?? .codex) == .codex else { return false }
+        clearSelectionReadinessError(id: discussionID)
+        selectionAuthenticationRequired.insert(discussionID)
+        selectionConnectionStates[discussionID] = .idle
+        if selectionDiscussionErrors[discussionID] == nil {
+            selectionDiscussionErrors[discussionID] =
+                "Your ChatGPT session needs to be renewed. Sign in again to continue with Codex."
+        }
+        return true
+    }
+
+    @discardableResult
     func applySelectionDiscussionReadiness(
         id discussionID: UUID,
         runtimeID: String,
@@ -3440,7 +3516,7 @@ final class CourseExperienceStore {
                 presentationRequestID: presentationRequestID
             )
         } catch {
-            agentError = error.localizedDescription
+            agentError = "Course agents could not be loaded. Check the connection and try again."
         }
     }
 
@@ -3587,10 +3663,15 @@ final class CourseExperienceStore {
                     agentError = "Codex was not selected because sign-in was cancelled or not completed."
                     if !hadCompletedSetup { disconnectForAgentPicker() }
                     return false
-                case .failed(let message):
+                case .authenticationRequired(let message):
                     connectionState = .failed(message)
                     agentNeedsAuthentication = true
-                    agentError = "Codex was not selected because its credentials could not be verified. \(message)"
+                    agentError = message
+                    return false
+                case .failed(let message):
+                    connectionState = .failed(message)
+                    agentNeedsAuthentication = false
+                    agentError = message
                     return false
                 }
             } else {
@@ -3657,11 +3738,13 @@ final class CourseExperienceStore {
             return true
         } catch {
             LLog.error("course-agent", "could not connect the local course agent", error: error)
-            connectionState = .failed(error.localizedDescription)
             if agentID == .codex {
-                agentNeedsAuthentication = true
-                agentError = "Codex was not selected because its local sign-in could not be verified. \(error.localizedDescription)"
+                let message = "Codex could not be checked right now. Check its connection and try again."
+                connectionState = .failed(message)
+                agentNeedsAuthentication = false
+                agentError = message
             } else {
+                connectionState = .failed("\(agentID.titleDisplayLabel) is unavailable right now.")
                 agentError =
                     "\(agentID.titleDisplayLabel) is unavailable right now. Check the selected server connection and try again."
             }
@@ -3688,9 +3771,13 @@ final class CourseExperienceStore {
             agentNeedsAuthentication = true
             agentError = "Codex was not selected because sign-in was cancelled or not completed."
             return false
-        case .failed(let message):
+        case .authenticationRequired(let message):
             agentNeedsAuthentication = true
-            agentError = "Codex was not selected because its credentials could not be verified. \(message)"
+            agentError = message
+            return false
+        case .failed(let message):
+            agentNeedsAuthentication = false
+            agentError = message
             return false
         }
     }
@@ -6371,7 +6458,10 @@ final class CourseExperienceStore {
                 selectionDiscussionErrors[discussionID] =
                     "The focused discussion couldn’t be opened. Check \(runtimeID.displayLabel) and try again."
             }
-            selectionConnectionStates[discussionID] = .failed(error.localizedDescription)
+            selectionConnectionStates[discussionID] = .failed(
+                selectionDiscussionErrors[discussionID]
+                    ?? "The focused discussion couldn’t be opened. Check \(runtimeID.displayLabel) and try again."
+            )
         }
     }
 
@@ -7463,6 +7553,9 @@ final class CourseExperienceStore {
                     params: AppRefreshAccountRequest(refreshToken: false)
                 )
                 await appModel.refreshSnapshot()
+                if case .chatgpt? = appModel.snapshot?.serverSnapshot(for: serverID)?.account {
+                    try await appModel.client.refreshRateLimits(serverId: serverID)
+                }
             }
             guard !Task.isCancelled, isCurrentMainAgentReadinessIdentity(identity) else {
                 return
@@ -7485,6 +7578,8 @@ final class CourseExperienceStore {
                     && server.account == nil,
                 identity: identity
             )
+        } catch ClientError.AuthenticationRequired {
+            _ = applyMainAgentAuthenticationRequired(identity: identity)
         } catch {
             guard applyMainAgentReadinessFailure(error, identity: identity) else { return }
             LLog.error("course-agent", "could not refresh course agent readiness", error: error)
@@ -7524,6 +7619,9 @@ final class CourseExperienceStore {
                     params: AppRefreshAccountRequest(refreshToken: false)
                 )
                 await appModel.refreshSnapshot()
+                if case .chatgpt? = appModel.snapshot?.serverSnapshot(for: serverID)?.account {
+                    try await appModel.client.refreshRateLimits(serverId: serverID)
+                }
             }
             guard let server = appModel.snapshot?.serverSnapshot(for: serverID) else {
                 selectionConnectionStates[discussionID] = .idle
@@ -7540,6 +7638,8 @@ final class CourseExperienceStore {
                     && server.requiresOpenaiAuth
                     && server.account == nil
             )
+        } catch ClientError.AuthenticationRequired {
+            _ = applySelectionDiscussionAuthenticationRequired(id: discussionID)
         } catch {
             let message = "\(runtimeID.displayLabel) is unavailable right now. Check its connection and try again."
             selectionConnectionStates[discussionID] = .failed(message)
@@ -7594,8 +7694,11 @@ final class CourseExperienceStore {
                 runtimeAvailable: true,
                 needsAuthentication: false
             )
+        } catch ClientError.AuthenticationRequired {
+            _ = applySelectionDiscussionAuthenticationRequired(id: discussionID)
+            return false
         } catch {
-            let message = error.localizedDescription
+            let message = "\(runtimeID.displayLabel) is unavailable right now. Check its connection and try again."
             selectionConnectionStates[discussionID] = .failed(message)
             recordSelectionReadinessError(message, id: discussionID)
             return false

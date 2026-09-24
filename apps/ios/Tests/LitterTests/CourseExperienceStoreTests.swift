@@ -4486,6 +4486,7 @@ final class CourseExperienceStoreTests: XCTestCase {
     func testFailedAndCancelledCodexReadinessPreservePersistedHermesSelection() async throws {
         for outcome in [
             CourseAgentReadinessOutcome.failed("Credential rejected"),
+            .authenticationRequired("Sign in again with ChatGPT."),
             .cancelled,
         ] {
             let defaults = try makeDefaults()
@@ -4511,6 +4512,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             XCTAssertEqual(store.selectedModelID, "hermes-default")
             XCTAssertEqual(defaults.string(forKey: "snappy.course.selectedAgent"), "hermes")
             XCTAssertEqual(probe.validationCount, 1)
+            XCTAssertEqual(store.agentNeedsAuthentication, outcome != .failed("Credential rejected"))
         }
     }
 
@@ -4585,6 +4587,21 @@ final class CourseExperienceStoreTests: XCTestCase {
                 CourseCodexLiveProbePolicy.strategy(
                     auth: AuthStatus(
                         authMethod: mode,
+                        authToken: "stale-chatgpt-token",
+                        requiresOpenaiAuth: true
+                    ),
+                    storedBaseURL: "https://provider.example/v1",
+                    storedAPIKey: "provider-secret"
+                ),
+                .openAICompatible(
+                    baseURL: "https://provider.example/v1",
+                    apiKey: "provider-secret"
+                )
+            )
+            XCTAssertEqual(
+                CourseCodexLiveProbePolicy.strategy(
+                    auth: AuthStatus(
+                        authMethod: mode,
                         authToken: "",
                         requiresOpenaiAuth: true
                     ),
@@ -4639,31 +4656,55 @@ final class CourseExperienceStoreTests: XCTestCase {
             .noProbeRequired
         )
 
-        for partialConfiguration in [
-            CourseCodexProviderConfiguration(
-                baseURL: "http://provider.test/v1",
-                apiKey: nil
-            ),
-            CourseCodexProviderConfiguration(
-                baseURL: nil,
-                apiKey: "orphaned-secret"
+        for auth in [
+            AuthStatus(requiresOpenaiAuth: false),
+            AuthStatus(
+                authMethod: .chatgptAuthTokens,
+                authToken: "stale-chatgpt-token",
+                requiresOpenaiAuth: true
             ),
         ] {
             XCTAssertEqual(
                 CourseCodexLiveProbePolicy.strategy(
-                    auth: AuthStatus(requiresOpenaiAuth: false),
-                    storedBaseURL: partialConfiguration.baseURL,
-                    storedAPIKey: partialConfiguration.apiKey
+                    auth: auth,
+                    storedBaseURL: nil,
+                    storedAPIKey: "standalone-openai-key"
                 ),
-                .credentialsUnavailable
+                .openAICompatible(
+                    baseURL: "https://api.openai.com/v1",
+                    apiKey: "standalone-openai-key"
+                )
             )
+        }
+        XCTAssertEqual(
+            CourseCodexLiveProbePolicy.strategy(
+                auth: AuthStatus(
+                    authMethod: .chatgptAuthTokens,
+                    authToken: "current-chatgpt-token",
+                    requiresOpenaiAuth: true
+                ),
+                storedBaseURL: "https://provider.example/v1",
+                storedAPIKey: "saved-provider-key",
+                prefersChatGPT: true
+            ),
+            .rateLimits
+        )
+
+        let partialConfiguration = CourseCodexProviderConfiguration(
+            baseURL: "http://provider.test/v1",
+            apiKey: nil
+        )
+        for auth in [
+            AuthStatus(requiresOpenaiAuth: false),
+            AuthStatus(
+                authMethod: .apiKey,
+                authToken: "runtime-secret",
+                requiresOpenaiAuth: true
+            ),
+        ] {
             XCTAssertEqual(
                 CourseCodexLiveProbePolicy.strategy(
-                    auth: AuthStatus(
-                        authMethod: .apiKey,
-                        authToken: "runtime-secret",
-                        requiresOpenaiAuth: true
-                    ),
+                    auth: auth,
                     storedBaseURL: partialConfiguration.baseURL,
                     storedAPIKey: partialConfiguration.apiKey
                 ),
@@ -9578,6 +9619,32 @@ final class CourseExperienceStoreTests: XCTestCase {
             agentID: "codex",
             hasOwnedReadinessError: store.isDisplayingOwnedReadinessError(for: nil),
             needsAuthentication: store.agentNeedsAuthentication
+        ))
+    }
+
+    func testExpiredCodexSessionOffersSignInWithoutOwningAConnectionError() throws {
+        let store = CourseExperienceStore(defaults: try makeDefaults(), environment: [:])
+        store.selectedAgentID = .codex
+        XCTAssertFalse(store.applyMainAgentReadiness(
+            runtimeID: .codex,
+            runtimeAvailable: false,
+            needsAuthentication: false
+        ))
+        XCTAssertTrue(store.isDisplayingOwnedReadinessError(for: nil))
+
+        XCTAssertTrue(store.applyMainAgentAuthenticationRequired(
+            identity: store.mainCourseAgentReadinessIdentity()
+        ))
+
+        XCTAssertTrue(store.agentNeedsAuthentication)
+        XCTAssertEqual(store.connectionState, .idle)
+        XCTAssertFalse(store.isDisplayingOwnedReadinessError(for: nil))
+        XCTAssertTrue(CourseChatAuthPolicy.needsSignIn(
+            isCodex: true,
+            requiresOpenAIAuth: true,
+            hasAccount: true,
+            explicitlyRequired: store.agentNeedsAuthentication,
+            hasOwnedReadinessError: store.isDisplayingOwnedReadinessError(for: nil)
         ))
     }
 
