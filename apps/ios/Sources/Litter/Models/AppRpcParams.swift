@@ -75,6 +75,8 @@ struct AppComposerPayload: Equatable, Sendable {
     var model: String?
     var effort: ReasoningEffort?
     var serviceTier: ServiceTier?
+    /// App-owned developer context for this turn, separate from learner text.
+    var applicationContext: String? = nil
 
     func turnStartRequest(threadId: String) -> AppStartTurnRequest {
         var inputs = additionalInputs
@@ -89,7 +91,8 @@ struct AppComposerPayload: Equatable, Sendable {
             sandboxPolicy: sandboxPolicy,
             model: model,
             serviceTier: serviceTier,
-            effort: effort
+            effort: effort,
+            applicationContext: applicationContext
         )
     }
 }

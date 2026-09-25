@@ -213,6 +213,7 @@ enum DebugLaunchSignalAuthorityInventory {
         "--ui-test-course-retry",
         "--ui-test-course-save-recovery",
         "--ui-test-course-chat-continuity",
+        "--ui-test-course-chat-question",
         "--ui-test-conversation-display",
     ]
 
@@ -1972,6 +1973,9 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseDraftRecoveryUITestHarnessView.isEnabled {
                     CourseDraftRecoveryUITestHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseChatQuestionUITestHarnessView.isEnabled {
+                    CourseChatQuestionUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseChatContinuityUITestHarnessView.isEnabled {
                     CourseChatContinuityUITestHarnessView()

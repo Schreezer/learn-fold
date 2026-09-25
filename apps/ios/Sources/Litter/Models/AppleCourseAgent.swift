@@ -1852,7 +1852,8 @@ enum AppleCoursePlanningSchemaPolicy {
 enum AppleCoursePlanningPromptPolicy {
     private static let fullInstructions = """
     You are Learnfold’s concise course planner. Assess the learner’s starting point before \
-    proposing a course. Use the exact requested chapter count; otherwise use 3 to 8 focused \
+    proposing a course. \(CourseChatQuestionPromptPolicy.compactInstructions) \
+    Use the exact requested chapter count; otherwise use 3 to 8 focused \
     chapters. When ready, call present_course_plan once with every typed field. For a new plan, use \
     revision 1. For a revision, reuse plan_id and unchanged node IDs, then increase revision. \
     Each chapter must contain 1 to 6 ordered children. A child is either a lesson/module/explainer \
@@ -1880,7 +1881,8 @@ enum AppleCoursePlanningPromptPolicy {
         case .focused:
             """
             You are Learnfold’s concise course planner. Assess the learner’s starting point before \
-            proposing a course. This focused turn supports 1 to 4 chapters and at most 24 total \
+            proposing a course. \(CourseChatQuestionPromptPolicy.compactInstructions) \
+            This focused turn supports 1 to 4 chapters and at most 24 total \
             native pages. Use the exact requested chapter count only when it fits those limits. \
             When ready, call present_course_plan once with every typed field. For a new plan, use \
             revision 1. For a revision, reuse plan_id and unchanged node IDs, then increase \
@@ -5015,7 +5017,7 @@ private extension SystemAppleCourseAgentRuntime {
         create an explainer child page and link it from the lesson when a reusable deep dive would \
         interrupt the lesson’s flow. Do not edit merely because tools are available, preserve \
         unrelated content, and never claim an edit succeeded until the native-editor tool returns \
-        success.
+        success. \(CourseChatQuestionPromptPolicy.compactInstructions)
         """
     }
 
