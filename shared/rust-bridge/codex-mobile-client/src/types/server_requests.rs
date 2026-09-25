@@ -396,6 +396,7 @@ impl TryFrom<AppStartThreadRequest> for upstream::ThreadStartParams {
             history_mode: None,
             session_start_source: None,
             thread_source: None,
+            project_id: None,
             dynamic_tools: value
                 .dynamic_tools
                 .map(|tools| {
@@ -479,6 +480,7 @@ impl TryFrom<AppForkThreadRequest> for upstream::ThreadForkParams {
         Ok(Self {
             thread_id: value.thread_id,
             last_turn_id: None,
+            before_turn_id: None,
             path: None,
             model: value.model,
             model_provider: None,
@@ -495,6 +497,7 @@ impl TryFrom<AppForkThreadRequest> for upstream::ThreadForkParams {
             ephemeral: false,
             thread_source: None,
             exclude_turns: value.exclude_turns,
+            defer_goal_continuation: false,
         })
     }
 }
@@ -753,7 +756,10 @@ impl From<AppListThreadsRequest> for upstream::ThreadListParams {
             source_kinds: value
                 .source_kinds
                 .map(|kinds| kinds.into_iter().map(Into::into).collect()),
+            originators: None,
             archived: value.archived,
+            section_id: None,
+            project_id: None,
             cwd: normalize_cwd(value.cwd).map(upstream::ThreadListCwdFilter::One),
             search_term: value.search_term,
             use_state_db_only: value.use_state_db_only,
@@ -844,6 +850,7 @@ impl TryFrom<AppListPluginsRequest> for upstream::PluginListParams {
         Ok(Self {
             cwds,
             marketplace_kinds: None,
+            force_refetch: false,
         })
     }
 }
@@ -900,6 +907,8 @@ impl TryFrom<AppStartTurnRequest> for upstream::TurnStartParams {
                 .into_iter()
                 .map(user_input_into_upstream)
                 .collect::<Result<Vec<_>, _>>()?,
+            turn_trigger: None,
+            tool_output: None,
             responsesapi_client_metadata: None,
             additional_context: None,
             cwd: None,
@@ -917,6 +926,7 @@ impl TryFrom<AppStartTurnRequest> for upstream::TurnStartParams {
                 .service_tier
                 .map(service_tier_into_upstream_string)
                 .map(Some),
+            service_tier_for_turn: None,
             effort: value.effort.map(reasoning_effort_into_upstream),
             summary: None,
             personality: None,
@@ -933,6 +943,7 @@ impl TryFrom<AppStartTurnRequest> for upstream::TurnStartParams {
                 .transpose()?,
             collaboration_mode: None,
             multi_agent_mode: None,
+            cyber_access_program: None,
         })
     }
 }
@@ -973,12 +984,17 @@ impl TryFrom<AppStartRealtimeSessionRequest> for upstream::ThreadRealtimeStartPa
             version: None,
             voice: value.voice.map(Into::into),
             client_managed_handoffs: Some(value.client_controlled_handoff),
+            delegation_ack_filler: None,
             flush_transcript_tail_on_session_end: None,
             codex_responses_as_items: None,
             codex_response_item_prefix: None,
-            codex_response_handoff_prefix: None,
+            codex_response_handoff_mode: None,
+            codex_response_handoff_channel_prefixes: None,
             model: None,
             include_startup_context: None,
+            initial_items: None,
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
             dynamic_tools: value
                 .dynamic_tools
                 .map(|tools| {
