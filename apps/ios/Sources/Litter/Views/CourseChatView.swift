@@ -336,6 +336,67 @@ enum CourseChatTimelinePolicy {
         return merged
     }
 
+    struct Turn: Identifiable, Equatable {
+        let id: String
+        let items: [ConversationItem]
+        let isLive: Bool
+    }
+
+    /// Splits the course transcript into learner-initiated turns so only the
+    /// turn that is actually streaming renders as live. `ConversationTurnTimeline`
+    /// treats every row it receives as part of one turn: handing it the whole
+    /// thread while a turn is active marks the previous reply as the streaming
+    /// message (replaying its token reveal) and flips live-only layout on every
+    /// historical row, which reads as the transcript flickering.
+    static func turns(
+        from items: [ConversationItem],
+        threadHasActiveTurn: Bool,
+        activeTurnID: String?
+    ) -> [Turn] {
+        var groups: [[ConversationItem]] = []
+        for item in items {
+            if item.isUserItem || item.isFromUserTurnBoundary || groups.isEmpty {
+                groups.append([item])
+            } else {
+                groups[groups.count - 1].append(item)
+            }
+        }
+
+        let liveIndex = liveTurnIndex(
+            in: groups,
+            threadHasActiveTurn: threadHasActiveTurn,
+            activeTurnID: activeTurnID
+        )
+        return groups.enumerated().map { index, turnItems in
+            Turn(
+                id: "course-turn-\(turnItems[0].id)",
+                items: turnItems,
+                isLive: index == liveIndex
+            )
+        }
+    }
+
+    private static func liveTurnIndex(
+        in groups: [[ConversationItem]],
+        threadHasActiveTurn: Bool,
+        activeTurnID: String?
+    ) -> Int? {
+        guard threadHasActiveTurn, let lastIndex = groups.indices.last else { return nil }
+        guard let activeTurnID else { return lastIndex }
+        // An optimistic learner message whose text differs from the live
+        // prompt (for example, appended link sources) trails the live turn,
+        // so prefer the turn that actually carries the active turn's items.
+        if let index = groups.lastIndex(where: { turnItems in
+            turnItems.contains { $0.sourceTurnId == activeTurnID }
+        }) {
+            return index
+        }
+        // Nothing from the active turn is visible yet: either the learner's
+        // message is still optimistic, or an internal course action is
+        // streaming a hidden turn and the last visible turn already finished.
+        return groups[lastIndex].allSatisfy { $0.sourceTurnId == nil } ? lastIndex : nil
+    }
+
     static func hasAssistantContentAfterLatestLearner(
         in items: [ConversationItem]
     ) -> Bool {
@@ -836,6 +897,18 @@ struct CourseChatView: View {
         )
     }
 
+    private var visibleRemoteTimelineItems: [ConversationItem] {
+        CourseChatQuestionPolicy.strippingQuestions(from: remoteTimelineItems)
+    }
+
+    private var remoteTimelineTurns: [CourseChatTimelinePolicy.Turn] {
+        CourseChatTimelinePolicy.turns(
+            from: visibleRemoteTimelineItems,
+            threadHasActiveTurn: liveThread?.hasActiveTurn == true,
+            activeTurnID: liveThread?.activeTurnId
+        )
+    }
+
     private var localStreamingTextLength: Int {
         localMessages.last(where: { $0.role == .agent })?.text.utf16.count ?? 0
     }
@@ -1067,34 +1140,41 @@ struct CourseChatView: View {
                                     .id(message.id)
                             }
                         } else if !remoteTimelineItems.isEmpty || liveThread != nil {
-                            ConversationTurnTimeline(
-                                items: CourseChatQuestionPolicy.strippingQuestions(
-                                    from: remoteTimelineItems
-                                ),
-                                isLive: liveThread?.hasActiveTurn == true,
-                                serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
-                                originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
-                                agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
-                                messageActionsDisabled: true,
-                                onStreamingSnapshotRendered: {
-                                    requestFollowScrollAfterLayout(proxy)
-                                },
-                                onLiveContentLayoutChanged: {
-                                    requestFollowScrollAfterLayout(proxy)
-                                },
-                                resolveTargetLabel: { target in
-                                    appModel.snapshot?.resolvedAgentTargetLabel(
-                                        for: target,
-                                        serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? ""
+                            VStack(alignment: .leading, spacing: 10) {
+                                let expansionContext = ConversationTimelineExpansionContext(
+                                    items: visibleRemoteTimelineItems
+                                )
+                                ForEach(remoteTimelineTurns) { turn in
+                                    ConversationTurnTimeline(
+                                        items: turn.items,
+                                        isLive: turn.isLive,
+                                        serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
+                                        originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
+                                        agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
+                                        messageActionsDisabled: true,
+                                        onStreamingSnapshotRendered: {
+                                            requestFollowScrollAfterLayout(proxy)
+                                        },
+                                        onLiveContentLayoutChanged: {
+                                            requestFollowScrollAfterLayout(proxy)
+                                        },
+                                        resolveTargetLabel: { target in
+                                            appModel.snapshot?.resolvedAgentTargetLabel(
+                                                for: target,
+                                                serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? ""
+                                            )
+                                        },
+                                        onWidgetPrompt: { prompt in
+                                            inputText = prompt
+                                            composerFocused = true
+                                        },
+                                        onEditUserItem: { _ in },
+                                        onForkFromUserItem: { _ in },
+                                        expansionContext: expansionContext
                                     )
-                                },
-                                onWidgetPrompt: { prompt in
-                                    inputText = prompt
-                                    composerFocused = true
-                                },
-                                onEditUserItem: { _ in },
-                                onForkFromUserItem: { _ in }
-                            )
+                                    .id(turn.id)
+                                }
+                            }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .id("course-live-timeline")
                         }

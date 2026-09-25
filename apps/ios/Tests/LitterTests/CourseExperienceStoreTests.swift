@@ -19337,6 +19337,115 @@ final class CourseChatTimelinePolicyTests: XCTestCase {
         XCTAssertTrue(CourseChatTimelinePolicy.projectLiveItems([call, result]).isEmpty)
     }
 
+    func testTurnsMarkOnlyTheStreamingTurnLive() {
+        let items = [
+            userItem(id: "user-1", turnID: "turn-1"),
+            assistantItem(id: "agent-1", turnID: "turn-1"),
+            userItem(id: "user-2", turnID: "turn-2"),
+            assistantItem(id: "agent-2", turnID: "turn-2"),
+        ]
+
+        let turns = CourseChatTimelinePolicy.turns(
+            from: items,
+            threadHasActiveTurn: true,
+            activeTurnID: "turn-2"
+        )
+
+        XCTAssertEqual(turns.map(\.id), ["course-turn-user-1", "course-turn-user-2"])
+        XCTAssertEqual(turns.map { $0.items.map(\.id) }, [
+            ["user-1", "agent-1"],
+            ["user-2", "agent-2"],
+        ])
+        XCTAssertEqual(turns.map(\.isLive), [false, true])
+    }
+
+    func testTurnsKeepPreviousReplyStaticBeforeNewReplyArrives() {
+        let items = [
+            userItem(id: "user-1", turnID: "turn-1"),
+            assistantItem(id: "agent-1", turnID: "turn-1"),
+            userItem(id: "course-local-pending", turnID: nil),
+        ]
+
+        let turns = CourseChatTimelinePolicy.turns(
+            from: items,
+            threadHasActiveTurn: true,
+            activeTurnID: "turn-2"
+        )
+
+        XCTAssertEqual(turns.map(\.isLive), [false, true])
+        XCTAssertEqual(turns.first?.items.map(\.id), ["user-1", "agent-1"])
+    }
+
+    func testTurnsDoNotReviveFinishedTurnWhileHiddenTurnStreams() {
+        let items = [
+            userItem(id: "user-1", turnID: "turn-1"),
+            assistantItem(id: "agent-1", turnID: "turn-1"),
+        ]
+
+        let turns = CourseChatTimelinePolicy.turns(
+            from: items,
+            threadHasActiveTurn: true,
+            activeTurnID: "hidden-internal-turn"
+        )
+
+        XCTAssertEqual(turns.map(\.isLive), [false])
+    }
+
+    func testTurnsKeepStreamingTurnLiveWhenUnmatchedLocalMessageTrails() {
+        let items = [
+            userItem(id: "user-1", turnID: "turn-1"),
+            assistantItem(id: "agent-1", turnID: "turn-1"),
+            userItem(id: "user-2", turnID: "turn-2"),
+            assistantItem(id: "agent-2", turnID: "turn-2"),
+            userItem(id: "course-local-unmatched", turnID: nil),
+        ]
+
+        let turns = CourseChatTimelinePolicy.turns(
+            from: items,
+            threadHasActiveTurn: true,
+            activeTurnID: "turn-2"
+        )
+
+        XCTAssertEqual(turns.map(\.isLive), [false, true, false])
+    }
+
+    func testTurnsAreStaticWhenThreadIsIdle() {
+        let turns = CourseChatTimelinePolicy.turns(
+            from: [
+                userItem(id: "user-1", turnID: "turn-1"),
+                assistantItem(id: "agent-1", turnID: "turn-1"),
+            ],
+            threadHasActiveTurn: false,
+            activeTurnID: nil
+        )
+
+        XCTAssertEqual(turns.map(\.isLive), [false])
+    }
+
+    private func userItem(id: String, turnID: String?) -> ConversationItem {
+        ConversationItem(
+            id: id,
+            content: .user(ConversationUserMessageData(text: id, images: [])),
+            sourceTurnId: turnID,
+            isFromUserTurnBoundary: true
+        )
+    }
+
+    private func assistantItem(id: String, turnID: String?) -> ConversationItem {
+        ConversationItem(
+            id: id,
+            content: .assistant(
+                ConversationAssistantMessageData(
+                    text: id,
+                    agentNickname: nil,
+                    agentRole: nil,
+                    phase: nil
+                )
+            ),
+            sourceTurnId: turnID
+        )
+    }
+
     private func mcpItem(
         server: String,
         tool: String,
