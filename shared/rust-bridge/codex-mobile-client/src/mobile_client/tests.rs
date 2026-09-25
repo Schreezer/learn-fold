@@ -1565,14 +1565,23 @@ mod mobile_client_tests {
             .upsert_server(&config, ServerHealthSnapshot::Connected);
 
         let mut thread = thread_snapshot_with_active_turn(server_id, thread_id, "turn-active");
+        let additional_context = Some(HashMap::from([(
+            "learnfold.course".to_string(),
+            upstream::AdditionalContextEntry {
+                value: "Use course teaching instructions".to_string(),
+                kind: upstream::AdditionalContextKind::Application,
+            },
+        )]));
         let draft = queued_follow_up_draft_from_inputs(
             &[upstream::UserInput::Text {
                 text: "follow up".to_string(),
                 text_elements: Vec::new(),
             }],
             AppQueuedFollowUpKind::Message,
+            additional_context.clone(),
         )
         .expect("draft");
+        assert_eq!(draft.additional_context, additional_context);
         let preview_id = draft.preview.id.clone();
         thread.queued_follow_up_drafts.push(draft);
         client.app_store.upsert_thread_snapshot(thread);
@@ -1636,6 +1645,108 @@ mod mobile_client_tests {
             1,
             "duplicate steer taps should not fan out to multiple TurnSteer calls"
         );
+        let upstream::ClientRequest::TurnSteer { params, .. } = &captured[0] else {
+            panic!("expected a turn/steer request");
+        };
+        assert_eq!(params.additional_context, additional_context);
+    }
+
+    #[tokio::test]
+    async fn autosend_queued_follow_up_preserves_additional_context() {
+        let client = MobileClient::new();
+        let server_id = "srv";
+        let thread_id = "thread-1";
+        let key = ThreadKey {
+            server_id: server_id.to_string(),
+            thread_id: thread_id.to_string(),
+        };
+        let config = make_server_config(server_id);
+        client
+            .app_store
+            .upsert_server(&config, ServerHealthSnapshot::Connected);
+
+        let additional_context = Some(HashMap::from([(
+            "learnfold.course".to_string(),
+            upstream::AdditionalContextEntry {
+                value: "Course teaching instructions".to_string(),
+                kind: upstream::AdditionalContextKind::Application,
+            },
+        )]));
+        let draft = queued_follow_up_draft_from_inputs(
+            &[upstream::UserInput::Text {
+                text: "Explain OLED pixels".to_string(),
+                text_elements: Vec::new(),
+            }],
+            AppQueuedFollowUpKind::Message,
+            additional_context.clone(),
+        )
+        .expect("draft");
+        let mut thread = ThreadSnapshot::from_info(server_id, make_thread_info(thread_id));
+        thread.queued_follow_up_drafts.push(draft);
+        client.app_store.upsert_thread_snapshot(thread);
+
+        let start_calls = Arc::new(StdMutex::new(Vec::<upstream::ClientRequest>::new()));
+        let request_handler: TestRequestHandler = {
+            let start_calls = Arc::clone(&start_calls);
+            Arc::new(move |request| {
+                start_calls
+                    .lock()
+                    .expect("start calls lock should not be poisoned")
+                    .push(request);
+                Ok(json!({}))
+            })
+        };
+        let session = Arc::new(ServerSession::test_stub_with_handlers(
+            config,
+            Some(request_handler),
+            None,
+            None,
+        ));
+        client
+            .sessions
+            .write()
+            .expect("sessions lock should not be poisoned")
+            .insert(server_id.to_string(), session);
+
+        maybe_send_next_local_queued_follow_up(
+            Arc::clone(&client.app_store),
+            Arc::clone(&client.sessions),
+            key,
+        )
+        .await;
+
+        let captured = start_calls
+            .lock()
+            .expect("start calls lock should not be poisoned");
+        assert_eq!(captured.len(), 1);
+        let upstream::ClientRequest::TurnStart { params, .. } = &captured[0] else {
+            panic!("expected a turn/start request");
+        };
+        assert_eq!(params.additional_context, additional_context);
+    }
+
+    #[test]
+    fn queued_follow_up_draft_preserves_additional_context_and_preview_text() {
+        let additional_context = Some(HashMap::from([(
+            "learnfold.course".to_string(),
+            upstream::AdditionalContextEntry {
+                value: "Course teaching instructions".to_string(),
+                kind: upstream::AdditionalContextKind::Application,
+            },
+        )]));
+        let draft = queued_follow_up_draft_from_inputs(
+            &[upstream::UserInput::Text {
+                text: "Explain OLED pixels".to_string(),
+                text_elements: Vec::new(),
+            }],
+            AppQueuedFollowUpKind::Message,
+            additional_context.clone(),
+        )
+        .expect("draft");
+
+        assert_eq!(draft.additional_context, additional_context);
+        assert_eq!(draft.preview.text, "Explain OLED pixels");
+        assert_eq!(draft.preview.kind, AppQueuedFollowUpKind::Message);
     }
 
     #[test]

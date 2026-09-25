@@ -1068,7 +1068,9 @@ struct CourseChatView: View {
                             }
                         } else if !remoteTimelineItems.isEmpty || liveThread != nil {
                             ConversationTurnTimeline(
-                                items: remoteTimelineItems,
+                                items: CourseChatQuestionPolicy.strippingQuestions(
+                                    from: remoteTimelineItems
+                                ),
                                 isLive: liveThread?.hasActiveTurn == true,
                                 serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
                                 originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
@@ -1095,6 +1097,16 @@ struct CourseChatView: View {
                             )
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .id("course-live-timeline")
+                        }
+
+                        if let pendingQuestion {
+                            CourseChatQuestionOptionsView(
+                                question: pendingQuestion,
+                                isEnabled: canSendQuestionOption,
+                                onSelect: sendQuestionOption
+                            )
+                            .padding(.top, 2)
+                            .id("course-chat-question")
                         }
 
                         if isAgentWorking && displayedAgentError == nil {
@@ -1542,7 +1554,9 @@ struct CourseChatView: View {
             }
             CourseChatComposer(
                 inputText: $inputText,
-                prompt: selectionDiscussionID == nil
+                prompt: pendingQuestion != nil
+                    ? CourseChatQuestion.freeTextPrompt
+                    : selectionDiscussionID == nil
                     ? "Message your course agent"
                     : "Ask a question",
                 sources: displayedSources,
@@ -1571,6 +1585,31 @@ struct CourseChatView: View {
                 onPasteLink: pasteLink
             )
         }
+    }
+
+    /// The newest multiple-choice question while it awaits a reply.
+    private var pendingQuestion: CourseChatQuestion? {
+        guard !isAgentWorking, displayedAgentError == nil else { return nil }
+        if CourseAgentProvider.usesLocalMessages(displayedAgentID) {
+            return CourseChatQuestionPolicy.pendingQuestion(in: localMessages)
+        }
+        return CourseChatQuestionPolicy.pendingQuestion(in: remoteTimelineItems)
+    }
+
+    private var canSendQuestionOption: Bool {
+        isAgentReady
+            && !isAgentWorking
+            && !isPreparingSelectionDiscussion
+            && !isPreparingDisplayedSource
+            && displayedSubmissionRecoveryState?.blocksNewSubmission != true
+            && !blocksNewSubmissionForHermesRecovery
+    }
+
+    /// Use the ordinary composer path so a tapped answer has the same guards.
+    /// If sending is refused, keep the option in the composer for manual send.
+    private func sendQuestionOption(_ option: String) {
+        inputText = option
+        sendCurrentMessage()
     }
 
     private func sendCurrentMessage() {
@@ -2767,6 +2806,12 @@ private struct CourseMessageRow: View {
     let message: CourseChatMessage
     let agentID: String
 
+    /// Keep the question sentence while hiding the block rendered as buttons.
+    private var displayText: String {
+        guard message.role == .agent else { return message.text }
+        return CourseChatQuestion.extract(from: message.text).text
+    }
+
     var body: some View {
         HStack(alignment: .bottom, spacing: 9) {
             if message.role == .learner { Spacer(minLength: 40) }
@@ -2785,11 +2830,11 @@ private struct CourseMessageRow: View {
                     }
                 }
 
-                if !message.text.isEmpty {
+                if !displayText.isEmpty {
                     if message.role == .agent {
-                        CourseMarkdownMessageView(markdown: message.text)
+                        CourseMarkdownMessageView(markdown: displayText)
                     } else {
-                        Text(message.text)
+                        Text(displayText)
                             .font(.body)
                             .foregroundStyle(.white)
                             .textSelection(.enabled)
@@ -3230,6 +3275,87 @@ struct CourseSourceCheckpointUITestHarnessView: View {
         }
         return reference
     }()
+}
+#endif
+
+#if DEBUG
+/// Debug-only transcript for verifying inline multiple-choice questions
+/// without a live agent. Launch with `--ui-test-course-chat-question`.
+struct CourseChatQuestionUITestHarnessView: View {
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-test-course-chat-question")
+    }
+
+    @State private var messages: [CourseChatMessage] = [
+        CourseChatMessage(role: .learner, text: "Zk snarks"),
+        CourseChatMessage(
+            role: .agent,
+            text: """
+            Great topic. To personalize your course, let's understand your learning goal and background knowledge.
+
+            \(CourseChatQuestionPromptPolicy.exampleBlock)
+            """
+        ),
+    ]
+    @State private var inputText = ""
+    @State private var selectedPhoto: PhotosPickerItem?
+    @FocusState private var composerFocused: Bool
+
+    private var pendingQuestion: CourseChatQuestion? {
+        CourseChatQuestionPolicy.pendingQuestion(in: messages)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(messages) { message in
+                        CourseMessageRow(message: message, agentID: CourseAgentProvider.hosted)
+                    }
+                    if let pendingQuestion {
+                        CourseChatQuestionOptionsView(
+                            question: pendingQuestion,
+                            isEnabled: true,
+                            onSelect: send
+                        )
+                        .padding(.top, 2)
+                    }
+                }
+                .padding(16)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                CourseChatComposer(
+                    inputText: $inputText,
+                    prompt: pendingQuestion != nil
+                        ? CourseChatQuestion.freeTextPrompt
+                        : "Message your course agent",
+                    sources: [],
+                    isFocused: $composerFocused,
+                    onRemoveSource: { _ in },
+                    onSend: { send(inputText) },
+                    isAgentWorking: false,
+                    isPreparing: false,
+                    isEditingEnabled: true,
+                    isAgentReady: true,
+                    isStopping: false,
+                    onStop: {},
+                    supportsBinarySources: true,
+                    selectedPhoto: $selectedPhoto,
+                    onChooseFile: {},
+                    onPasteLink: {}
+                )
+            }
+            .navigationTitle("New Course")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    private func send(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        messages.append(CourseChatMessage(role: .learner, text: trimmed))
+        inputText = ""
+    }
 }
 #endif
 

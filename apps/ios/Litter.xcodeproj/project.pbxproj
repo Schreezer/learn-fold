@@ -54,6 +54,7 @@
 		0FA2D55FE17D4AD9A910FB74 /* gruvbox-light-hard.json in Resources */ = {isa = PBXBuildFile; fileRef = 9AF7E00FF3D6A3D37B161855 /* gruvbox-light-hard.json */; };
 		0FEE6C68E9A49D3AAB2859FD /* LitterComplicationEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4578B3ADA4BFFC01A6910404 /* LitterComplicationEntry.swift */; };
 		1101AAA61DF5B949EE2BB0AF /* StreamingRendererCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2ECDF838BCE5FEBFE5B80DCC /* StreamingRendererCoordinator.swift */; };
+		11193C963D03DB3F971CCAD7 /* CourseChatQuestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65BE51E8C9167CBA832D91A4 /* CourseChatQuestion.swift */; };
 		1129DC9B38650FC49541690E /* BerkeleyMono-Bold.otf in Resources */ = {isa = PBXBuildFile; fileRef = 3BD63CCD80D9E1F66879EF97 /* BerkeleyMono-Bold.otf */; };
 		11D2F55D074C9B7A7DE62B5B /* CoursePageEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7340819D7B1C11A650B6674B /* CoursePageEditorView.swift */; };
 		120959210E9154F5F2D5E0E2 /* UWBDebugView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F86295AB7DE370727377248 /* UWBDebugView.swift */; };
@@ -67,6 +68,7 @@
 		15378E713092362B622ADF95 /* BerkeleyMono-Bold-Oblique.otf in Resources */ = {isa = PBXBuildFile; fileRef = 3CB07F43FD670F05B9A43C55 /* BerkeleyMono-Bold-Oblique.otf */; };
 		156F89639E8053C53F00A37E /* cat_transmission_05.png in Resources */ = {isa = PBXBuildFile; fileRef = ACB40989C3523BA263AD8F03 /* cat_transmission_05.png */; };
 		15A9B5853E6712B0244CDB72 /* IshFS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B2BFE640367D986B437735F /* IshFS.swift */; };
+		16CDA68C037DB50483233DED /* CourseChatQuestionOptionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 953B47950EC0357C79BDF3AB /* CourseChatQuestionOptionsView.swift */; };
 		17033989C6AC46E5A7D52FF4 /* HomeModelChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3994BDBDC27E3555A77466B /* HomeModelChip.swift */; };
 		1845E6F83191374192633342 /* InlineVoiceStatusStrip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6672503DE611533270EDDEE0 /* InlineVoiceStatusStrip.swift */; };
 		18505C3526851FD8F141B78E /* WidgetWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF1C08AB8EA89D69A67AA7B2 /* WidgetWebView.swift */; };
@@ -153,6 +155,7 @@
 		322165B22304150CF1924EAC /* CourseBashTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = C902F0AC32E28F2363729CEC /* CourseBashTool.swift */; };
 		32B5D8CCFAC412E8F2F3E049 /* LitterWatchComplications.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 7234EDD5C8F0342DB3A592D9 /* LitterWatchComplications.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		32CA9FCEE8BA7B775188571B /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 2FB04F90D08EE57F92DD7F58 /* AppIcon.icon */; };
+		32DD530846AF4F059D5B2ED1 /* CourseChatQuestionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BB42192C1A7C2A54DFE0D28 /* CourseChatQuestionTests.swift */; };
 		331E2822B6797451E6B5D7DE /* PinnedHTTPDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10176945CE6987361994BB3 /* PinnedHTTPDownloader.swift */; };
 		3323CEC8ECD1A91494C76101 /* StreamingAssistantRenderCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8148E90D1A219FEE664EB9A1 /* StreamingAssistantRenderCache.swift */; };
 		333B502373DE386E9BDCE871 /* PathDisplayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 119E33CEA4127BD72EADC968 /* PathDisplayTests.swift */; };
@@ -488,6 +491,7 @@
 		A5BD2B22AB2223379FD596F6 /* LitterRectangularComplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FF976ADC271DEBBD94D75A3 /* LitterRectangularComplication.swift */; };
 		A5CECA15DCF0A7D1BDF44BCA /* WatchAppStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24F7CC5031C2AD8E0B53F6DF /* WatchAppStore.swift */; };
 		A5D2556BF0AC3D6805FF91FF /* BrandLogo.swift in Sources */ = {isa = PBXBuildFile; fileRef = C361CBF40ED3D35C44D46880 /* BrandLogo.swift */; };
+		A5E42CA5ABFA2DFE344871A8 /* CourseChatQuestionOptionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 953B47950EC0357C79BDF3AB /* CourseChatQuestionOptionsView.swift */; };
 		A6F78ABD673579D6716690B2 /* one-dark-pro-D.json in Resources */ = {isa = PBXBuildFile; fileRef = 289E852E220BF379FBFA6BCD /* one-dark-pro-D.json */; };
 		A6FF1F7811A4B6626BD440F5 /* ConversationComposerModalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED83627330437842851BBC07 /* ConversationComposerModalCoordinator.swift */; };
 		A75ADD78306A5B628AFFAAFF /* Nuke in Frameworks */ = {isa = PBXBuildFile; productRef = D3C5FD0BDB468EC8BA03BBE6 /* Nuke */; };
@@ -595,6 +599,7 @@
 		C8068ED5E7BD21E726D18A81 /* WatchSessionBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = D749E825270EC039FC1736BE /* WatchSessionBridge.swift */; };
 		C866847E4BEBA8A05A0D1EB1 /* HomeDashboardSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FB206863136DF3B8FA50457 /* HomeDashboardSupport.swift */; };
 		C87E14EF9EE09B6990C255AC /* PluginMentionEncodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E37E6A02561EFC0135BB00F5 /* PluginMentionEncodingTests.swift */; };
+		C897331395D210C3F5EAF05F /* CourseChatQuestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65BE51E8C9167CBA832D91A4 /* CourseChatQuestion.swift */; };
 		C89B541EEA82E751FFA04897 /* cat_transmission_02.png in Resources */ = {isa = PBXBuildFile; fileRef = 37F784707298B3B10132B107 /* cat_transmission_02.png */; };
 		C93588F488F685B4777132FE /* CrossServerToolResultView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86A94747FCE745BAA2DBEBF4 /* CrossServerToolResultView.swift */; };
 		CA41DDEC724CC91E47583700 /* ProjectChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5294396A986F27242D0F814 /* ProjectChip.swift */; };
@@ -1010,6 +1015,7 @@
 		63D9ACF04F4018F2949FB7E0 /* AudioWaveformView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioWaveformView.swift; sourceTree = "<group>"; };
 		64A9C3848F4142EF67DD23D3 /* lobster-dark-dxSKfHK-.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "lobster-dark-dxSKfHK-.json"; sourceTree = "<group>"; };
 		64C8CA93B134E2C4486B86A1 /* kanagawa-wave.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "kanagawa-wave.json"; sourceTree = "<group>"; };
+		65BE51E8C9167CBA832D91A4 /* CourseChatQuestion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CourseChatQuestion.swift; sourceTree = "<group>"; };
 		661D06D9BB4571F38A7AD272 /* UltrasonicEmitter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UltrasonicEmitter.swift; sourceTree = "<group>"; };
 		6672503DE611533270EDDEE0 /* InlineVoiceStatusStrip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineVoiceStatusStrip.swift; sourceTree = "<group>"; };
 		66961A8B9B89E5B34B6C5A93 /* PathDisplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PathDisplay.swift; sourceTree = "<group>"; };
@@ -1020,6 +1026,7 @@
 		6A485EF4E929239E297A46F5 /* DebugSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugSettings.swift; sourceTree = "<group>"; };
 		6A9876F2929290D47ED57D77 /* SSHLoginSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHLoginSheet.swift; sourceTree = "<group>"; };
 		6AE2C5F6A9589EF98EF22485 /* VoiceSessionModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceSessionModels.swift; sourceTree = "<group>"; };
+		6BB42192C1A7C2A54DFE0D28 /* CourseChatQuestionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CourseChatQuestionTests.swift; sourceTree = "<group>"; };
 		6C2A455B0E2E7C8B6EE59A93 /* HomeBottomBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeBottomBar.swift; sourceTree = "<group>"; };
 		6D220AD4FC96E2D24A533485 /* ServerPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerPill.swift; sourceTree = "<group>"; };
 		6E75F2343E53BABCD1C8207E /* CarPlayVoiceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CarPlayVoiceManager.swift; sourceTree = "<group>"; };
@@ -1089,6 +1096,7 @@
 		93CDBDD02E344E7C903D5DEC /* RustAlleycatBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustAlleycatBridge.swift; sourceTree = "<group>"; };
 		9465B38F1CE05DAC59F5A918 /* proof-light.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "proof-light.json"; sourceTree = "<group>"; };
 		952E431DD6FA6740D6585B4A /* NetworkReachabilityObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkReachabilityObserver.swift; sourceTree = "<group>"; };
+		953B47950EC0357C79BDF3AB /* CourseChatQuestionOptionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CourseChatQuestionOptionsView.swift; sourceTree = "<group>"; };
 		962FB1FBD4EB523E14C3A14D /* LitterRunningTurnWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LitterRunningTurnWidget.swift; sourceTree = "<group>"; };
 		971354BA3CB115869D1FB27C /* tokyo-night.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "tokyo-night.json"; sourceTree = "<group>"; };
 		991F612D39C0762BB7657452 /* CarPlay.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CarPlay.framework; path = System/Library/Frameworks/CarPlay.framework; sourceTree = SDKROOT; };
@@ -1455,6 +1463,7 @@
 				B0C1A0569B4424123A37B0DA /* ConversationPlanSemanticsTests.swift */,
 				B66383694E80CDCBCF582C67 /* ConversationScreenModelTests.swift */,
 				8AFFED49783E95ED9FDA8941 /* CourseBashToolTests.swift */,
+				6BB42192C1A7C2A54DFE0D28 /* CourseChatQuestionTests.swift */,
 				F0691C661284CA4F8A302FBE /* CourseCloudSyncModelsTests.swift */,
 				716A966B4A9F6DBE01C94D01 /* CourseCloudSyncRepositoryTests.swift */,
 				F5AD1EDB9286723297700801 /* CourseCloudSyncStateStoreTests.swift */,
@@ -1590,7 +1599,6 @@
 				49D8F8EB81409A95F0AA81B6 /* home_cat.png */,
 				EB7A91131021ED64DF88AF8B /* Fonts */,
 				DB02264740185FE99A0B2419 /* Themes */,
-				CBFC126980D89207F3601305 /* ThirdPartyLicenses */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -1639,13 +1647,6 @@
 			);
 			name = LitterWatchComplications;
 			path = Sources/LitterWatchComplications;
-			sourceTree = "<group>";
-		};
-		CBFC126980D89207F3601305 /* ThirdPartyLicenses */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = ThirdPartyLicenses;
 			sourceTree = "<group>";
 		};
 		D50A88119F9D44E48BDF3D0B /* Components */ = {
@@ -1800,6 +1801,7 @@
 				CD02327C52F16587C973B70F /* ConversationWarmupCoordinator.swift */,
 				0766CE57303EC3988F3C9A2E /* CourseAgentTools.swift */,
 				C902F0AC32E28F2363729CEC /* CourseBashTool.swift */,
+				65BE51E8C9167CBA832D91A4 /* CourseChatQuestion.swift */,
 				553CF9EADAD06942645AF233 /* CourseCloudSyncEngine.swift */,
 				06AB23A050292ACF8B642F38 /* CourseCloudSyncModels.swift */,
 				8CA0BB018908E47A5C21E4EA /* CourseCloudSyncStateStore.swift */,
@@ -1905,6 +1907,7 @@
 				55700E32058BA95A9372AA41 /* ConversationTimelineView.swift */,
 				BF245554F39E59E68B72EB22 /* ConversationView.swift */,
 				E27C590AB2E27ACAAB6432EF /* ConversationWarmupView.swift */,
+				953B47950EC0357C79BDF3AB /* CourseChatQuestionOptionsView.swift */,
 				0A8BFE4D3098F9DB50E5CFBE /* CourseChatView.swift */,
 				E568ADD8A5CB27BD9BFF4101 /* CourseExperienceView.swift */,
 				D812624CCD48884025818FC6 /* CourseLessonActionButton.swift */,
@@ -2540,6 +2543,7 @@
 				9C44ABDBA2399DD2C0B1E9E2 /* ConversationPlanSemanticsTests.swift in Sources */,
 				F1535DE46C8E5A530A8C131E /* ConversationScreenModelTests.swift in Sources */,
 				0097DEB63111F37E95384BEA /* CourseBashToolTests.swift in Sources */,
+				32DD530846AF4F059D5B2ED1 /* CourseChatQuestionTests.swift in Sources */,
 				CA5B129F2878066B4FDC80A6 /* CourseCloudSyncModelsTests.swift in Sources */,
 				21BD0111866BA94416BC2C11 /* CourseCloudSyncRepositoryTests.swift in Sources */,
 				FE233B5B279235862B69A433 /* CourseCloudSyncStateStoreTests.swift in Sources */,
@@ -2666,6 +2670,8 @@
 				F64EB92413EE8FA1EAA77BC8 /* ConversationWarmupView.swift in Sources */,
 				495274D567D5E44CCC387A1B /* CourseAgentTools.swift in Sources */,
 				322165B22304150CF1924EAC /* CourseBashTool.swift in Sources */,
+				C897331395D210C3F5EAF05F /* CourseChatQuestion.swift in Sources */,
+				16CDA68C037DB50483233DED /* CourseChatQuestionOptionsView.swift in Sources */,
 				BC1AB45A9D13FC9787E016F5 /* CourseChatView.swift in Sources */,
 				46CEAF4D53B027A7E8ECC9A0 /* CourseCloudSyncEngine.swift in Sources */,
 				A907FDB402F401C77B9B711F /* CourseCloudSyncModels.swift in Sources */,
@@ -2887,6 +2893,8 @@
 				69CD7E945F5E2F84A69A556C /* ConversationWarmupView.swift in Sources */,
 				128A17AEB3FFBE244EA468F3 /* CourseAgentTools.swift in Sources */,
 				5CCB55A45268BF3979B58E70 /* CourseBashTool.swift in Sources */,
+				11193C963D03DB3F971CCAD7 /* CourseChatQuestion.swift in Sources */,
+				A5E42CA5ABFA2DFE344871A8 /* CourseChatQuestionOptionsView.swift in Sources */,
 				AFC9320DF125157940E5A105 /* CourseChatView.swift in Sources */,
 				74D06C0E8E697AF7D48CE783 /* CourseCloudSyncEngine.swift in Sources */,
 				305E943B0F35B0CF36DDA5CB /* CourseCloudSyncModels.swift in Sources */,

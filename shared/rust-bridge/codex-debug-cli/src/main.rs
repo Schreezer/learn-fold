@@ -2112,6 +2112,7 @@ async fn run_server_cli(args: ServerArgs) -> Result<(), Box<dyn std::error::Erro
                             service_tier: None,
                             effort: None,
                             output_schema: None,
+                            application_context: None,
                         },
                     )
                     .await;

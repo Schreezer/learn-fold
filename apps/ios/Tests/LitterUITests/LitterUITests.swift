@@ -245,6 +245,46 @@ final class LitterUITests: XCTestCase {
     }
 
     @MainActor
+    func testCourseChatQuestionOptionsSendTappedAnswer() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchArguments.append("--ui-test-course-chat-question")
+        app.launch()
+
+        let options = app.otherElements["course-chat-question-options"]
+        XCTAssertTrue(options.waitForExistence(timeout: 10), "Question options did not render")
+        XCTAssertFalse(
+            app.staticTexts
+                .containing(NSPredicate(format: "label CONTAINS %@", "learnfold-question"))
+                .firstMatch.exists,
+            "The raw question fence must never be visible"
+        )
+        XCTAssertTrue(app.staticTexts["What experience do you already have with cryptography or blockchains?"].exists)
+
+        let composer = app.textFields["course-chat-composer"].firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        XCTAssertEqual(composer.placeholderValue, "Or type your own response here…")
+        attachScreenshot(named: "Course chat multiple-choice question", app: app)
+
+        let second = app.buttons["course-chat-question-option-1"]
+        XCTAssertTrue(second.waitForExistence(timeout: 5))
+        XCTAssertEqual(second.label, "Answer: Understand the basics but haven't built with them")
+        second.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["Understand the basics but haven't built with them"].waitForExistence(timeout: 5),
+            "Tapping an option must send it as the learner's reply"
+        )
+        let optionsGone = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: options
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [optionsGone], timeout: 5), .completed)
+        XCTAssertEqual(composer.placeholderValue, "Message your course agent")
+        attachScreenshot(named: "Course chat question answered by tap", app: app)
+    }
+
+    @MainActor
     func testCourseDraftRecoveryShowsFullPlanAndRestoredComposer() throws {
         let app = XCUIApplication()
         app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"

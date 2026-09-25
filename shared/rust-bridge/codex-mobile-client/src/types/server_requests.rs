@@ -9,6 +9,7 @@ use codex_app_server_protocol as upstream;
 use codex_protocol::openai_models::ReasoningEffort as CoreReasoningEffort;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::enums::ApprovalKind;
@@ -17,6 +18,8 @@ use super::{
     AppRealtimeAudioChunk, AppReviewTarget, AppSandboxMode, AppSandboxPolicy, AppUserInput,
     ReasoningEffort, ServiceTier,
 };
+
+const APPLICATION_CONTEXT_SOURCE: &str = "mobile-client.application-context";
 
 fn absolute_path_buf_from_mobile(value: AbsolutePath) -> Result<AbsolutePathBuf, RpcClientError> {
     AbsolutePathBuf::try_from(value.value).map_err(|error| {
@@ -872,6 +875,10 @@ pub struct AppStartTurnRequest {
     #[serde(default)]
     #[uniffi(default = None)]
     pub output_schema: Option<String>,
+    /// Turn-scoped app-owned instructions, delivered as developer context.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub application_context: Option<String>,
 }
 
 /// Describes how a submitted composer payload entered the server lifecycle.
@@ -910,7 +917,15 @@ impl TryFrom<AppStartTurnRequest> for upstream::TurnStartParams {
             turn_trigger: None,
             tool_output: None,
             responsesapi_client_metadata: None,
-            additional_context: None,
+            additional_context: value.application_context.map(|context| {
+                HashMap::from([(
+                    APPLICATION_CONTEXT_SOURCE.to_string(),
+                    upstream::AdditionalContextEntry {
+                        value: context,
+                        kind: upstream::AdditionalContextKind::Application,
+                    },
+                )])
+            }),
             cwd: None,
             runtime_workspace_roots: None,
             approval_policy: value.approval_policy.map(ask_for_approval_into_upstream),
@@ -1330,6 +1345,48 @@ impl TryFrom<AppWriteConfigValueRequest> for upstream::ConfigValueWriteParams {
 mod tests {
     use super::*;
     use crate::types::enums::ApprovalKind;
+
+    fn start_turn_request(application_context: Option<String>) -> AppStartTurnRequest {
+        AppStartTurnRequest {
+            thread_id: "thread-1".to_string(),
+            input: Vec::new(),
+            approval_policy: None,
+            sandbox_policy: None,
+            model: None,
+            service_tier: None,
+            effort: None,
+            output_schema: None,
+            application_context,
+        }
+    }
+
+    #[test]
+    fn start_turn_request_forwards_application_owned_developer_context() {
+        let request = start_turn_request(Some("Course teaching instructions".to_string()));
+        let params: upstream::TurnStartParams = request.try_into().unwrap();
+
+        assert_eq!(
+            params.additional_context,
+            Some(HashMap::from([(
+                APPLICATION_CONTEXT_SOURCE.to_string(),
+                upstream::AdditionalContextEntry {
+                    value: "Course teaching instructions".to_string(),
+                    kind: upstream::AdditionalContextKind::Application,
+                },
+            )]))
+        );
+    }
+
+    #[test]
+    fn start_turn_request_defaults_to_no_application_context() {
+        let mut json = serde_json::to_value(start_turn_request(None)).unwrap();
+        json.as_object_mut().unwrap().remove("applicationContext");
+        let request: AppStartTurnRequest = serde_json::from_value(json).unwrap();
+
+        assert_eq!(request.application_context, None);
+        let params: upstream::TurnStartParams = request.try_into().unwrap();
+        assert_eq!(params.additional_context, None);
+    }
 
     #[test]
     fn turn_submission_receipt_preserves_server_turn_identity() {

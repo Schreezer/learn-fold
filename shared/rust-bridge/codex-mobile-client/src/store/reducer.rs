@@ -678,6 +678,7 @@ impl AppStoreReducer {
             QueuedFollowUpDraft {
                 preview,
                 inputs: Vec::new(),
+                additional_context: None,
                 source_message_json: None,
             },
         );
@@ -919,6 +920,7 @@ impl AppStoreReducer {
             .map(|preview| QueuedFollowUpDraft {
                 preview,
                 inputs: Vec::new(),
+                additional_context: None,
                 source_message_json: None,
             })
             .collect();

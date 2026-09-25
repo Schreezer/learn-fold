@@ -2,6 +2,7 @@
 
 ## Summary
 
+- Course setup now asks one assessment question at a time and shows tappable answers for multiple-choice questions. You can still type your own answer.
 - Course Settings now refreshes Codex's model list when opened, keeps cached choices during a temporary refresh failure, and offers a retry. The bundled Codex runtime now supports the newer model catalog.
 - Course replies now render bold, italics, headings, lists, links, code blocks, and tables, including while replies stream.
 - Fixed stale history replacing Apple and focused-discussion messages, and kept focused tools in the correct course workspace.
@@ -29,6 +30,7 @@ Learnfold is an early external beta. Visible adaptation, reassessment, citations
 8. Confirm the app icon has a pure black background on the Home Screen and in TestFlight.
 9. Ask Hosted for a formatted explanation with a numbered list and code sample. Check formatting in light and dark mode and with larger text.
 10. Select Codex in Course Settings. Check that models available to your account appear, use Refresh Models, and confirm your selection stays selected after reopening settings.
+11. Start a new Codex course and answer a multiple-choice assessment question by tapping an option. Check that the answer sends once, then try typing a custom answer to a later question.
 
 ## Feedback
 
