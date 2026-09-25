@@ -1137,6 +1137,9 @@ struct CourseChatView: View {
                             }
                         } else if !remoteTimelineItems.isEmpty || liveThread != nil {
                             VStack(alignment: .leading, spacing: 10) {
+                                let expansionContext = ConversationTimelineExpansionContext(
+                                    items: remoteTimelineItems
+                                )
                                 ForEach(remoteTimelineTurns) { turn in
                                     ConversationTurnTimeline(
                                         items: turn.items,
@@ -1162,7 +1165,8 @@ struct CourseChatView: View {
                                             composerFocused = true
                                         },
                                         onEditUserItem: { _ in },
-                                        onForkFromUserItem: { _ in }
+                                        onForkFromUserItem: { _ in },
+                                        expansionContext: expansionContext
                                     )
                                     .id(turn.id)
                                 }

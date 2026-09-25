@@ -116,6 +116,8 @@ final class AppModel {
     private static let liveItemMutationCoalescingNanoseconds: UInt64 = 120_000_000 // ~8fps commands
     private static let liveThreadStateCoalescingNanoseconds: UInt64 = 150_000_000  // ~6fps metadata
     private static let streamingDeltaCoalescingNanoseconds: UInt64 = 120_000_000   // ~8fps streamed text
+    private static let modelRefreshInterval: TimeInterval = 5 * 60
+    private static let modelRefreshFailureRetryInterval: TimeInterval = 30
     private static let localAuthRestoreRetryDelays: [Duration] = [
         .seconds(1),
         .seconds(2),
@@ -193,7 +195,9 @@ final class AppModel {
 
     @ObservationIgnored private var subscription: AppStoreSubscription?
     @ObservationIgnored private var updateTask: Task<Void, Never>?
-    @ObservationIgnored private var loadingModelServerIds: Set<String> = []
+    @ObservationIgnored private var modelRefreshTasks: [String: (id: UUID, task: Task<Bool, Never>)] = [:]
+    @ObservationIgnored private var recentModelRefreshAttempts: [String: Date] = [:]
+    @ObservationIgnored private var failedModelRefreshServerIds: Set<String> = []
     @ObservationIgnored private var loadingRateLimitServerIds: Set<String> = []
     @ObservationIgnored private var recentConversationMetadataLoads: [String: Date] = [:]
     @ObservationIgnored private var pendingThreadRefreshKeys: Set<ThreadKey> = []
@@ -242,6 +246,7 @@ final class AppModel {
     }
 
     deinit {
+        modelRefreshTasks.values.forEach { $0.task.cancel() }
         updateTask?.cancel()
         pendingThreadRefreshTask?.cancel()
         pendingActiveThreadHydrationTask?.cancel()
@@ -2174,19 +2179,60 @@ final class AppModel {
 
     func loadAvailableModelsIfNeeded(serverId: String) async {
         guard let server = snapshot?.serverSnapshot(for: serverId), server.isConnected else { return }
-        guard server.availableModels == nil else { return }
-        guard !loadingModelServerIds.contains(serverId) else { return }
-        loadingModelServerIds.insert(serverId)
-        defer { loadingModelServerIds.remove(serverId) }
-        do {
-            _ = try await client.refreshModels(
-                serverId: serverId,
-                params: AppRefreshModelsRequest(cursor: nil, limit: nil, includeHidden: false)
-            )
-            await refreshSnapshot()
-        } catch {
-            lastError = error.localizedDescription
+        guard modelCatalogNeedsRefresh(
+            serverId: serverId,
+            hasCachedModels: server.availableModels != nil
+        ) else { return }
+        if !(await refreshAvailableModels(serverId: serverId)) {
+            lastError = "Models could not be refreshed."
         }
+    }
+
+    /// An explicit picker presentation must re-query model/list even when the
+    /// Rust store already has a list. Coalesce concurrent callers for the same
+    /// server and always project the store snapshot, including partial updates.
+    @discardableResult
+    func refreshAvailableModels(serverId: String) async -> Bool {
+        guard snapshot?.serverSnapshot(for: serverId)?.isConnected == true else { return false }
+        if let pending = modelRefreshTasks[serverId] {
+            return await pending.task.value
+        }
+        recentModelRefreshAttempts[serverId] = Date()
+        let requestID = UUID()
+        let task = Task { @MainActor in
+            let succeeded: Bool
+            do {
+                _ = try await client.refreshModels(
+                    serverId: serverId,
+                    params: AppRefreshModelsRequest(cursor: nil, limit: nil, includeHidden: false)
+                )
+                succeeded = true
+            } catch {
+                succeeded = false
+            }
+            recentModelRefreshAttempts[serverId] = Date()
+            if succeeded {
+                failedModelRefreshServerIds.remove(serverId)
+            } else {
+                failedModelRefreshServerIds.insert(serverId)
+            }
+            await refreshSnapshot()
+            return succeeded
+        }
+        modelRefreshTasks[serverId] = (requestID, task)
+        let succeeded = await task.value
+        if modelRefreshTasks[serverId]?.id == requestID {
+            modelRefreshTasks.removeValue(forKey: serverId)
+        }
+        return succeeded
+    }
+
+    private func modelCatalogNeedsRefresh(serverId: String, hasCachedModels: Bool) -> Bool {
+        guard let lastAttempt = recentModelRefreshAttempts[serverId] else { return true }
+        let interval = failedModelRefreshServerIds.contains(serverId) || !hasCachedModels
+            ? Self.modelRefreshFailureRetryInterval
+            : Self.modelRefreshInterval
+        return Date().timeIntervalSince(lastAttempt) >= interval
     }
 
     func loadRateLimitsIfNeeded(serverId: String) async {
@@ -2440,6 +2486,7 @@ final class AppModel {
     private func hasFreshConversationMetadata(for serverId: String) -> Bool {
         guard let server = snapshot?.serverSnapshot(for: serverId) else { return false }
         let hasModels = server.availableModels != nil
+            && !modelCatalogNeedsRefresh(serverId: serverId, hasCachedModels: true)
         let hasRateLimits = server.account == nil || server.rateLimits != nil
         if hasModels && hasRateLimits {
             return true

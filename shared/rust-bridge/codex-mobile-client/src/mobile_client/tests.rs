@@ -678,7 +678,7 @@ mod mobile_client_tests {
                 requests
                     .lock()
                     .expect("request log lock should not be poisoned")
-                    .push(request.method().to_string());
+                    .push(request.method_name().to_string());
                 match request {
                     upstream::ClientRequest::ThreadResume { .. } => {
                         Err(RpcError::Transport(TransportError::SendFailed(
@@ -718,7 +718,7 @@ mod mobile_client_tests {
                     }
                     other => Err(RpcError::Deserialization(format!(
                         "unexpected request in test: {}",
-                        other.method()
+                        other.method_name()
                     ))),
                 }
             })
@@ -788,7 +788,7 @@ mod mobile_client_tests {
                 requests
                     .lock()
                     .expect("request log lock should not be poisoned")
-                    .push(format!("codex:{}", request.method()));
+                    .push(format!("codex:{}", request.method_name()));
                 Err(RpcError::Deserialization(
                     "no rollout found for thread id thread-1".to_string(),
                 ))
@@ -800,7 +800,7 @@ mod mobile_client_tests {
                 requests
                     .lock()
                     .expect("request log lock should not be poisoned")
-                    .push(format!("claude:{}", request.method()));
+                    .push(format!("claude:{}", request.method_name()));
                 match request {
                     upstream::ClientRequest::ThreadResume { .. } => {
                         serde_json::to_value(serde_json::json!({
@@ -836,7 +836,7 @@ mod mobile_client_tests {
                     }
                     other => Err(RpcError::Deserialization(format!(
                         "unexpected request in test: {}",
-                        other.method()
+                        other.method_name()
                     ))),
                 }
             })
@@ -902,7 +902,7 @@ mod mobile_client_tests {
                 requests
                     .lock()
                     .expect("request log lock should not be poisoned")
-                    .push(request.method().to_string());
+                    .push(request.method_name().to_string());
                 match request {
                     upstream::ClientRequest::ThreadResume { .. } => {
                         serde_json::to_value(serde_json::json!({
@@ -938,7 +938,7 @@ mod mobile_client_tests {
                     }
                     other => Err(RpcError::Deserialization(format!(
                         "unexpected request in test: {}",
-                        other.method()
+                        other.method_name()
                     ))),
                 }
             })
@@ -999,7 +999,7 @@ mod mobile_client_tests {
                         requests
                             .lock()
                             .expect("request log lock should not be poisoned")
-                            .push(other.method().to_string());
+                            .push(other.method_name().to_string());
                     }
                 }
                 match request {
@@ -1062,7 +1062,7 @@ mod mobile_client_tests {
                     }
                     other => Err(RpcError::Deserialization(format!(
                         "unexpected request in test: {}",
-                        other.method()
+                        other.method_name()
                     ))),
                 }
             })
@@ -1215,7 +1215,7 @@ mod mobile_client_tests {
                 }
                 other => Err(RpcError::Deserialization(format!(
                     "unexpected request in test: {}",
-                    other.method()
+                    other.method_name()
                 ))),
             })
         };
@@ -1330,7 +1330,7 @@ mod mobile_client_tests {
                 }
                 other => Err(RpcError::Deserialization(format!(
                     "unexpected request in test: {}",
-                    other.method()
+                    other.method_name()
                 ))),
             })
         };
@@ -1452,7 +1452,7 @@ mod mobile_client_tests {
                 }
                 other => Err(RpcError::Deserialization(format!(
                     "unexpected request in test: {}",
-                    other.method()
+                    other.method_name()
                 ))),
             })
         };
@@ -1592,7 +1592,7 @@ mod mobile_client_tests {
                     }
                     other => Err(RpcError::Deserialization(format!(
                         "unexpected request in test: {}",
-                        other.method()
+                        other.method_name()
                     ))),
                 }
             })

@@ -2,6 +2,7 @@
 
 ## Summary
 
+- Course Settings now refreshes Codex's model list when opened, keeps cached choices during a temporary refresh failure, and offers a retry. The bundled Codex runtime now supports the newer model catalog.
 - Course replies now render bold, italics, headings, lists, links, code blocks, and tables, including while replies stream.
 - Fixed stale history replacing Apple and focused-discussion messages, and kept focused tools in the correct course workspace.
 - Fixed chained Hosted tools finishing early and surfaced model stream errors instead of silently dropping them.
@@ -27,6 +28,7 @@ Learnfold is an early external beta. Visible adaptation, reassessment, citations
 7. Pair or reconnect a Hermes server and confirm its connection state is accurate throughout the flow.
 8. Confirm the app icon has a pure black background on the Home Screen and in TestFlight.
 9. Ask Hosted for a formatted explanation with a numbered list and code sample. Check formatting in light and dark mode and with larger text.
+10. Select Codex in Course Settings. Check that models available to your account appear, use Refresh Models, and confirm your selection stays selected after reopening settings.
 
 ## Feedback
 
