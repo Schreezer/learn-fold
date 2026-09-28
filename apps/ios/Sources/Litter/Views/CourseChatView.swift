@@ -932,6 +932,18 @@ struct CourseChatView: View {
         )
     }
 
+    private var visibleRemoteTimelineItems: [ConversationItem] {
+        CourseChatQuestionPolicy.strippingQuestions(from: remoteTimelineItems)
+    }
+
+    private var remoteTimelineTurns: [CourseChatTimelinePolicy.Turn] {
+        CourseChatTimelinePolicy.turns(
+            from: visibleRemoteTimelineItems,
+            threadHasActiveTurn: liveThread?.hasActiveTurn == true,
+            activeTurnID: liveThread?.activeTurnId
+        )
+    }
+
     private var firstLearnerAwaitingReplyID: String? {
         CourseChatTimelinePolicy.firstLearnerAwaitingReplyID(
             in: remoteTimelineItems
@@ -1184,25 +1196,37 @@ struct CourseChatView: View {
                                     .id(message.id)
                             }
                         } else if !remoteTimelineItems.isEmpty || liveThread != nil {
-                            ConversationTurnTimeline(
-                                items: CourseChatQuestionPolicy.strippingQuestions(
-                                    from: remoteTimelineItems
-                                ),
-                                isLive: liveThread?.hasActiveTurn == true,
-                                serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
-                                originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
-                                agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
-                                messageActionsDisabled: true,
-                                onStreamingSnapshotRendered: {
-                                    requestFollowScrollAfterLayout(proxy)
-                                },
-                                onLiveContentLayoutChanged: {
-                                    requestFollowScrollAfterLayout(proxy)
-                                },
-                                resolveTargetLabel: { target in
-                                    appModel.snapshot?.resolvedAgentTargetLabel(
-                                        for: target,
-                                        serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? ""
+                            VStack(alignment: .leading, spacing: 10) {
+                                let expansionContext = ConversationTimelineExpansionContext(
+                                    items: visibleRemoteTimelineItems
+                                )
+                                ForEach(remoteTimelineTurns) { turn in
+                                    ConversationTurnTimeline(
+                                        items: turn.items,
+                                        isLive: turn.isLive,
+                                        serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
+                                        originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
+                                        agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
+                                        messageActionsDisabled: true,
+                                        onStreamingSnapshotRendered: {
+                                            requestFollowScrollAfterLayout(proxy)
+                                        },
+                                        onLiveContentLayoutChanged: {
+                                            requestFollowScrollAfterLayout(proxy)
+                                        },
+                                        resolveTargetLabel: { target in
+                                            appModel.snapshot?.resolvedAgentTargetLabel(
+                                                for: target,
+                                                serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? ""
+                                            )
+                                        },
+                                        onWidgetPrompt: { prompt in
+                                            inputText = prompt
+                                            composerFocused = true
+                                        },
+                                        onEditUserItem: { _ in },
+                                        onForkFromUserItem: { _ in },
+                                        expansionContext: expansionContext
                                     )
                                     .id(turn.id)
                                 }
