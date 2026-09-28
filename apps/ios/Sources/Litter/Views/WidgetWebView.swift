@@ -322,7 +322,14 @@ struct WidgetWebView: UIViewRepresentable {
 
         // Block navigation to external URLs
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
-            if navigationAction.navigationType == .other || navigationAction.request.url?.scheme == "about" {
+            // `loadHTMLString` with a nil base URL lands on about:blank, and
+            // that is the only document this view should ever enter directly.
+            // Allowing every `.other` navigation also allowed script-driven
+            // ones (`location.href = …`), which would carry the `widget`
+            // message handler and the injected shell script onto whatever
+            // remote origin the widget content named.
+            let url = navigationAction.request.url
+            if url == nil || url?.scheme == "about" {
                 decisionHandler(.allow)
                 return
             }

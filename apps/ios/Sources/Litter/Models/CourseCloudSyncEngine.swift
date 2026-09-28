@@ -261,6 +261,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         repository: CourseDocumentRepository,
         title: String? = nil
     ) async throws {
+        guard repository.allowsCloudSync else { return }
         guard let engine, let accountID, let stateStore else {
             throw CourseCloudSyncEngineError.notStarted
         }
@@ -447,7 +448,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
     func queueRepositoryChangesIfNeeded(
         repository: CourseDocumentRepository
     ) async {
-        guard availability == .available else { return }
+        guard repository.allowsCloudSync, availability == .available else { return }
         let workspaceID = repository.workspaceID
         guard !workspacesBeingQueued.contains(workspaceID) else { return }
         workspacesBeingQueued.insert(workspaceID)
@@ -615,9 +616,14 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         guard let accountID, let stateStore else { return nil }
         do {
             let outbox = try await stateStore.pendingOutbox(accountID: accountID, limit: 500)
-            let byID = Dictionary(uniqueKeysWithValues: outbox.map {
-                (Self.recordID(zoneName: $0.zoneName, recordName: $0.recordName), $0)
-            })
+            // Two outbox rows can name the same record. Prefer the newest
+            // instead of trapping inside a CKSyncEngine delegate callback.
+            let byID = Dictionary(
+                outbox.map {
+                    (Self.recordID(zoneName: $0.zoneName, recordName: $0.recordName), $0)
+                },
+                uniquingKeysWith: { _, newest in newest }
+            )
             let pending = syncEngine.state.pendingRecordZoneChanges.filter {
                 context.options.scope.contains($0)
             }

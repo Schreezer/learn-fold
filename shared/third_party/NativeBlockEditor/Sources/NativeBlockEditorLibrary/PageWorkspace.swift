@@ -405,7 +405,10 @@ public struct PageWorkspace: Codable, Hashable, Sendable {
             throw PageWorkspaceError.cannotReparentRoot
         }
         let sourceIDs = subtreeIDs(rootedAt: itemID)
-        let idMap = Dictionary(uniqueKeysWithValues: sourceIDs.map { ($0, UUID().uuidString.lowercased()) })
+        let idMap = Dictionary(
+            sourceIDs.map { ($0, UUID().uuidString.lowercased()) },
+            uniquingKeysWith: { first, _ in first }
+        )
 
         for sourceID in sourceIDs {
             guard let source = items[sourceID], let newID = idMap[sourceID] else { continue }
@@ -524,7 +527,9 @@ public struct PageWorkspace: Codable, Hashable, Sendable {
         if let decodedItems = try container.decodeIfPresent([String: LibraryItem].self, forKey: .items) {
             items = decodedItems
         } else {
-            items = Dictionary(uniqueKeysWithValues: pages.values.enumerated().map { index, page in
+            // A decoded page map can repeat a record's own `id` even though
+            // its dictionary keys are unique, so this must not trap.
+            items = Dictionary(pages.values.enumerated().map { index, page in
                 (page.id, LibraryItem(
                     id: page.id,
                     kind: .page,
@@ -535,7 +540,7 @@ public struct PageWorkspace: Codable, Hashable, Sendable {
                     createdAt: page.createdAt,
                     updatedAt: page.updatedAt
                 ))
-            })
+            }, uniquingKeysWith: { first, _ in first })
         }
         normalizeLibraryRoot()
         try validate()

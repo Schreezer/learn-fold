@@ -452,6 +452,7 @@ struct CoursePageEditorView: View {
     @State private var loadingError: String?
     @State private var reloadGeneration = 0
     @State private var chatError: String?
+    @State private var activePageChat: CoursePageChatContext?
     @State private var activeDiscussion: CourseSelectionDiscussion?
     @State private var discussionConflict: CourseSelectionDiscussionConflict?
 #if DEBUG
@@ -482,7 +483,10 @@ struct CoursePageEditorView: View {
                     onOpenPage: { destination in
                         store.openCoursePage(courseID: course.id, pageID: destination.id)
                     },
-                    readingFooter: readingFooter,
+                    readingFooter: readingFooter(for: model),
+                    onAskAboutPage: {
+                        openPageChat(model: model)
+                    },
                     initialReadingPosition: initialReadingPosition,
                     onReadingPositionChange: { position in
                         guard store.navigationPath.last == .coursePage(courseID: course.id, pageID: pageID),
@@ -530,7 +534,12 @@ struct CoursePageEditorView: View {
             guard let model else { return }
             Task { await model.flush() }
         }
-        .sheet(item: $activeDiscussion) { discussion in
+        .fullScreenCover(item: $activePageChat) { context in
+            NavigationStack {
+                CourseChatView(store: store, pageContext: context, showsDismissButton: true)
+            }
+        }
+        .fullScreenCover(item: $activeDiscussion) { discussion in
             if let reference = discussion.reference {
                 NavigationStack {
                     CourseChatView(
@@ -549,8 +558,15 @@ struct CoursePageEditorView: View {
                 }
 #endif
                 .id(discussion.id)
-                .presentationDetents([.large])
-                .presentationDragIndicator(.visible)
+            } else {
+                // A full-screen cover has no swipe-to-dismiss, so presenting
+                // nothing here left the learner on a blank screen with no way
+                // back. (The sheet this replaced could at least be dragged
+                // away.) A discussion can lose its reference when its anchor
+                // no longer resolves against the current page text.
+                CourseSelectionDiscussionUnavailableView {
+                    activeDiscussion = nil
+                }
             }
         }
         .courseSelectionDiscussionAlerts(
@@ -561,12 +577,36 @@ struct CoursePageEditorView: View {
         )
     }
 
-    private var readingFooter: AnyView? {
-        guard CourseReadingOrder.lessons(in: readingNodes).contains(where: { $0.pageID == pageID }) else { return nil }
+    private func openPageChat(model: CoursePageEditorModel, initialQuestion: String? = nil) {
+        guard store.prepareContextualCourseChat(for: course) else {
+            chatError = store.agentError ?? "This course’s chat could not be opened."
+            return
+        }
+        activePageChat = CoursePageChatContext(
+            pageID: pageID,
+            pageTitle: model.title,
+            content: AppFlowyMarkdownCodec().encode(model.document),
+            initialQuestion: initialQuestion
+        )
+    }
+
+    /// Lesson navigation, when this page is part of the reading order.
+    private func readingFooter(for model: CoursePageEditorModel) -> AnyView? {
+        lessonReadingFooter
+    }
+
+    private var lessonReadingFooter: AnyView? {
+        let lessons = CourseReadingOrder.lessons(in: readingNodes)
+        let isLesson = lessons.contains(where: { $0.pageID == pageID })
+        // A branch page returns the learner to the main path after its lesson.
+        let isBranch = !isLesson
+            && CourseReadingOrder.trunkLesson(containing: pageID, in: lessons) != nil
+        guard isLesson || isBranch else { return nil }
         if let next = CourseReadingOrder.next(after: pageID, in: readingNodes) {
             return AnyView(CourseLessonActionButton(
                 course: course, node: next, store: store,
-                title: "Next lesson", replacesCurrentPage: true
+                title: isBranch ? "Back to the main path" : "Next lesson",
+                replacesCurrentPage: true
             ))
         }
         return AnyView(VStack(spacing: 12) {
@@ -3073,16 +3113,41 @@ private struct CourseEditorCheckpointUITestValidHarnessView: View {
 }
 #endif
 
+/// Shown when a saved selection discussion no longer has a resolvable passage.
+/// Its only job is to give the learner a way back out of the full-screen cover.
+private struct CourseSelectionDiscussionUnavailableView: View {
+    let onClose: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ContentUnavailableView(
+                "This discussion is unavailable",
+                systemImage: "text.badge.xmark",
+                description: Text("Its passage is no longer part of this page.")
+            )
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done", action: onClose)
+                }
+            }
+        }
+        .accessibilityIdentifier("course-selection-discussion-unavailable")
+    }
+}
+
+
 private struct CoursePageEditorCanvas: View {
     @Bindable var model: CoursePageEditorModel
     @AppStorage("coursePage.wrapsCodeLines") private var wrapsCodeLines = false
     @State private var isEditing: Bool
+    @State private var readingSelection: NativeBlockEditorSelection?
     let textAnnotations: [NativeBlockEditorTextAnnotation]
     let onAskAboutSelection: (NativeBlockEditorSelection) -> CourseTextReference?
     let onOpenTextAnnotation: (NativeBlockEditorTextAnnotation) -> Bool
     let onOpenPage: (NativeBlockEditorPageDestination) -> Void
     var onRetrySave: (() -> Void)?
     let readingFooter: AnyView?
+    let onAskAboutPage: (() -> Void)?
     let initialReadingPosition: NativeBlockEditorReadingPosition?
     let onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)?
 
@@ -3095,6 +3160,7 @@ private struct CoursePageEditorCanvas: View {
         startsInEditingMode: Bool = false,
         onRetrySave: (() -> Void)? = nil,
         readingFooter: AnyView? = nil,
+        onAskAboutPage: (() -> Void)? = nil,
         initialReadingPosition: NativeBlockEditorReadingPosition? = nil,
         onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)? = nil
     ) {
@@ -3106,6 +3172,7 @@ private struct CoursePageEditorCanvas: View {
         _isEditing = State(initialValue: startsInEditingMode)
         self.onRetrySave = onRetrySave
         self.readingFooter = readingFooter
+        self.onAskAboutPage = onAskAboutPage
         self.initialReadingPosition = initialReadingPosition
         self.onReadingPositionChange = onReadingPositionChange
     }
@@ -3147,7 +3214,7 @@ private struct CoursePageEditorCanvas: View {
                     allowsBlockReordering: isEditing,
                     isEditable: isEditing,
                     showsTrailingAddBlockRow: false,
-                    hiddenBlockIDs: leadingTitleBlockIDs
+                    hiddenBlockIDs: hiddenReadingBlockIDs
                 ),
                 header: AnyView(
                     Text(model.title)
@@ -3175,7 +3242,22 @@ private struct CoursePageEditorCanvas: View {
                     return true
                 },
                 onAskAboutSelection: { selection in
-                    _ = onAskAboutSelection(selection)
+                    if onAskAboutSelection(selection) != nil {
+                        readingSelection = nil
+                    }
+                },
+                onSelectionChange: { selection in
+                    guard !isEditing else { return }
+                    if !selection.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        readingSelection = selection
+                    } else {
+                        // Only one block holds the selection at a time, so an
+                        // empty one means nothing is highlighted anywhere.
+                        // Matching the path first left a selection from the
+                        // previous block armed, and the Ask button then sent
+                        // that stale passage as the question's context.
+                        readingSelection = nil
+                    }
                 },
                 textAnnotations: textAnnotations,
                 onOpenTextAnnotation: { annotation in
@@ -3185,6 +3267,37 @@ private struct CoursePageEditorCanvas: View {
                 initialReadingPosition: initialReadingPosition,
                 onReadingPositionChange: onReadingPositionChange
             )
+        }
+        .toolbar {
+            if !isEditing, let onAskAboutPage {
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Spacer()
+                    Button {
+                        if let readingSelection {
+                            if onAskAboutSelection(readingSelection) != nil {
+                                self.readingSelection = nil
+                            }
+                        } else {
+                            onAskAboutPage()
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "bubble.left.and.bubble.right")
+                            if readingSelection != nil {
+                                Text("Ask about this")
+                                    .font(.callout.weight(.semibold))
+                            }
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                        .animation(.snappy(duration: 0.2), value: readingSelection != nil)
+                    }
+                    .accessibilityLabel(readingSelection == nil ? "Ask AI about this page" : "Ask about this")
+                    .accessibilityHint(readingSelection == nil
+                        ? "Opens chat with the current page as context"
+                        : "Opens chat with the selected passage as context")
+                    .accessibilityIdentifier("course-page-ask-ai")
+                }
+            }
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -3210,6 +3323,16 @@ private struct CoursePageEditorCanvas: View {
         model.saveState
     }
 
+    /// Courses no longer generate a trailing "Keep asking" section, but pages
+    /// written before that change still carry one. Keep hiding it while
+    /// reading so those pages do not end in a stray list of questions.
+    /// Editing still shows it in place so it can be deleted.
+    private var hiddenReadingBlockIDs: Set<UUID> {
+        guard !isEditing else { return leadingTitleBlockIDs }
+        let followUpIDs = CourseFollowUpQuestions.extract(from: model.document)?.hiddenBlockIDs ?? []
+        return leadingTitleBlockIDs.union(followUpIDs)
+    }
+
     private var leadingTitleBlockIDs: Set<UUID> {
         guard let first = model.document.root.children.first,
               first.type == "heading",
@@ -3227,6 +3350,7 @@ private struct CoursePageEditorCanvas: View {
     }
 
     private func setEditing(_ editing: Bool) {
+        readingSelection = nil
         isEditing = editing
         UIAccessibility.post(
             notification: .announcement,

@@ -42,6 +42,9 @@ settings:
     CLANG_ENABLE_EXPLICIT_MODULES: "YES"
 
 packages:
+  PostHog:
+    url: https://github.com/PostHog/posthog-ios.git
+    exactVersion: "3.72.0"
   Hairball:
     # Vendored at 42d52f5 so Learnfold can carry the small Xcode 27
     # `SwiftUI.Document` qualification fix until it lands upstream.
@@ -125,6 +128,8 @@ targets:
       - path: Sources/Litter/Resources/cat_transmission_05.png
       - path: Sources/Litter/Resources/cat_transmission_06.png
     dependencies:
+      - package: PostHog
+        product: PostHog
       - sdk: CarPlay.framework
       - sdk: CoreGraphics.framework
       - sdk: CoreText.framework

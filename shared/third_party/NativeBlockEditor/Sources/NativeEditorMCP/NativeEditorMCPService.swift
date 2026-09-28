@@ -108,9 +108,15 @@ public actor NativeEditorMCPService {
         self.lastOpenPageID = lastOpenPageID
     }
 
+    /// `seedWorkspace` is an autoclosure so a caller can hand over an
+    /// expensive import without paying for it on every open: it is evaluated
+    /// only when the database holds no workspace yet. Callers must not decide
+    /// that for themselves from the database file's existence — the file is
+    /// created before the first workspace is committed, so an interrupted
+    /// first open would otherwise be seeded with a blank "Home" forever.
     public static func open(
         databaseURL: URL,
-        seedWorkspace: PageWorkspace? = nil
+        seedWorkspace: @autoclosure () -> PageWorkspace? = nil
     ) async throws -> NativeEditorMCPService {
         let store = try SQLiteLibraryStore(url: databaseURL)
         if let persisted = try await store.load() {
@@ -121,7 +127,7 @@ public actor NativeEditorMCPService {
                 lastOpenPageID: persisted.lastOpenPageID
             )
         }
-        let workspace = seedWorkspace ?? PageWorkspace(rootTitle: "Home")
+        let workspace = seedWorkspace() ?? PageWorkspace(rootTitle: "Home")
         let workspaceGeneration = try await store.save(
             workspace,
             lastOpenPageID: workspace.rootPageID,
@@ -911,6 +917,7 @@ public actor NativeEditorMCPService {
             ("course_role", "course_role"),
             ("generation_status", "course_generation_status"),
             ("bootstrap_status", "course_bootstrap_status"),
+            ("origin_question", "course_origin_question"),
         ]
         var changed = false
         for (property, dataKey) in mappings {
@@ -933,6 +940,7 @@ public actor NativeEditorMCPService {
             "course_role",
             "course_generation_status",
             "course_bootstrap_status",
+            "course_origin_question",
         ] where updatedDocument.root.data[key] == nil {
             updatedDocument.root.data[key] = previousDocument.root.data[key]
         }
@@ -944,6 +952,7 @@ public actor NativeEditorMCPService {
             "role": document.root.data["course_role"] ?? .null,
             "generation_status": document.root.data["course_generation_status"] ?? .null,
             "bootstrap_status": document.root.data["course_bootstrap_status"] ?? .null,
+            "origin_question": document.root.data["course_origin_question"] ?? .null,
         ])
     }
 

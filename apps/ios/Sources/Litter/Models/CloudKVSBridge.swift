@@ -33,7 +33,7 @@ final class CloudKVSBridge {
     private let preferencesDirectory: String
     private let deviceId: String
     private var observers: [NSObjectProtocol] = []
-    private var defaultsObservers: [DefaultsObserver] = []
+    private var platformKeySnapshot: [String: NSObject] = [:]
     private var pendingExportTask: Task<Void, Never>?
     private var lastAppliedEnvelopeHash: Int?
     /// Set while we're applying a remote envelope so the UserDefaults
@@ -76,17 +76,23 @@ final class CloudKVSBridge {
         }
         observers.append(externalChange)
 
-        // Outbound: observe each Swift-owned UserDefaults key. The list
-        // comes from Rust so both platforms agree on the exact set.
-        for key in cloudSyncPlatformKeys() {
-            let observer = DefaultsObserver(key: key) { [weak self] in
-                guard let self else { return }
-                Task { @MainActor in
-                    self.handleLocalDefaultsChange(key: key)
-                }
-            }
-            defaultsObservers.append(observer)
+        // Outbound: watch each Swift-owned UserDefaults key. The list comes
+        // from Rust so both platforms agree on the exact set.
+        //
+        // This diffs a snapshot rather than registering KVO per key:
+        // `addObserver(forKeyPath:)` reads a dot as a key-path separator, so
+        // dotted keys such as "litter.debugSettings" never reported a change
+        // and silently never reached iCloud.
+        platformKeySnapshot = Self.platformKeyValues()
+        let defaultsChange = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: UserDefaults.standard,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.handleLocalDefaultsSnapshotDiff() }
         }
+        observers.append(defaultsChange)
 
         // Pull whatever is currently in KVS (in case we missed external
         // notifications while the app was suspended) and kick off an
@@ -162,7 +168,14 @@ final class CloudKVSBridge {
     private func applyWritebacks(_ writebacks: [PlatformWriteback]) {
         guard !writebacks.isEmpty else { return }
         isApplyingRemoteUpdate = true
-        defer { isApplyingRemoteUpdate = false }
+        // The change notification is delivered on a later main-queue turn, by
+        // which time the flag is back to false. Rebase the snapshot on the way
+        // out so a value we just received is not diffed as a local edit and
+        // echoed straight back to the cloud.
+        defer {
+            isApplyingRemoteUpdate = false
+            platformKeySnapshot = Self.platformKeyValues()
+        }
 
         for writeback in writebacks {
             guard let data = writeback.valueJson.data(using: .utf8) else { continue }
@@ -190,6 +203,32 @@ final class CloudKVSBridge {
     }
 
     // MARK: - Outbound
+
+    /// Property-list values read back from `UserDefaults` are all `NSObject`
+    /// subclasses with a working `isEqual:`, so a snapshot compares directly.
+    private static func platformKeyValues() -> [String: NSObject] {
+        let defaults = UserDefaults.standard
+        var values: [String: NSObject] = [:]
+        for key in cloudSyncPlatformKeys() {
+            if let value = defaults.object(forKey: key) as? NSObject {
+                values[key] = value
+            }
+        }
+        return values
+    }
+
+    private func handleLocalDefaultsSnapshotDiff() {
+        guard !isApplyingRemoteUpdate else { return }
+        let current = Self.platformKeyValues()
+        let changed = Set(current.keys).union(platformKeySnapshot.keys)
+            .filter { current[$0] != platformKeySnapshot[$0] }
+            .sorted()
+        guard !changed.isEmpty else { return }
+        platformKeySnapshot = current
+        for key in changed {
+            handleLocalDefaultsChange(key: key)
+        }
+    }
 
     private func handleLocalDefaultsChange(key: String) {
         guard !isApplyingRemoteUpdate else { return }
@@ -266,39 +305,5 @@ final class CloudKVSBridge {
         let fresh = UUID().uuidString
         defaults.set(fresh, forKey: deviceIdKey)
         return fresh
-    }
-}
-
-/// KVO-style helper around `UserDefaults.standard` that ignores the value
-/// payload (we re-read on every change to avoid Foundation-level coercion
-/// surprises). Lives only as long as the owning array entry.
-private final class DefaultsObserver: NSObject, @unchecked Sendable {
-    private let key: String
-    private let onChange: () -> Void
-
-    init(key: String, onChange: @escaping () -> Void) {
-        self.key = key
-        self.onChange = onChange
-        super.init()
-        UserDefaults.standard.addObserver(
-            self,
-            forKeyPath: key,
-            options: [.new],
-            context: nil
-        )
-    }
-
-    deinit {
-        UserDefaults.standard.removeObserver(self, forKeyPath: key, context: nil)
-    }
-
-    override func observeValue(
-        forKeyPath keyPath: String?,
-        of object: Any?,
-        change: [NSKeyValueChangeKey: Any]?,
-        context: UnsafeMutableRawPointer?
-    ) {
-        guard keyPath == key else { return }
-        onChange()
     }
 }

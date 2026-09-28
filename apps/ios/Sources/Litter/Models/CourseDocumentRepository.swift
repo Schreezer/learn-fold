@@ -1,5 +1,6 @@
 import Foundation
 import NativeBlockEditorCore
+import NativeBlockEditorUI
 import NativeEditorMCP
 import Observation
 
@@ -104,6 +105,12 @@ enum CourseCloudSyncRepositoryError: Error, Equatable, LocalizedError {
 actor CourseDocumentRepository {
     let workspaceID: String
 
+    /// The bundled practice course has an independent copy on each device.
+    /// Sharing its fixed identity would merge unrelated tutorial exercises.
+    nonisolated var allowsCloudSync: Bool {
+        workspaceID != LearnfoldStarterCourse.workspaceID
+    }
+
     private struct PendingUserEdit: Codable, Sendable {
         var document: BlockDocument
         var baseDocument: BlockDocument?
@@ -127,6 +134,8 @@ actor CourseDocumentRepository {
     private var latestSnapshots: [String: NativeEditorPageSnapshot] = [:]
     private var autosaveRetryAttempt = 0
     private var asyncTaskMonitors: [String: Task<Void, Never>] = [:]
+    /// Unchanged visualizations are not re-rendered on every page edit.
+    private var visualizationInspections: [String: HTMLBlockInspection] = [:]
     private var continuations: [UUID: AsyncStream<CourseDocumentChange>.Continuation] = [:]
     private var changeSequence = 0
 #if DEBUG
@@ -158,22 +167,24 @@ actor CourseDocumentRepository {
         rootTitle: String,
         autosaveDelay: Duration = .milliseconds(350)
     ) async throws -> CourseDocumentRepository {
-        let databaseAlreadyExists = FileManager.default.fileExists(atPath: databaseURL.path)
         try FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
         let courseRoot = databaseURL.deletingLastPathComponent().deletingLastPathComponent()
-        let seed = databaseAlreadyExists
-            ? nil
-            : LegacyCoursePageImporter.makeSeedWorkspace(
+        // Whether seeding is needed is the store's call, not the file system's.
+        // SQLite creates the database file before the first workspace commits,
+        // so gating on the file's existence meant a first open interrupted in
+        // that window skipped the import for good and left the course showing
+        // a blank "Home". The seed is an autoclosure, so the import still only
+        // runs when the store really has no workspace.
+        let service = try await NativeEditorMCPService.open(
+            databaseURL: databaseURL,
+            seedWorkspace: LegacyCoursePageImporter.makeSeedWorkspace(
                 workspaceID: workspaceID,
                 rootTitle: rootTitle,
                 courseRoot: courseRoot
             )
-        let service = try await NativeEditorMCPService.open(
-            databaseURL: databaseURL,
-            seedWorkspace: seed
         )
         let pendingEditsURL = databaseURL.deletingLastPathComponent()
             .appendingPathComponent("pending-user-edits.json")
@@ -184,7 +195,7 @@ actor CourseDocumentRepository {
             courseRoot: courseRoot,
             pendingEditsURL: pendingEditsURL,
             autosaveDelay: autosaveDelay,
-            schedulesCloudSync: true,
+            schedulesCloudSync: workspaceID != LearnfoldStarterCourse.workspaceID,
             recoveredUserEdits: recoveredUserEdits
         )
         if !recoveredUserEdits.isEmpty {
@@ -861,11 +872,27 @@ actor CourseDocumentRepository {
                         // the initial queued descriptor. Keep the plan lease
                         // until the device has actually finished the mutation,
                         // and return that terminal result to Hermes.
-                        let terminal = await awaitAsyncTaskTerminal(id: task.id)
+                        guard let terminal = await awaitAsyncTaskTerminal(id: task.id) else {
+                            return NativeEditorMCPToolResult(
+                                value: .object([
+                                    "object": "error",
+                                    "code": "async_task_timeout",
+                                    "message": .string(
+                                        "The page edit did not report a result in time."
+                                    ),
+                                ]),
+                                isError: true
+                            )
+                        }
                         handleAsyncTask(terminal.descriptor)
-                        return NativeEditorMCPToolResult(
+                        let terminalResult = NativeEditorMCPToolResult(
                             value: terminal.value,
                             isError: terminal.descriptor.status == "failed"
+                        )
+                        return await addingVisualizationCheck(
+                            to: terminalResult,
+                            tool: name,
+                            arguments: arguments
                         )
                     }
                     handleAsyncTask(task)
@@ -874,6 +901,7 @@ actor CourseDocumentRepository {
                     latestSnapshots.removeAll()
                     publish(pageID: pageID, replacesDocument: true)
                     scheduleCloudSync()
+                    return await addingVisualizationCheck(to: result, tool: name, arguments: arguments)
                 }
             }
             return result
@@ -887,6 +915,38 @@ actor CourseDocumentRepository {
                 isError: true
             )
         }
+    }
+
+    /// Renders each visualization on the pages a successful write touched and
+    /// attaches what a learner would hit, so the agent fixes it right away.
+    private func addingVisualizationCheck(
+        to result: NativeEditorMCPToolResult,
+        tool: String,
+        arguments: [String: JSONValue]
+    ) async -> NativeEditorMCPToolResult {
+        guard !result.isError,
+              CourseVisualizationCheck.writesContent(tool: tool, arguments: arguments) else { return result }
+        var reports: [CourseVisualizationCheck.PageReport] = []
+        for pageID in CourseVisualizationCheck.writtenPageIDs(in: result.value) {
+            guard let snapshot = try? await service.pageSnapshot(id: pageID) else { continue }
+            let visualizations = CourseVisualizationCheck.visualizations(in: snapshot.document)
+            guard !visualizations.isEmpty else { continue }
+            var issues: [[String]] = []
+            for html in visualizations {
+                issues.append(await visualizationInspection(for: html).issues)
+            }
+            reports.append(.init(pageID: pageID, title: snapshot.title, visualizationIssues: issues))
+        }
+        guard let check = CourseVisualizationCheck.value(for: reports) else { return result }
+        return CourseVisualizationCheck.attaching(check, to: result)
+    }
+
+    private func visualizationInspection(for html: String) async -> HTMLBlockInspection {
+        if let cached = visualizationInspections[html] { return cached }
+        let inspection = await HTMLBlockInspector.inspect(html: html)
+        if visualizationInspections.count >= 32 { visualizationInspections.removeAll() }
+        visualizationInspections[html] = inspection
+        return inspection
     }
 
     func isLatestPlanApproved() -> Bool {
@@ -1106,11 +1166,18 @@ actor CourseDocumentRepository {
         }
     }
 
-    private func awaitAsyncTaskTerminal(id: String) async -> TerminalAsyncTask {
+    /// Upper bound on how long the plan lease is held waiting for a native
+    /// mutation to reach a terminal state. Without it a task that never
+    /// reports `succeeded`/`failed` wedges the workspace security gate for the
+    /// rest of the process's life, blocking every later course operation.
+    private static let asyncTaskTerminalTimeout: Duration = .seconds(120)
+
+    private func awaitAsyncTaskTerminal(id: String) async -> TerminalAsyncTask? {
         let service = self.service
+        let deadline = ContinuousClock.now.advanced(by: Self.asyncTaskTerminalTimeout)
         return await Task.detached {
             var pollDelay: Duration = .milliseconds(100)
-            while true {
+            while ContinuousClock.now < deadline {
                 do {
                     let value = try await service.asyncTask(["task_id": .string(id)])
                     if let descriptor = Self.asyncTaskDescriptor(value),
@@ -1126,6 +1193,7 @@ actor CourseDocumentRepository {
                 // native mutation can still commit would be unsafe.
                 try? await Task.sleep(for: pollDelay)
             }
+            return nil
         }.value
     }
 
@@ -1167,7 +1235,9 @@ actor CourseDocumentRepository {
         let isLeafPage = role.map {
             ["lesson", "module", "context", "agent_notes", "explainer"].contains($0)
         } ?? false
-        let kind: CourseLearningNode.Kind = children.isEmpty && isLeafPage
+        // A lesson that gains child pages stays a readable lesson; its
+        // children are branches, not a new section of the planned path.
+        let kind: CourseLearningNode.Kind = isLeafPage
             ? .markdown
             : .folder
         let explicitStatus = page.document.root.data["course_generation_status"]?.stringValue
@@ -1187,7 +1257,7 @@ actor CourseDocumentRepository {
             }
         } else if let explicitStatus {
             derivedStatus = explicitStatus
-        } else if !contentBlocks.isEmpty || !children.isEmpty {
+        } else if !contentBlocks.isEmpty || (kind == .folder && !children.isEmpty) {
             derivedStatus = .generated
         } else {
             derivedStatus = .pendingGeneration
@@ -1199,7 +1269,8 @@ actor CourseDocumentRepository {
             status: derivedStatus,
             role: role.flatMap(CourseLearningNode.Role.init(rawValue:)),
             pageID: page.id,
-            children: children
+            children: children,
+            originQuestion: page.document.root.data["course_origin_question"]?.stringValue
         )
     }
 }

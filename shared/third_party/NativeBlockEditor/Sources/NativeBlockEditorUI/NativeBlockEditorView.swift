@@ -160,6 +160,7 @@ public struct NativeBlockEditorView: View {
     private let onOpenURL: ((URL) -> Bool)?
     private let customBlockRenderer: CustomBlockRenderer?
     private let onDocumentChange: ((BlockDocument) -> Void)?
+    private let onSelectionChange: ((NativeBlockEditorSelection) -> Void)?
     private let onAskAboutSelection: ((NativeBlockEditorSelection) -> Void)?
     private let textAnnotations: [NativeBlockEditorTextAnnotation]
     private let onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)?
@@ -185,6 +186,7 @@ public struct NativeBlockEditorView: View {
         customBlockRenderer: CustomBlockRenderer? = nil,
         onDocumentChange: ((BlockDocument) -> Void)? = nil,
         onAskAboutSelection: ((NativeBlockEditorSelection) -> Void)? = nil,
+        onSelectionChange: ((NativeBlockEditorSelection) -> Void)? = nil,
         textAnnotations: [NativeBlockEditorTextAnnotation] = [],
         onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)? = nil,
         wrapsCodeLines: Binding<Bool> = .constant(false),
@@ -202,6 +204,7 @@ public struct NativeBlockEditorView: View {
         self.onOpenURL = onOpenURL
         self.customBlockRenderer = customBlockRenderer
         self.onDocumentChange = onDocumentChange
+        self.onSelectionChange = onSelectionChange
         self.onAskAboutSelection = onAskAboutSelection
         self.textAnnotations = textAnnotations
         self.onOpenTextAnnotation = onOpenTextAnnotation
@@ -746,6 +749,14 @@ public struct NativeBlockEditorView: View {
             },
             onSelectionChange: { range in
                 try? engine.setSelection(Selection(path: block.path, startOffset: range.location, endOffset: NSMaxRange(range)))
+                let text = (block.node.delta?.plainText ?? "") as NSString
+                guard range.location != NSNotFound, NSMaxRange(range) <= text.length else { return }
+                onSelectionChange?(NativeBlockEditorSelection(
+                    blockID: block.node.stableBlockID,
+                    path: block.path,
+                    range: range,
+                    text: text.substring(with: range)
+                ))
             }
         )
         .frame(maxWidth: .infinity, alignment: .leading)

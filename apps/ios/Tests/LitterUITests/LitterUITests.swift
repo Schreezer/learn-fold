@@ -125,9 +125,17 @@ final class LitterUITests: XCTestCase {
         app.launch()
 
         continuePastIntroIfNeeded(in: app)
+        if app.staticTexts["Ready to start learning"].exists {
+            let changeAgent = app.buttons["course-agent-change"]
+            XCTAssertTrue(waitUntilHittable(changeAgent, timeout: 5))
+            changeAgent.tap()
+        }
         XCTAssertTrue(
             app.staticTexts["Choose your course agent"].waitForExistence(timeout: 15)
         )
+        let applePrivateCloud = identifiedElement("course-agent-option-apple-private-cloud", in: app)
+        XCTAssertTrue(scrollUntilHittable(applePrivateCloud, in: app))
+        applePrivateCloud.tap()
         let connect = identifiedElement("course-agent-connect", in: app)
         XCTAssertTrue(scrollUntilHittable(connect, in: app))
         XCTAssertEqual(connect.label, "Connect Apple Private Cloud")
@@ -139,11 +147,15 @@ final class LitterUITests: XCTestCase {
         courseAgentMenu.tap()
 
         XCTAssertTrue(app.navigationBars["Course Settings"].waitForExistence(timeout: 5))
+        let addCustomProvider = identifiedElement("course-settings-byok", in: app)
+        XCTAssertTrue(
+            scrollUntilHittable(addCustomProvider, in: app),
+            "The API key option should be available even when Codex is not selected"
+        )
         let codex = identifiedElement("course-settings-agent-codex", in: app)
         XCTAssertTrue(scrollUntilHittable(codex, in: app))
         codex.tap()
 
-        let addCustomProvider = app.buttons["Add custom provider"]
         XCTAssertTrue(
             scrollUntilHittable(addCustomProvider, in: app),
             "Selecting Codex should update the local draft without launching OAuth"
@@ -156,6 +168,17 @@ final class LitterUITests: XCTestCase {
         XCTAssertEqual(formMarker.label, "Connection")
         XCTAssertEqual(formMarker.value as? String, "ready")
         attachScreenshot(named: "Codex custom provider draft before Save", app: app)
+
+        let providerSave = identifiedElement("custom-provider-save", in: app)
+        XCTAssertFalse(providerSave.isEnabled)
+        let apiKey = identifiedElement("custom-provider-api-key", in: app)
+        XCTAssertTrue(scrollUntilHittable(apiKey, in: app))
+        apiKey.tap()
+        apiKey.typeText("test-key-only")
+        XCTAssertTrue(
+            providerSave.isEnabled,
+            "An API key alone should enable the default OpenAI provider"
+        )
     }
 
     @MainActor
@@ -227,6 +250,46 @@ final class LitterUITests: XCTestCase {
             1
         )
         attachScreenshot(named: "Course chat partial snapshot continuity", app: app)
+    }
+
+    @MainActor
+    func testCourseChatQuestionOptionsSendTappedAnswer() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchArguments.append("--ui-test-course-chat-question")
+        app.launch()
+
+        let options = app.otherElements["course-chat-question-options"]
+        XCTAssertTrue(options.waitForExistence(timeout: 10), "Question options did not render")
+        XCTAssertFalse(
+            app.staticTexts
+                .containing(NSPredicate(format: "label CONTAINS %@", "learnfold-question"))
+                .firstMatch.exists,
+            "The raw question fence must never be visible"
+        )
+        XCTAssertTrue(app.staticTexts["What experience do you already have with cryptography or blockchains?"].exists)
+
+        let composer = app.textFields["course-chat-composer"].firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        XCTAssertEqual(composer.placeholderValue, "Or type your own response here…")
+        attachScreenshot(named: "Course chat multiple-choice question", app: app)
+
+        let second = app.buttons["course-chat-question-option-1"]
+        XCTAssertTrue(second.waitForExistence(timeout: 5))
+        XCTAssertEqual(second.label, "Answer: Understand the basics but haven't built with them")
+        second.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["Understand the basics but haven't built with them"].waitForExistence(timeout: 5),
+            "Tapping an option must send it as the learner's reply"
+        )
+        let optionsGone = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: options
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [optionsGone], timeout: 5), .completed)
+        XCTAssertEqual(composer.placeholderValue, "Message your course agent")
+        attachScreenshot(named: "Course chat question answered by tap", app: app)
     }
 
     @MainActor

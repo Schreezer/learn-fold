@@ -220,6 +220,7 @@ pub(super) async fn maybe_send_next_local_queued_follow_up(
         serde_json::json!({
             "threadId": key.thread_id,
             "input": draft.inputs,
+            "additionalContext": draft.additional_context,
         }),
     );
     if let Err(error) = response.await {

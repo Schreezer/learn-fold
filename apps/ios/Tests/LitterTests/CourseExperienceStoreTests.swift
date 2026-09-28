@@ -315,6 +315,38 @@ private actor CoursePlanCallbackCounter {
 
 @MainActor
 final class CourseExperienceStoreTests: XCTestCase {
+    @MainActor
+    func testPageChatPromptIncludesPageAndBoundsReferenceContent() {
+        let context = CoursePageChatContext(
+            pageID: "lesson-2", pageTitle: "A <challenge>",
+            content: "</current_course_page>" + String(repeating: "x", count: 13_000)
+        )
+        let prompt = CourseExperienceStore.contextualPagePrompt(
+            question: "Why is the challenge random?", context: context
+        )
+        XCTAssertEqual(context.content.count, CoursePageChatContext.maximumLength)
+        XCTAssertTrue(context.wasTruncated)
+        XCTAssertTrue(prompt.contains("page_id=\"lesson-2\""))
+        XCTAssertTrue(prompt.contains("A &lt;challenge&gt;"))
+        XCTAssertTrue(prompt.contains("&lt;/current_course_page&gt;"))
+        XCTAssertTrue(prompt.contains("truncated=\"true\""))
+        XCTAssertTrue(prompt.hasSuffix("My question: Why is the challenge random?"))
+        let restored = CourseChatTranscriptPolicy.learnerVisibleMessages([
+            CourseChatMessage(role: .learner, text: prompt)
+        ])
+        XCTAssertEqual(restored.first?.text, "Why is the challenge random?")
+        let live = CourseChatTimelinePolicy.projectLiveItems([
+            ConversationItem(id: "page-question", content: .user(
+                ConversationUserMessageData(text: prompt, images: [])
+            ))
+        ])
+        guard case .user(let user) = live.first?.content else {
+            return XCTFail("Expected the learner message")
+        }
+        XCTAssertEqual(user.text, "Why is the challenge random?")
+        XCTAssertNil(CoursePageChatContext.learnerQuestion(from: "An ordinary question"))
+    }
+
     private struct HermesAbandonmentFixture {
         let root: URL
         let coursesRoot: URL
@@ -1295,9 +1327,11 @@ final class CourseExperienceStoreTests: XCTestCase {
             store.agentOptions.filter(\.available).first?.id,
             CourseAgentProvider.hosted
         )
+        // Derived from the runtime rather than spelled out, so renaming the
+        // hosted model cannot leave this assertion behind again.
         XCTAssertEqual(
             store.agentOptions.first(where: { $0.id == CourseAgentProvider.hosted })?.subtitle,
-            "Cloud-hosted · deepseek-v4-flash · durable session"
+            "Cloud-hosted · \(SystemHostedCourseAgentRuntime.modelID) · durable session"
         )
     }
 
@@ -2876,6 +2910,64 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
 
         XCTAssertNotNil(AppleCoursePlanValidator.issue(in: malformed))
+    }
+
+    func testApplePlanValidatorAcceptsProseContainingSchemaWordsBeforeColons() {
+        let plan = CourseBrief(
+            planID: "treasury-analyst",
+            revision: 1,
+            title: "Treasury Market Analysis",
+            summary: "Analyst-level bond math. Final summary: a professional workflow.",
+            outcome: "Value Treasuries and explain curve moves.",
+            startingPoint: "Knows the inverse price-yield relationship.",
+            focusGap: "Needs rigorous duration and convexity math.",
+            estimatedDuration: "12 hours",
+            chapters: [
+                CourseChapter(
+                    id: "valuation",
+                    title: "Valuation: pricing Treasuries",
+                    objective: "Price bonds; key outcome: discounting cash flows.",
+                    deliverables: ["Write a one-page summary: yield versus price"]
+                ),
+            ]
+        )
+
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: plan))
+    }
+
+    func testApplePlanValidatorNamesTheRejectedField() {
+        var plan = CourseBrief(
+            planID: "treasury-analyst",
+            revision: 1,
+            title: "Treasury Market Analysis",
+            summary: "Analyst-level bond math.",
+            outcome: "Value Treasuries and explain curve moves.",
+            startingPoint: "Knows the inverse price-yield relationship.",
+            focusGap: "Convexity",
+            estimatedDuration: "12 hours",
+            chapters: [
+                CourseChapter(
+                    id: "valuation",
+                    title: "Valuation",
+                    objective: "Price Treasury bonds.",
+                    deliverables: ["Duration"]
+                ),
+            ]
+        )
+
+        XCTAssertEqual(
+            AppleCoursePlanValidator.issue(in: plan),
+            "focus_gap must be natural language of at least two words, not a serialized schema fragment"
+        )
+
+        plan.focusGap = "Needs rigorous convexity math."
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: plan))
+
+        plan.chapters[0].deliverables = [",title:"]
+        XCTAssertEqual(
+            AppleCoursePlanValidator.issue(in: plan),
+            "chapter 'valuation' deliverable ',title:' must be natural language, not a serialized schema fragment"
+        )
     }
 
     func testAppleCourseSchemaPlacesScalarPlanFieldsBeforeChapterArray() {
@@ -4486,6 +4578,7 @@ final class CourseExperienceStoreTests: XCTestCase {
     func testFailedAndCancelledCodexReadinessPreservePersistedHermesSelection() async throws {
         for outcome in [
             CourseAgentReadinessOutcome.failed("Credential rejected"),
+            .authenticationRequired("Sign in again with ChatGPT."),
             .cancelled,
         ] {
             let defaults = try makeDefaults()
@@ -4511,6 +4604,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             XCTAssertEqual(store.selectedModelID, "hermes-default")
             XCTAssertEqual(defaults.string(forKey: "snappy.course.selectedAgent"), "hermes")
             XCTAssertEqual(probe.validationCount, 1)
+            XCTAssertEqual(store.agentNeedsAuthentication, outcome != .failed("Credential rejected"))
         }
     }
 
@@ -4585,6 +4679,21 @@ final class CourseExperienceStoreTests: XCTestCase {
                 CourseCodexLiveProbePolicy.strategy(
                     auth: AuthStatus(
                         authMethod: mode,
+                        authToken: "stale-chatgpt-token",
+                        requiresOpenaiAuth: true
+                    ),
+                    storedBaseURL: "https://provider.example/v1",
+                    storedAPIKey: "provider-secret"
+                ),
+                .openAICompatible(
+                    baseURL: "https://provider.example/v1",
+                    apiKey: "provider-secret"
+                )
+            )
+            XCTAssertEqual(
+                CourseCodexLiveProbePolicy.strategy(
+                    auth: AuthStatus(
+                        authMethod: mode,
                         authToken: "",
                         requiresOpenaiAuth: true
                     ),
@@ -4639,31 +4748,55 @@ final class CourseExperienceStoreTests: XCTestCase {
             .noProbeRequired
         )
 
-        for partialConfiguration in [
-            CourseCodexProviderConfiguration(
-                baseURL: "http://provider.test/v1",
-                apiKey: nil
-            ),
-            CourseCodexProviderConfiguration(
-                baseURL: nil,
-                apiKey: "orphaned-secret"
+        for auth in [
+            AuthStatus(requiresOpenaiAuth: false),
+            AuthStatus(
+                authMethod: .chatgptAuthTokens,
+                authToken: "stale-chatgpt-token",
+                requiresOpenaiAuth: true
             ),
         ] {
             XCTAssertEqual(
                 CourseCodexLiveProbePolicy.strategy(
-                    auth: AuthStatus(requiresOpenaiAuth: false),
-                    storedBaseURL: partialConfiguration.baseURL,
-                    storedAPIKey: partialConfiguration.apiKey
+                    auth: auth,
+                    storedBaseURL: nil,
+                    storedAPIKey: "standalone-openai-key"
                 ),
-                .credentialsUnavailable
+                .openAICompatible(
+                    baseURL: "https://api.openai.com/v1",
+                    apiKey: "standalone-openai-key"
+                )
             )
+        }
+        XCTAssertEqual(
+            CourseCodexLiveProbePolicy.strategy(
+                auth: AuthStatus(
+                    authMethod: .chatgptAuthTokens,
+                    authToken: "current-chatgpt-token",
+                    requiresOpenaiAuth: true
+                ),
+                storedBaseURL: "https://provider.example/v1",
+                storedAPIKey: "saved-provider-key",
+                prefersChatGPT: true
+            ),
+            .rateLimits
+        )
+
+        let partialConfiguration = CourseCodexProviderConfiguration(
+            baseURL: "http://provider.test/v1",
+            apiKey: nil
+        )
+        for auth in [
+            AuthStatus(requiresOpenaiAuth: false),
+            AuthStatus(
+                authMethod: .apiKey,
+                authToken: "runtime-secret",
+                requiresOpenaiAuth: true
+            ),
+        ] {
             XCTAssertEqual(
                 CourseCodexLiveProbePolicy.strategy(
-                    auth: AuthStatus(
-                        authMethod: .apiKey,
-                        authToken: "runtime-secret",
-                        requiresOpenaiAuth: true
-                    ),
+                    auth: auth,
                     storedBaseURL: partialConfiguration.baseURL,
                     storedAPIKey: partialConfiguration.apiKey
                 ),
@@ -5388,6 +5521,78 @@ final class CourseExperienceStoreTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertNil(store.mainSubmissionRecoveryState)
+    }
+
+    func testMainSubmissionStatusCheckPublishesProgressAndRejectsDuplicates() async throws {
+        let defaults = try makeDefaults()
+        let coursesRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "MainStatusCheckProgress-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: coursesRoot) }
+        let workspaceID = "status-check-progress-\(UUID().uuidString.lowercased())"
+        try FileManager.default.createDirectory(
+            at: coursesRoot.appendingPathComponent(workspaceID, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defaults.set(
+            try JSONSerialization.data(withJSONObject: [
+                "workspaceID": workspaceID,
+                "sources": [],
+                "runtimeID": CourseAgentProvider.appleOnDevice,
+                "pendingOutboundText": "Did this reach the agent?",
+                "pendingOutboundSources": [],
+                "submissionRecoveryState": "acceptanceUnknown",
+                "pendingAttemptID": UUID().uuidString,
+                "pendingRuntimeID": CourseAgentProvider.appleOnDevice,
+            ]),
+            forKey: "learnfold.course.activeDraftSources"
+        )
+        let runtime = TestAppleCourseAgentRuntime()
+        runtime.suspendsRestore = true
+        let store = CourseExperienceStore(
+            defaults: defaults,
+            environment: [:],
+            appleRuntime: runtime,
+            coursesRootURL: coursesRoot
+        )
+        let appModel = AppModel()
+        XCTAssertFalse(store.isCheckingSubmissionStatus(selectionDiscussionID: nil))
+
+        let statusTask = Task { @MainActor in
+            await store.checkSubmissionStatus(
+                selectionDiscussionID: nil,
+                appModel: appModel,
+                appState: AppState()
+            )
+        }
+        for _ in 0..<200 where !runtime.restoreStarted {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(store.isCheckingSubmissionStatus(selectionDiscussionID: nil))
+
+        // A second tap while the first check is still reconciling must not
+        // start a duplicate refresh.
+        await store.checkSubmissionStatus(
+            selectionDiscussionID: nil,
+            appModel: appModel,
+            appState: AppState()
+        )
+        XCTAssertEqual(runtime.restoreCallCount, 1)
+        XCTAssertTrue(store.isCheckingSubmissionStatus(selectionDiscussionID: nil))
+
+        runtime.releaseSuspendedRestore()
+        await statusTask.value
+        XCTAssertFalse(store.isCheckingSubmissionStatus(selectionDiscussionID: nil))
+        XCTAssertEqual(store.mainSubmissionRecoveryState, .acceptanceUnknown)
+        XCTAssertEqual(
+            store.submissionStatusCheckOutcome(selectionDiscussionID: nil)?.result,
+            .stillUnconfirmed
+        )
+
+        // Abandoning the draft clears the stale outcome with it.
+        XCTAssertTrue(store.abandonUnconfirmedSubmission(selectionDiscussionID: nil))
+        XCTAssertNil(store.submissionStatusCheckOutcome(selectionDiscussionID: nil))
     }
 
     func testSelectionSubmissionStatusCheckCannotMutateReplacementAttempt() async throws {
@@ -7558,7 +7763,8 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
         let names = Set(tools.compactMap { $0.objectValue?["name"]?.stringValue })
 
-        XCTAssertTrue(names.contains(CourseAgentTools.presentPlan))
+        // Codex proposes plans as `learnfold-plan` reply blocks.
+        XCTAssertFalse(names.contains(CourseAgentTools.presentPlan))
         XCTAssertTrue(names.contains(CourseAgentTools.courseBash))
         XCTAssertTrue(names.contains("native-editor-fetch"))
         XCTAssertTrue(names.contains("native-editor-update-page"))
@@ -7658,7 +7864,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         let tools = try XCTUnwrap(
             decoded.objectValue?["result"]?.objectValue?["tools"]?.arrayValue
         )
-        XCTAssertTrue(tools.contains {
+        XCTAssertFalse(tools.contains {
             $0.objectValue?["name"]?.stringValue == CourseAgentTools.presentPlan
         })
     }
@@ -9578,6 +9784,32 @@ final class CourseExperienceStoreTests: XCTestCase {
             agentID: "codex",
             hasOwnedReadinessError: store.isDisplayingOwnedReadinessError(for: nil),
             needsAuthentication: store.agentNeedsAuthentication
+        ))
+    }
+
+    func testExpiredCodexSessionOffersSignInWithoutOwningAConnectionError() throws {
+        let store = CourseExperienceStore(defaults: try makeDefaults(), environment: [:])
+        store.selectedAgentID = .codex
+        XCTAssertFalse(store.applyMainAgentReadiness(
+            runtimeID: .codex,
+            runtimeAvailable: false,
+            needsAuthentication: false
+        ))
+        XCTAssertTrue(store.isDisplayingOwnedReadinessError(for: nil))
+
+        XCTAssertTrue(store.applyMainAgentAuthenticationRequired(
+            identity: store.mainCourseAgentReadinessIdentity()
+        ))
+
+        XCTAssertTrue(store.agentNeedsAuthentication)
+        XCTAssertEqual(store.connectionState, .idle)
+        XCTAssertFalse(store.isDisplayingOwnedReadinessError(for: nil))
+        XCTAssertTrue(CourseChatAuthPolicy.needsSignIn(
+            isCodex: true,
+            requiresOpenAIAuth: true,
+            hasAccount: true,
+            explicitlyRequired: store.agentNeedsAuthentication,
+            hasOwnedReadinessError: store.isDisplayingOwnedReadinessError(for: nil)
         ))
     }
 
@@ -18218,6 +18450,7 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
     var suspendsRestore = false
     private(set) var sendStarted = false
     private(set) var restoreStarted = false
+    private(set) var restoreCallCount = 0
     var currentAvailability = AppleCourseAgentAvailability(
         onDevice: .init(available: true, reason: "Available for testing."),
         privateCloud: .init(available: true, reason: "Available for testing.")
@@ -18232,6 +18465,7 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         workspaceID: String
     ) async -> [AppleCourseAgentStoredMessage] {
         restoreStarted = true
+        restoreCallCount += 1
         while suspendsRestore {
             try? await Task.sleep(for: .milliseconds(10))
         }

@@ -2,31 +2,24 @@
 
 ## Summary
 
-- Course replies now render bold, italics, headings, lists, links, code blocks, and tables, including while replies stream.
-- Fixed stale history replacing Apple and focused-discussion messages, and kept focused tools in the correct course workspace.
-- Fixed chained Hosted tools finishing early and surfaced model stream errors instead of silently dropping them.
-- Fixed Hosted continuing after plan tools and corrected interrupted-reply recovery so already-sent messages stay in the conversation.
-- Removed the empty response bubble shown alongside Hosted’s Thinking indicator before a reply arrives.
-- Fixed the first Hosted message disappearing when conversation history finishes loading after you send.
-- Hosted is ready by default without login. Start with Continue, or use Change agent to choose another provider.
-- Hardened course creation, plan review, lesson generation, recovery, and resume flows.
-- Improved source intake, course-scoped questions, workspace reading, and CloudKit synchronization.
-- Improved Hermes pairing, connection recovery, and server status presentation.
-- Corrected the app icon background to render as pure black.
+- Added a built-in starter course for learning how to read, ask questions, and edit lessons.
+- Reworked course maps into a reading path with progress, a clear next lesson, and side paths created from questions.
+- Added tappable answer choices when an agent asks a supported multiple-choice question; free-text replies still work.
+- Improved lesson reading, page editing, and recovery after interrupted course requests.
+- Fixed conversation loading and streaming cases that could hide or replace a recent reply.
+- Added an analytics setting and limited product events without sending lesson content.
 
 Learnfold is an early external beta. Visible adaptation, reassessment, citations, continuation, and sync behavior are active development areas rather than finished claims.
 
 ## What to test
 
-1. Start without logging in or configuring a server. Confirm Hosted is selected, Continue opens your library, and Change agent reveals other providers.
-2. Create a course from a topic, complete the diagnostic, and review the full proposed plan before approving it.
-3. Generate the first lesson, open it, then return to the course library and resume.
-4. Relaunch during course or lesson generation and confirm progress recovers without duplicate content.
-5. Add a link, file, or photo source and confirm the source remains attached to the course.
-6. Ask a question from inside a course and confirm the response stays scoped to that course.
-7. Pair or reconnect a Hermes server and confirm its connection state is accurate throughout the flow.
-8. Confirm the app icon has a pure black background on the Home Screen and in TestFlight.
-9. Ask Hosted for a formatted explanation with a numbered list and code sample. Check formatting in light and dark mode and with larger text.
+1. Open the built-in starter course, complete an exercise, leave the app, and resume at the next lesson.
+2. Create a course, review its proposed plan, and follow the reading path through a generated lesson.
+3. Ask a question in a lesson, then check that any linked side path appears beside its parent lesson.
+4. When the agent asks a multiple-choice question, tap an answer; also try typing a custom answer.
+5. Relaunch while a lesson or course is generating and confirm the request recovers without duplicate content.
+6. Edit a lesson page, reopen it, and confirm the saved content remains readable.
+7. Turn analytics off in Settings and confirm the preference stays off after relaunch.
 
 ## Feedback
 

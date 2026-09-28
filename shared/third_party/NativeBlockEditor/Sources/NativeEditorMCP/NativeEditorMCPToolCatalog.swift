@@ -77,6 +77,7 @@ public enum NativeEditorMCPToolCatalog {
                                             description: "Current generation state for this course page."
                                         ),
                                         "bootstrap_status": stringSchema("Root-course bootstrap state, such as building or ready_for_learning."),
+                                        "origin_question": stringSchema("For a branch page created from a learner question, the question that prompted it."),
                                     ],
                                     required: ["title"]
                                 ),
@@ -130,6 +131,7 @@ public enum NativeEditorMCPToolCatalog {
                             description: "Current generation state for this course page."
                         ),
                         "bootstrap_status": stringSchema("Root-course bootstrap state, such as building or ready_for_learning."),
+                        "origin_question": stringSchema("For a branch page created from a learner question, the question that prompted it."),
                     ]),
                     "in_trash": booleanSchema("Whether the page should be placed in trash."),
                     "allow_deleting_content": booleanSchema("Explicitly allow removal of child-page or database blocks."),

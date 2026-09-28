@@ -9,6 +9,8 @@ struct CourseLessonActionButton: View {
     @Bindable var store: CourseExperienceStore
     let title: String
     var replacesCurrentPage = false
+    /// Floats the button as Liquid Glass over scrolling content (iOS 26+).
+    var usesGlass = false
 
     @State private var requestID: UUID?
     @State private var isGenerating = false
@@ -24,41 +26,50 @@ struct CourseLessonActionButton: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
                     .accessibilityIdentifier("course-reading-error")
             }
-            Button {
-                error = nil
-                requestID = UUID()
-            } label: {
-                HStack(spacing: 12) {
-                    if requestID != nil {
-                        ProgressView().tint(.white)
-                    } else {
-                        Image(systemName: "arrow.right")
-                    }
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(requestID != nil ? (isGenerating ? "Generating next lesson…" : "Opening lesson…") : (error == nil ? title : "Try again"))
-                            .font(.headline)
-                        Text(node.title)
-                            .font(.caption)
-                            .lineLimit(2)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 13)
-                .frame(maxWidth: 480, minHeight: 58)
-                .background(.blue, in: RoundedRectangle(cornerRadius: 24))
-                .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
-            }
-            .buttonStyle(.plain)
-            .disabled(requestID != nil)
-            .accessibilityIdentifier(replacesCurrentPage ? "course-next-lesson" : "course-continue")
+            actionButton
         }
         .task(id: requestID) {
             guard let requestID else { return }
             await openLesson(request: requestID)
         }
         .onDisappear { requestID = nil }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        let button = Button {
+            error = nil
+            requestID = UUID()
+        } label: {
+            HStack(spacing: usesGlass ? 10 : 12) {
+                if requestID != nil {
+                    ProgressView()
+                } else {
+                    Image(systemName: usesGlass ? "play.fill" : "arrow.right")
+                        .font(usesGlass ? .body.weight(.semibold) : nil)
+                }
+                VStack(alignment: .leading, spacing: usesGlass ? 1 : 3) {
+                    Text(requestID != nil ? (isGenerating ? "Generating next lesson…" : "Opening lesson…") : (error == nil ? title : "Try again"))
+                        .font(.headline)
+                    Text(node.title)
+                        .font(usesGlass ? .subheadline : .caption)
+                        .opacity(usesGlass ? 0.85 : 1)
+                        .lineLimit(usesGlass ? 1 : 2)
+                }
+                Spacer(minLength: 0)
+            }
+            .multilineTextAlignment(.leading)
+            .frame(maxWidth: 480)
+        }
+        .controlSize(usesGlass ? .regular : .large)
+        .disabled(requestID != nil)
+        .accessibilityIdentifier(replacesCurrentPage ? "course-next-lesson" : "course-continue")
+
+        if usesGlass, #available(iOS 26.0, *) {
+            button.buttonStyle(.glassProminent)
+        } else {
+            button.buttonStyle(.borderedProminent)
+        }
     }
 
     @MainActor

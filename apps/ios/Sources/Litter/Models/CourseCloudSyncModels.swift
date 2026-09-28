@@ -283,7 +283,13 @@ struct CourseSyncWorkspaceSnapshot: Codable, Hashable, Sendable {
         guard manifest.schemaVersion == CourseCloudSyncSchema.version else {
             throw CourseCloudSyncModelError.unsupportedSchema(manifest.schemaVersion)
         }
-        guard Set(manifest.itemIDs) == Set(items.map(\.id)),
+        // Comparing sets alone would accept a decoded generation that repeats
+        // an ID, which then traps while building the lookups below. A remote
+        // record is untrusted input: reject it instead.
+        guard Set(manifest.itemIDs).count == manifest.itemIDs.count,
+              Set(items.map(\.id)).count == items.count,
+              Set(pages.map(\.id)).count == pages.count,
+              Set(manifest.itemIDs) == Set(items.map(\.id)),
               Set(manifest.pageChecksums.keys) == Set(pages.map(\.id)) else {
             throw CourseCloudSyncModelError.incompleteGeneration(manifest.generationID)
         }

@@ -351,7 +351,10 @@ enum CourseMCPProtocol {
             case "ping":
                 return resultResponse(id: id ?? .null, result: .object([:]))
             case "tools/list":
-                let definitions = try CourseAgentTools.mcpToolDefinitions()
+                // Codex proposes plans as `learnfold-plan` reply blocks.
+                let definitions = try CourseAgentTools.mcpToolDefinitions(
+                    includePresentPlan: false
+                )
                 let toolsData = try JSONSerialization.data(
                     withJSONObject: definitions.map(\.jsonObject),
                     options: [.sortedKeys]

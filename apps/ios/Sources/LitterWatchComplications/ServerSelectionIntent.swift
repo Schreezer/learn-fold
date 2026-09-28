@@ -24,7 +24,9 @@ struct ServerEntity: AppEntity {
 struct ServerEntityQuery: EntityQuery {
     func entities(for identifiers: [ServerEntity.ID]) async throws -> [ServerEntity] {
         let all = allServers()
-        let lookup = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })
+        let lookup = Dictionary(
+            all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }
+        )
         return identifiers.compactMap { lookup[$0] }
     }
 

@@ -73,9 +73,12 @@ enum CourseAgentTools {
         }
     }
 
-    static func mcpToolDefinitions() throws -> [CourseMCPToolDefinition] {
-        var definitions = [
-            CourseMCPToolDefinition(
+    static func mcpToolDefinitions(
+        includePresentPlan: Bool = true
+    ) throws -> [CourseMCPToolDefinition] {
+        var definitions: [CourseMCPToolDefinition] = []
+        if includePresentPlan {
+            definitions.append(CourseMCPToolDefinition(
                 name: presentPlan,
                 description: """
                 Present a complete course plan in Learnfold's native approval card after you have enough learner context. Do not print the plan as JSON or Markdown. Call it again with the same plan_id and a higher revision when the learner requests changes.
@@ -84,8 +87,8 @@ enum CourseAgentTools {
                 readOnly: true,
                 destructive: false,
                 openWorld: false
-            )
-        ]
+            ))
+        }
         definitions.append(
             CourseMCPToolDefinition(
                 name: courseBash,
@@ -261,7 +264,7 @@ enum CourseAgentTools {
                 ],
                 "learning_path": [
                     "type": "array",
-                    "description": "The complete ordered native page hierarchy. Every planned chapter, subchapter, lesson, module, and explainer is a separate typed node.",
+                    "description": "The complete ordered native page hierarchy. Every planned chapter, subchapter, lesson, module, and explainer is a separate typed node. Limits: at most \(CoursePlanHierarchyPolicy.maximumNodeCount) nodes in total across all levels, at most \(CoursePlanHierarchyPolicy.maximumDepth) levels deep, and every chapter or subchapter has 1 to \(CoursePlanHierarchyPolicy.maximumDirectChildren) children. Node IDs must be unique across the whole plan and must not reuse plan_id. Root IDs and titles must exactly match chapters in order. For a large course, group lessons into fewer, richer pages rather than exceeding the node limit.",
                     "minItems": 1,
                     "maxItems": 8,
                     "items": planNodeSchema(depth: 1),

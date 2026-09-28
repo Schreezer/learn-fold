@@ -385,6 +385,64 @@ final class CourseDocumentRepositoryTests: XCTestCase {
         XCTAssertFalse(authorizedMutation.isError)
     }
 
+    func testAgentPageWriteReportsVisualizationProblemsInToolResult() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CourseVisualizationCheckTests-\(UUID().uuidString)", isDirectory: true)
+        let protectedWorkspace = AppleCourseApprovalPolicy
+            .protectedMetadataDirectory(courseDirectory: directory)
+            .deletingLastPathComponent()
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            try? FileManager.default.removeItem(at: protectedWorkspace)
+        }
+        let repository = try await CourseDocumentRepository.open(
+            workspaceID: UUID().uuidString,
+            databaseURL: directory.appendingPathComponent(".course/course-library.sqlite"),
+            rootTitle: "Visualization check"
+        )
+        let plan = approvedMutationPlan(planID: "visualization-check", title: "Visualization Check")
+        try await repository.presentPlan(plan)
+        try await repository.approvePlan(plan)
+
+        let broken = """
+        ## Yield
+
+        ```learnfold-visualization
+        <p>Tap to compute.</p>
+        <button id="go" type="button">Compute</button>
+        <output id="out" aria-live="polite">Waiting</output>
+        <script>
+        document.getElementById('go').addEventListener('click', function() {
+          document.getElementById('out').textContent = bond.price;
+        });
+        </script>
+        ```
+        """
+        let created = await repository.callTool(
+            named: NativeEditorMCPToolCatalog.createPages,
+            argumentsJSON: try jsonString([
+                "pages": [["properties": ["title": "Yield"], "content": broken]],
+            ])
+        )
+        XCTAssertFalse(created.isError, "The write stands even when the visualization needs fixes")
+        let check = try XCTUnwrap(created.value.objectValue?[CourseVisualizationCheck.resultKey]?.objectValue)
+        XCTAssertEqual(check["status"]?.stringValue, "needs_fixes")
+        let issues = check["pages"]?.arrayValue?.first?.objectValue?["visualizations"]?.arrayValue?
+            .first?.objectValue?["issues"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        XCTAssertTrue(
+            issues.contains { $0.contains("after tapping “Compute”") && $0.contains("bond") },
+            "\(issues)"
+        )
+
+        let plain = await repository.callTool(
+            named: NativeEditorMCPToolCatalog.createPages,
+            argumentsJSON: try jsonString([
+                "pages": [["properties": ["title": "Notes"], "content": "## Notes\n\nNo visualization here."]],
+            ])
+        )
+        XCTAssertNil(plain.value.objectValue?[CourseVisualizationCheck.resultKey])
+    }
+
     func testOpeningLegacyCourseImportsMarkdownHierarchyOnceIntoNativePages() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CourseDocumentMigrationTests-\(UUID().uuidString)", isDirectory: true)

@@ -717,10 +717,13 @@ final class StrictUITestLaunchConfigurationTests: XCTestCase {
             DebugLaunchSignalAuthorityInventory.legacyPrimaryArguments,
             [
                 "--ui-test-course-draft-recovery",
+                "--ui-test-course-reading",
+                "--ui-test-starter-course",
                 "--ui-test-course-generation-control",
                 "--ui-test-course-retry",
                 "--ui-test-course-save-recovery",
                 "--ui-test-course-chat-continuity",
+                "--ui-test-course-chat-question",
                 "--ui-test-conversation-display",
             ]
         )

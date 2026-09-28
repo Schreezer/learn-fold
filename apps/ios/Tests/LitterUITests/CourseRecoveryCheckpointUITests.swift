@@ -252,13 +252,69 @@ final class CourseRecoveryCheckpointUITests: XCTestCase {
     }
 
     @MainActor
+    func testLF34StatusCheckReportsProgressAndOutcome() {
+        let app = launch(.lf34AcceptanceUnknown)
+        let checkStatus = element("course-agent-error.action.check-status", in: app)
+        XCTAssertEqual(checkStatus.label, "Check Status")
+        tapAction("course-agent-error.action.check-status", in: app)
+
+        // The check does real work, so the card must acknowledge the tap
+        // instead of looking identical while it runs.
+        XCTAssertTrue(
+            element("course-agent-error.status-check.progress", in: app)
+                .waitForExistence(timeout: 3),
+            "Tapping Check Status must show in-flight progress"
+        )
+        XCTAssertFalse(
+            element("course-agent-error.action.check-status", in: app).isEnabled,
+            "Check Status must not accept a duplicate tap while in flight"
+        )
+        XCTAssertFalse(
+            element("course-agent-error.action.abandon-local-draft", in: app).isEnabled,
+            "Abandoning the draft must not race an in-flight status check"
+        )
+        attachScreenshot(named: "LF-34 status check in flight", app: app)
+
+        // A check that changes nothing still has to read as a completed check.
+        XCTAssertTrue(
+            element("course-agent-error.status-check.outcome", in: app)
+                .waitForExistence(timeout: 5),
+            "A finished status check must report its outcome"
+        )
+        XCTAssertTrue(
+            element("course-agent-error.status-check.outcome", in: app)
+                .label
+                .contains("still unconfirmed")
+        )
+        XCTAssertTrue(
+            waitForDisappearance(element("course-agent-error.status-check.progress", in: app))
+        )
+        XCTAssertTrue(
+            element("course-agent-error.action.check-status", in: app).isEnabled
+        )
+        assertAction(
+            "check-submission-status",
+            result: "Status check requested; no backend was contacted by this fixture.",
+            in: app
+        )
+        attachScreenshot(named: "LF-34 status check finished", app: app)
+    }
+
+    @MainActor
     func testLF34UnknownAcceptanceCheckAndAbandonGuardAgainstDuplicateSubmission() {
         let app = launch(.lf34AcceptanceUnknown)
         tapAction("course-agent-error.action.check-status", in: app)
         assertAction(
             "check-submission-status",
             result: "Status check requested; no backend was contacted by this fixture.",
-            in: app
+            in: app,
+            timeout: 10
+        )
+        // Destructive actions stay locked until the status check settles.
+        XCTAssertTrue(
+            waitUntil(timeout: 5) {
+                element("course-agent-error.action.abandon-local-draft", in: app).isEnabled
+            }
         )
 
         tapAction("course-agent-error.action.abandon-local-draft", in: app)
@@ -1013,6 +1069,12 @@ final class CourseRecoveryCheckpointUITests: XCTestCase {
     }
 
     @MainActor
+    private func occludingComposer(in app: XCUIApplication) -> XCUIElement {
+        let container = element("course-chat-composer-container", in: app)
+        return container.exists ? container : element("course-chat-composer", in: app)
+    }
+
+    @MainActor
     private func tapAction(_ identifier: String, in app: XCUIApplication) {
         let attempts = 8
 
@@ -1020,7 +1082,10 @@ final class CourseRecoveryCheckpointUITests: XCTestCase {
             let matches = app.buttons.matching(identifier: identifier)
             let candidates = (0..<matches.count).map { matches.element(boundBy: $0) }
             let visibleCandidates = candidates.filter { $0.exists && $0.isHittable }
-            let composer = element("course-chat-composer", in: app)
+            // The composer bar, not just its text field, is what occludes
+            // actions parked under the bottom inset. XCUITest still reports
+            // those actions as hittable, so compare against the container.
+            let composer = occludingComposer(in: app)
 
             if visibleCandidates.count == 1, let action = visibleCandidates.first {
                 let composerIsVisible = composer.exists && !composer.frame.isEmpty
@@ -1052,7 +1117,7 @@ final class CourseRecoveryCheckpointUITests: XCTestCase {
 
         let matches = app.buttons.matching(identifier: identifier)
         let candidates = (0..<matches.count).map { matches.element(boundBy: $0) }
-        let composer = element("course-chat-composer", in: app)
+        let composer = occludingComposer(in: app)
         XCTFail(actionCandidateDiagnostics(
             identifier: identifier,
             candidates: candidates,

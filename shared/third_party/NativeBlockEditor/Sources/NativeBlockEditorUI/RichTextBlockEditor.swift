@@ -396,7 +396,14 @@ struct RichTextBlockEditor: UIViewRepresentable {
         textView.accessibilityIdentifier = accessibilityIdentifier
         textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         textView.setContentHuggingPriority(.required, for: .vertical)
-        textView.attributedText = annotatedString()
+        textView.attributedText = annotatedString(traits: textView.traitCollection)
+        textView.appearanceDidChange = { [weak coordinator = context.coordinator] textView in
+            coordinator?.refreshAppearance(in: textView)
+        }
+        textView.registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) {
+            (textView: DocumentRichTextView, _: UITraitCollection) in
+            textView.appearanceDidChange?(textView)
+        }
         configureClipboardCallbacks(textView)
         configureKeyboardCallbacks(textView, coordinator: context.coordinator)
         configureLinkTap(textView, coordinator: context.coordinator)
@@ -410,6 +417,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
         )
         context.coordinator.renderedStyleSignature = textStyle.signature
         context.coordinator.renderedAnnotationSignature = annotationSignature
+        context.coordinator.renderedAppearanceSignature = appearanceSignature(for: textView.traitCollection)
         return textView
     }
 
@@ -417,11 +425,15 @@ struct RichTextBlockEditor: UIViewRepresentable {
         context.coordinator.parent = self
         textView.accessibilityLabel = accessibilityLabel
         textView.accessibilityIdentifier = accessibilityIdentifier
-        textView.isEditable = isEditable
-        textView.isSelectable = true
-        if !isEditable, textView.isFirstResponder {
-            textView.resignFirstResponder()
+        // Read-only selection also needs first-responder ownership. Only end
+        // editing when the mode changes, never on an ordinary reader refresh.
+        if textView.isEditable != isEditable {
+            if !isEditable, textView.isFirstResponder {
+                textView.resignFirstResponder()
+            }
+            textView.isEditable = isEditable
         }
+        textView.isSelectable = true
         configureClipboardCallbacks(textView)
         configureKeyboardCallbacks(textView, coordinator: context.coordinator)
         configureLinkTap(textView, coordinator: context.coordinator)
@@ -430,16 +442,18 @@ struct RichTextBlockEditor: UIViewRepresentable {
         let current = RichTextCodec.delta(from: textView.attributedText)
         if current != delta.normalized()
             || context.coordinator.renderedStyleSignature != textStyle.signature
-            || context.coordinator.renderedAnnotationSignature != annotationSignature,
+            || context.coordinator.renderedAnnotationSignature != annotationSignature
+            || context.coordinator.renderedAppearanceSignature != appearanceSignature(for: textView.traitCollection),
             textView.markedTextRange == nil
         {
             let selection = textView.selectedRange
-            textView.attributedText = annotatedString()
+            textView.attributedText = annotatedString(traits: textView.traitCollection)
             let location = min(selection.location, textView.attributedText.length)
             let length = min(selection.length, textView.attributedText.length - location)
             textView.selectedRange = NSRange(location: location, length: length)
             context.coordinator.renderedStyleSignature = textStyle.signature
             context.coordinator.renderedAnnotationSignature = annotationSignature
+            context.coordinator.renderedAppearanceSignature = appearanceSignature(for: textView.traitCollection)
         }
 
         if isEditable, textView.isFirstResponder {
@@ -514,9 +528,16 @@ struct RichTextBlockEditor: UIViewRepresentable {
             .joined(separator: "|")
     }
 
-    private func annotatedString() -> NSAttributedString {
+    private func appearanceSignature(for traits: UITraitCollection) -> String {
+        "\(traits.userInterfaceStyle.rawValue)|\(traits.accessibilityContrast.rawValue)|\(textStyle.color.resolvedColor(with: traits))"
+    }
+
+    private func annotatedString(from currentDelta: TextDelta? = nil, traits: UITraitCollection) -> NSAttributedString {
         let output = NSMutableAttributedString(
-            attributedString: RichTextCodec.attributedString(from: delta, style: textStyle)
+            attributedString: RichTextCodec.attributedString(
+                from: currentDelta ?? delta,
+                style: textStyle.resolved(for: traits)
+            )
         )
         for annotation in annotations {
             guard annotation.range.location >= 0,
@@ -556,12 +577,36 @@ struct RichTextBlockEditor: UIViewRepresentable {
         var parent: RichTextBlockEditor
         var renderedStyleSignature = ""
         var renderedAnnotationSignature = ""
+        var renderedAppearanceSignature = ""
         var handledFocusRequestID: UUID?
         var scheduledFocusRequestID: UUID?
         var pendingInsertion: (range: NSRange, attributes: [NSAttributedString.Key: Any])?
 
         init(parent: RichTextBlockEditor) {
             self.parent = parent
+        }
+
+        func refreshAppearance(in textView: UITextView) {
+            guard textView.markedTextRange == nil else { return }
+            // UIKit can attach a read-only text view before its window's final
+            // appearance arrives. Reapply colors without changing semantic text
+            // or using a SwiftUI snapshot that may lag an active local edit.
+            let currentDelta = RichTextCodec.delta(from: textView.attributedText)
+            let selection = textView.selectedRange
+            let typingAttributes = textView.typingAttributes
+            textView.attributedText = parent.annotatedString(
+                from: currentDelta,
+                traits: textView.traitCollection
+            )
+            textView.selectedRange = selection
+            textView.typingAttributes = RichTextCodec.visualAttributes(
+                for: RichTextCodec.inlineAttributes(from: typingAttributes),
+                baseFont: parent.textStyle.font,
+                paragraphStyle: parent.textStyle.paragraphStyle,
+                defaultColor: parent.textStyle.color.resolvedColor(with: textView.traitCollection),
+                semanticStrikethrough: parent.textStyle.strikesText
+            )
+            renderedAppearanceSignature = parent.appearanceSignature(for: textView.traitCollection)
         }
 
         func scheduleFocus(
@@ -748,6 +793,9 @@ struct RichTextBlockEditor: UIViewRepresentable {
             pendingInsertion = nil
             parent.session.textDidChange(textView)
             parent.onDeltaChange(RichTextCodec.delta(from: textView.attributedText))
+            if renderedAppearanceSignature != parent.appearanceSignature(for: textView.traitCollection) {
+                refreshAppearance(in: textView)
+            }
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -824,12 +872,18 @@ struct RichTextBlockEditor: UIViewRepresentable {
 }
 
 private final class DocumentRichTextView: UITextView {
+    var appearanceDidChange: ((UITextView) -> Void)?
     var copyHandler: ((NSRange) -> Bool)?
     var cutHandler: ((NSRange) -> Bool)?
     var pasteHandler: ((NSRange) -> Bool)?
     var deleteBackwardAtEmptyHandler: (() -> Void)?
     weak var linkTapRecognizer: UITapGestureRecognizer?
     weak var annotationTapRecognizer: UITapGestureRecognizer?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { appearanceDidChange?(self) }
+    }
 
     override func deleteBackward() {
         // UITextViewDelegate is not called when Backspace is pressed while the
@@ -882,6 +936,16 @@ struct BlockTextStyle {
 
     var signature: String {
         "\(font.fontName)|\(font.pointSize)|\(color.description)|\(lineSpacing)|\(minimumHeight)|\(strikesText)"
+    }
+
+    func resolved(for traits: UITraitCollection) -> BlockTextStyle {
+        BlockTextStyle(
+            font: font,
+            color: color.resolvedColor(with: traits),
+            lineSpacing: lineSpacing,
+            minimumHeight: minimumHeight,
+            strikesText: strikesText
+        )
     }
 
     var paragraphStyle: NSParagraphStyle {

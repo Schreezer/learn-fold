@@ -61,6 +61,35 @@ async fn rpc<T: serde::de::DeserializeOwned>(
         .map_err(|error| ClientError::Rpc(error.to_string()))
 }
 
+// Account RPCs can wrap an expired ChatGPT token in an internal server error.
+// Keep the server's response body out of the UniFFI error used by the UI.
+fn codex_account_error(message: String) -> ClientError {
+    let lower = message.to_ascii_lowercase();
+    let codex_account_context = lower.contains("chatgpt.com/backend-api/")
+        || lower.contains("failed to fetch codex rate limits")
+        || lower.contains("codex account authentication required")
+        || lower.contains("chatgpt authentication required")
+        || lower.contains("chatgpt token");
+    let unauthorized = lower.contains("401 unauthorized")
+        || lower.contains("http 401")
+        || lower.contains("status: 401")
+        || lower.contains("status=401")
+        || lower.contains("\"status\":401")
+        || lower.contains("\"status\": 401");
+    let expired_token = lower.contains("could not parse your authentication token")
+        || lower.contains("authentication token expired")
+        || lower.contains("expired authentication token")
+        || lower.contains("chatgpt token expired");
+    let missing_auth = lower.contains("codex account authentication required")
+        || lower.contains("chatgpt authentication required");
+
+    if codex_account_context && (unauthorized || expired_token || missing_auth) {
+        ClientError::AuthenticationRequired
+    } else {
+        ClientError::Rpc(message)
+    }
+}
+
 async fn rpc_runtime<T: serde::de::DeserializeOwned>(
     client: &MobileClient,
     server_id: &str,
@@ -1250,12 +1279,10 @@ impl AppClient {
 
     pub async fn refresh_rate_limits(&self, server_id: String) -> Result<(), ClientError> {
         blocking_async!(self.rt, self.inner, |c| {
-            let response: upstream::GetAccountRateLimitsResponse = rpc(
-                c.as_ref(),
-                &server_id,
-                req!(server_id, GetAccountRateLimits, None),
-            )
-            .await?;
+            let response: upstream::GetAccountRateLimitsResponse = c
+                .request_typed_for_server(&server_id, req!(server_id, GetAccountRateLimits, None))
+                .await
+                .map_err(codex_account_error)?;
             c.apply_account_rate_limits_response(&server_id, "codex".to_string(), &response);
             Ok(())
         })
@@ -1267,12 +1294,10 @@ impl AppClient {
         params: types::AppRefreshAccountRequest,
     ) -> Result<(), ClientError> {
         blocking_async!(self.rt, self.inner, |c| {
-            let response: upstream::GetAccountResponse = rpc(
-                c.as_ref(),
-                &server_id,
-                req!(server_id, GetAccount, params.into()),
-            )
-            .await?;
+            let response: upstream::GetAccountResponse = c
+                .request_typed_for_server(&server_id, req!(server_id, GetAccount, params.into()))
+                .await
+                .map_err(codex_account_error)?;
             c.apply_account_response(&server_id, &response);
             Ok(())
         })
@@ -3080,8 +3105,8 @@ Widget construction guidelines (for reference when making UI decisions):\n\n\
 mod tests {
     use super::{
         ImageViewSource, append_cached_models_for_failed_runtimes, append_missing_amp_mode_models,
-        choose_saved_app_update_server_id, image_read_command, is_mobile_hidden_skill,
-        normalize_model_info_for_runtime, normalized_image_path,
+        choose_saved_app_update_server_id, codex_account_error, image_read_command,
+        is_mobile_hidden_skill, normalize_model_info_for_runtime, normalized_image_path,
         probe_openai_compatible_credentials_request, runtime_exposes_model_choices,
         splice_generative_ui_preamble,
     };
@@ -3148,6 +3173,36 @@ mod tests {
 
     fn empty_http_response(status: &str) -> String {
         format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    #[test]
+    fn codex_account_errors_identify_expired_chatgpt_auth_without_exposing_response() {
+        for message in [
+            "server error -32603: failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; body={\"message\":\"Could not parse your authentication token. Please try signing in again.\"}",
+            "server error -32603: account/read GET https://chatgpt.com/backend-api/account failed: 401 Unauthorized",
+            "server error -32603: failed to fetch codex rate limits: authentication token expired",
+            "invalid request: chatgpt authentication required to read rate limits",
+        ] {
+            assert!(matches!(
+                codex_account_error(message.to_string()),
+                ClientError::AuthenticationRequired
+            ));
+        }
+    }
+
+    #[test]
+    fn codex_account_errors_keep_server_and_transport_failures_generic() {
+        for message in [
+            "server error -32603: failed to fetch codex rate limits: HTTP 503 Service Unavailable",
+            "server connection closed while reading account status",
+            "provider credential probe failed with HTTP 401 Unauthorized",
+            "failed to fetch codex rate limits: no snapshots returned",
+        ] {
+            assert!(matches!(
+                codex_account_error(message.to_string()),
+                ClientError::Rpc(original) if original == message
+            ));
+        }
     }
 
     #[tokio::test]

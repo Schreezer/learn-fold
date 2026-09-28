@@ -462,13 +462,16 @@ struct CourseExperienceRootView: View {
 
     var body: some View {
         courseExperience
-        .preferredColorScheme(.light)
         .task {
             store.installDocumentToolRouterIfNeeded(appModel: appModel)
             await store.recoverReadyCourses()
             if store.setupComplete, store.connectionState != .connected {
                 await store.connectLocalAgent(appModel: appModel, agentID: store.selectedAgentID ?? "codex")
             }
+        }
+        .task(id: store.setupComplete) {
+            guard store.setupComplete else { return }
+            await store.installStarterCourseIfNeeded()
         }
     }
 
@@ -757,7 +760,7 @@ struct CourseRouteFallbackStrictCheckpointRoot: View {
                 onResumeDraft: {},
                 onNewCourse: {}
             )
-            .navigationBarHidden(true)
+            .toolbar(.visible, for: .navigationBar)
         case .courseStructure:
             CourseDetailPresentation(
                 course: Self.course,
@@ -840,8 +843,8 @@ private struct CourseAgentCustomProviderButton: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(
                         hasCustomEndpoint
-                            ? "Custom provider connected"
-                            : "Use an OpenAI-compatible provider"
+                            ? "Your API key is configured"
+                            : "Use your own API key"
                     )
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.primary)
@@ -875,7 +878,10 @@ private struct CourseAgentSetupConnectionControls: View {
     let agentID: String
     let connectionState: CourseExperienceStore.AgentConnectionState
     let isAgentAvailable: Bool
+    let needsAuthentication: Bool
+    let isSigningIn: Bool
     let onConnect: () -> Void
+    let onSignIn: () -> Void
 
     var body: some View {
         VStack(spacing: 12) {
@@ -894,13 +900,25 @@ private struct CourseAgentSetupConnectionControls: View {
                 }
                 .font(.headline)
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
-                .foregroundStyle(.white)
-                .background(.blue, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
             .accessibilityIdentifier("course-agent-connect")
             .disabled(connectionState == .connecting || !isAgentAvailable)
+
+            if agentID == CourseAgentProvider.codex,
+               needsAuthentication {
+                Button(action: onSignIn) {
+                    Label(
+                        isSigningIn ? "Opening ChatGPT sign-in…" : "Sign in again with ChatGPT",
+                        systemImage: "person.crop.circle.badge.checkmark"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isSigningIn || connectionState == .connecting)
+                .accessibilityIdentifier("course-agent-sign-in-again")
+            }
 
             Label {
                 Text(agentID == CourseAgentProvider.hosted
@@ -1112,6 +1130,8 @@ private struct CourseAgentSetupView: View {
     @State private var showsOpenAICompatibleSetup = false
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
     @State private var hasExplicitUserSelection = false
+    @State private var isSigningIn = false
+    @State private var signInTask: Task<Void, Never>?
 
     init(
         store: CourseExperienceStore,
@@ -1153,6 +1173,8 @@ private struct CourseAgentSetupView: View {
                         isAgentAvailable: store.agentOptions.first(where: {
                             $0.id == selectedAgent
                         })?.available == true,
+                        needsAuthentication: store.agentNeedsAuthentication,
+                        isSigningIn: isSigningIn,
                         onConnect: {
                             hasExplicitUserSelection = true
                             Task {
@@ -1162,7 +1184,8 @@ private struct CourseAgentSetupView: View {
                                     modelID: selectedModelID.isEmpty ? nil : selectedModelID
                                 )
                             }
-                        }
+                        },
+                        onSignIn: signInAndConnectCodex
                     )
                 }
                 .padding(.horizontal, 22)
@@ -1222,6 +1245,35 @@ private struct CourseAgentSetupView: View {
             }
             .environment(appModel)
         }
+        .onDisappear {
+            signInTask?.cancel()
+            signInTask = nil
+        }
+    }
+
+    @MainActor
+    private func signInAndConnectCodex() {
+        guard !isSigningIn, selectedAgent == CourseAgentProvider.codex else { return }
+        isSigningIn = true
+        signInTask = Task { @MainActor in
+            defer {
+                isSigningIn = false
+                signInTask = nil
+            }
+            do {
+                try await appModel.loginLocalChatGPTAccountOnThisDevice()
+                guard !Task.isCancelled else { return }
+                await store.connectLocalAgent(
+                    appModel: appModel,
+                    agentID: CourseAgentProvider.codex,
+                    modelID: selectedModelID.isEmpty ? nil : selectedModelID
+                )
+            } catch ChatGPTOAuthError.cancelled {
+                store.agentError = "ChatGPT sign-in was cancelled. Your course agent has not changed."
+            } catch {
+                store.agentError = "ChatGPT sign-in did not finish. Please try again."
+            }
+        }
     }
 }
 
@@ -1247,7 +1299,22 @@ private struct CourseHomeView: View {
             onResumeDraft: { store.resumeCourseDraft() },
             onNewCourse: requestNewCourse
         )
-        .navigationBarHidden(true)
+        .toolbar(.visible, for: .navigationBar)
+        .safeAreaInset(edge: .bottom) {
+            if let error = store.starterCourseInstallationError {
+                HStack(spacing: 12) {
+                    Text(error).font(.footnote)
+                    Spacer()
+                    Button("Retry") {
+                        Task { await store.installStarterCourseIfNeeded() }
+                    }
+                    .disabled(store.isInstallingStarterCourse)
+                }
+                .padding()
+                .background(.regularMaterial)
+                .accessibilityIdentifier("starter-course-installation-retry")
+            }
+        }
         .sheet(isPresented: $showsCourseSettings) {
             CourseAgentSettingsView(
                 store: store,
@@ -1288,6 +1355,7 @@ private struct CourseHomeView: View {
 }
 
 private struct CourseLibraryContent: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let courses: [LearningCourse]
     let selectedAgentID: String
     let resumableDraft: CourseDraftResumePresentation?
@@ -1297,10 +1365,12 @@ private struct CourseLibraryContent: View {
     let onResumeDraft: () -> Void
     let onNewCourse: () -> Void
 
-    private let columns = [
-        GridItem(.flexible(), spacing: 14),
-        GridItem(.flexible(), spacing: 14),
-    ]
+    private var columns: [GridItem] {
+        Array(
+            repeating: GridItem(.flexible(), spacing: 14, alignment: .top),
+            count: dynamicTypeSize.isAccessibilitySize ? 1 : 2
+        )
+    }
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -1308,40 +1378,6 @@ private struct CourseLibraryContent: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
-                    HStack(alignment: .center) {
-                        Text("My Courses")
-                            .font(.system(size: 36, weight: .bold, design: .rounded))
-                            .tracking(-1)
-                            .accessibilityIdentifier("course-library-root")
-
-                        Spacer()
-
-                        HStack(spacing: 10) {
-                            Button(action: onOpenAppSettings) {
-                                Image(systemName: "gearshape.fill")
-                                    .font(.system(size: 19, weight: .semibold))
-                                    .foregroundStyle(.blue)
-                                    .frame(width: 46, height: 46)
-                                    .background(.thinMaterial, in: Circle())
-                                    .overlay(Circle().stroke(Color.black.opacity(0.07)))
-                            }
-                            .accessibilityLabel("App Settings")
-                            .accessibilityIdentifier("course-home-app-settings")
-
-                            Button(action: onOpenAgentSettings) {
-                                ZStack {
-                                    Circle().fill(.thinMaterial)
-                                    AgentIconView(kind: selectedAgentID, size: 28)
-                                }
-                                .frame(width: 46, height: 46)
-                                .overlay(Circle().stroke(Color.black.opacity(0.07)))
-                            }
-                            .accessibilityLabel("Course agent menu")
-                            .accessibilityIdentifier("course-home-agent-settings")
-                        }
-                    }
-                    .zIndex(10)
-
                     if let resumableDraft {
                         CourseDraftResumeCard(
                             presentation: resumableDraft,
@@ -1354,20 +1390,22 @@ private struct CourseLibraryContent: View {
                             onOpenCourse(featured.id)
                         }
 
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Text("All Courses")
-                                    .font(.title3.weight(.bold))
-                                Spacer()
-                                Text("\(courses.count)")
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                            }
+                        if courses.count > 1 {
+                            VStack(alignment: .leading, spacing: 14) {
+                                HStack {
+                                    Text("More Courses")
+                                        .font(.title3.weight(.bold))
+                                    Spacer()
+                                    Text("\(courses.count - 1)")
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                }
 
-                            LazyVGrid(columns: columns, spacing: 18) {
-                                ForEach(Array(courses.dropFirst())) { course in
-                                    CourseGridCard(course: course) {
-                                        onOpenCourse(course.id)
+                                LazyVGrid(columns: columns, spacing: 18) {
+                                    ForEach(Array(courses.dropFirst())) { course in
+                                        CourseGridCard(course: course) {
+                                            onOpenCourse(course.id)
+                                        }
                                     }
                                 }
                             }
@@ -1378,22 +1416,29 @@ private struct CourseLibraryContent: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.top, 14)
-                .padding(.bottom, 112)
+                .padding(.bottom, 16)
             }
 
-            Button(action: onNewCourse) {
-                Label("New Course", systemImage: "plus")
-                    .font(.headline)
-                    .padding(.horizontal, 21)
-                    .padding(.vertical, 15)
-                    .foregroundStyle(.white)
-                    .background(.blue, in: Capsule())
-                    .shadow(color: .blue.opacity(0.25), radius: 18, y: 8)
+        }
+        .navigationTitle("My Courses")
+        .navigationBarTitleDisplayMode(.large)
+        .accessibilityIdentifier("course-library-root")
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("App Settings", systemImage: "gearshape", action: onOpenAppSettings)
+                    .accessibilityIdentifier("course-home-app-settings")
             }
-            .buttonStyle(.plain)
-            .padding(.trailing, 18)
-            .padding(.bottom, 22)
-            .accessibilityIdentifier("new-course-button")
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: onOpenAgentSettings) {
+                    AgentIconView(kind: selectedAgentID, size: 28)
+                }
+                .accessibilityLabel("Course agent menu")
+                .accessibilityIdentifier("course-home-agent-settings")
+            }
+            ToolbarItem(placement: .bottomBar) {
+                Button("New Course", systemImage: "plus", action: onNewCourse)
+                    .accessibilityIdentifier("new-course-button")
+            }
         }
     }
 }
@@ -1633,6 +1678,13 @@ private struct CourseAgentModelSection: View {
 
 private struct CourseAgentSettingsErrorSection: View {
     let message: String
+    let showsCodexRecovery: Bool
+    let showsChatGPTSignIn: Bool
+    let hasCustomEndpoint: Bool
+    let isSigningIn: Bool
+    let onSignIn: () -> Void
+    let onRetry: () -> Void
+    let onOpenProvider: () -> Void
 
     var body: some View {
         Section {
@@ -1643,6 +1695,32 @@ private struct CourseAgentSettingsErrorSection: View {
                     .accessibilityIdentifier("course-settings-agent-error")
             }
             .foregroundStyle(.red)
+
+            if showsCodexRecovery {
+                if showsChatGPTSignIn {
+                    Button(action: onSignIn) {
+                        Label(
+                            isSigningIn ? "Opening ChatGPT sign-in…" : "Sign in again with ChatGPT",
+                            systemImage: "person.crop.circle.badge.checkmark"
+                        )
+                    }
+                    .disabled(isSigningIn)
+                    .accessibilityIdentifier("course-settings-codex-sign-in")
+                }
+
+                Button(action: onOpenProvider) {
+                    Label(
+                        hasCustomEndpoint ? "Edit your API key and endpoint" : "Use your own API key",
+                        systemImage: "key.horizontal"
+                    )
+                }
+                .disabled(isSigningIn)
+                .accessibilityIdentifier("course-settings-codex-provider-recovery")
+
+                Button("Try Codex again", action: onRetry)
+                    .disabled(isSigningIn)
+                    .accessibilityIdentifier("course-settings-codex-retry")
+            }
         }
     }
 }
@@ -1657,6 +1735,11 @@ private struct CourseAgentSettingsView: View {
     @State private var selectedEffort: String
     @State private var showsOpenAICompatibleSetup = false
     @State private var hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
+    @State private var hasStoredAPIKey = OpenAIApiKeyStore.shared.hasStoredKey
+    @State private var configuredProviderModelID = (try? OpenAIApiKeyStore.shared.loadModelID()) ?? ""
+    @State private var pendingCodexDraft: CourseAgentSettingsDraft?
+    @State private var isSigningIn = false
+    @State private var signInTask: Task<Void, Never>?
     @State private var cloudSyncAvailability: CourseCloudSyncAvailability = .missingEntitlement
     @State private var isRetryingCloudSync = false
     @State private var saveTask: Task<Void, Never>?
@@ -1678,6 +1761,10 @@ private struct CourseAgentSettingsView: View {
 
     private var selectedModelInfo: ModelInfo? {
         models.first(where: { $0.id == selectedModel || $0.model == selectedModel })
+    }
+
+    private var usesCustomEndpoint: Bool {
+        hasCustomEndpoint && !appModel.prefersLocalChatGPTAuth
     }
 
     private var connectedHermesServer: AppServerSnapshot? {
@@ -1732,7 +1819,67 @@ private struct CourseAgentSettingsView: View {
                     Text("Only agents currently available through this device or the selected server are shown.")
                 }
 
-                if CourseAgentProvider.usesAppServer(selectedAgent) {
+                if let error = store.agentError {
+                    CourseAgentSettingsErrorSection(
+                        message: error,
+                        showsCodexRecovery: pendingCodexDraft != nil
+                            || store.selectedAgentID == CourseAgentProvider.codex
+                            || (store.agentNeedsAuthentication
+                                && store.activeAgentID == CourseAgentProvider.codex),
+                        showsChatGPTSignIn: store.agentNeedsAuthentication,
+                        hasCustomEndpoint: hasCustomEndpoint,
+                        isSigningIn: isSigningIn,
+                        onSignIn: signInAndRetryCodex,
+                        onRetry: retryCodexSelection,
+                        onOpenProvider: { showsOpenAICompatibleSetup = true }
+                    )
+                }
+
+                Section {
+                    Button {
+                        showsOpenAICompatibleSetup = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "key.horizontal")
+                                .frame(width: 24)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(hasStoredAPIKey ? "Manage your API key" : "Use your own API key")
+                                    .foregroundStyle(.primary)
+                                Text(
+                                    hasCustomEndpoint && !configuredProviderModelID.isEmpty
+                                        ? "Configured for Codex · \(configuredProviderModelID)"
+                                        : hasStoredAPIKey
+                                            ? "OpenAI API key saved on this iPhone"
+                                            : "API key; optional custom URL and model ID"
+                                )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .accessibilityIdentifier("course-settings-byok")
+                } header: {
+                    Text("Your provider")
+                } footer: {
+                    Text("Uses Codex on this iPhone. Endpoint changes affect existing Codex conversations too.")
+                }
+
+                if selectedAgent == CourseAgentProvider.codex, usesCustomEndpoint {
+                    Section("Model") {
+                        LabeledContent(
+                            "Your model",
+                            value: selectedModel.isEmpty ? "Choose a model ID" : selectedModel
+                        )
+                        Button("Change model or provider") {
+                            showsOpenAICompatibleSetup = true
+                        }
+                        .accessibilityIdentifier("course-settings-custom-model")
+                    }
+                } else if CourseAgentProvider.usesAppServer(selectedAgent) {
                     CourseAgentModelSection(
                         agentID: selectedAgent,
                         models: models,
@@ -1745,7 +1892,9 @@ private struct CourseAgentSettingsView: View {
                     )
                 }
 
-                if let selectedModelInfo, !selectedModelInfo.supportedReasoningEfforts.isEmpty {
+                if !(selectedAgent == CourseAgentProvider.codex && usesCustomEndpoint),
+                   let selectedModelInfo,
+                   !selectedModelInfo.supportedReasoningEfforts.isEmpty {
                     Section("Reasoning") {
                         Picker("Effort", selection: $selectedEffort) {
                             ForEach(selectedModelInfo.supportedReasoningEfforts) { option in
@@ -1753,41 +1902,6 @@ private struct CourseAgentSettingsView: View {
                                     .tag(option.reasoningEffort.wireValue)
                             }
                         }
-                    }
-                }
-
-                if selectedAgent == "codex" {
-                    Section {
-                        Button {
-                            showsOpenAICompatibleSetup = true
-                        } label: {
-                            HStack {
-                                Label(
-                                    hasCustomEndpoint ? "Manage custom provider" : "Add custom provider",
-                                    systemImage: "point.3.connected.trianglepath.dotted"
-                                )
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-
-                        if hasCustomEndpoint {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("OpenAI-compatible endpoint active")
-                                    .font(.subheadline.weight(.semibold))
-                                if !selectedModel.isEmpty {
-                                    Text("New courses will request model “\(selectedModel)”.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    } header: {
-                        Text("Custom provider")
-                    } footer: {
-                        Text("Uses Learnfold’s existing local Codex runtime. Endpoint changes are app-wide and affect existing Codex conversations too.")
                     }
                 }
 
@@ -1828,9 +1942,6 @@ private struct CourseAgentSettingsView: View {
                     Text("Connecting Hermes authorizes it to use Learnfold’s phone-side course tools for your course turns. The shell is confined to the active course folder, read-only until you approve the course plan and read-write afterward. It cannot access sibling courses or make outbound network connections.")
                 }
 
-                if let error = store.agentError {
-                    CourseAgentSettingsErrorSection(message: error)
-                }
             }
             .task {
                 cloudSyncAvailability = await CourseCloudSyncEngine.shared.availability
@@ -1862,12 +1973,33 @@ private struct CourseAgentSettingsView: View {
                     selectedModel = store.presentedDefaultModelID(for: selectedAgent) ?? ""
                 }
                 hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
+                hasStoredAPIKey = OpenAIApiKeyStore.shared.hasStoredKey
+                configuredProviderModelID = (try? OpenAIApiKeyStore.shared.loadModelID()) ?? ""
+                if selectedAgent == CourseAgentProvider.codex,
+                   usesCustomEndpoint,
+                   !configuredProviderModelID.isEmpty {
+                    selectedModel = configuredProviderModelID
+                    selectedEffort = ""
+                }
             }
             .sheet(isPresented: $showsOpenAICompatibleSetup) {
-                OpenAICompatibleProviderSheet(initialModelID: selectedModel) { modelID in
-                    selectedModel = modelID
-                    selectedEffort = ""
+                OpenAICompatibleProviderSheet(
+                    initialModelID: selectedAgent == CourseAgentProvider.codex ? selectedModel : ""
+                ) { modelID in
                     hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
+                    hasStoredAPIKey = OpenAIApiKeyStore.shared.hasStoredKey
+                    configuredProviderModelID = (try? OpenAIApiKeyStore.shared.loadModelID()) ?? ""
+                    if hasStoredAPIKey {
+                        selectedAgent = CourseAgentProvider.codex
+                        selectedModel = modelID.isEmpty
+                            ? store.presentedDefaultModelID(for: CourseAgentProvider.codex) ?? ""
+                            : modelID
+                        selectedEffort = ""
+                    } else if selectedAgent == CourseAgentProvider.codex {
+                        selectedModel = store.presentedDefaultModelID(for: CourseAgentProvider.codex) ?? ""
+                    }
+                    store.agentError = nil
+                    pendingCodexDraft = nil
                 }
                 .environment(appModel)
             }
@@ -1875,6 +2007,8 @@ private struct CourseAgentSettingsView: View {
             .onDisappear {
                 saveTask?.cancel()
                 saveTask = nil
+                signInTask?.cancel()
+                signInTask = nil
             }
         }
     }
@@ -1894,6 +2028,7 @@ private struct CourseAgentSettingsView: View {
     private func startSave() {
         guard saveTask == nil else { return }
         let draft = currentDraft
+        pendingCodexDraft = draft.agentID == CourseAgentProvider.codex ? draft : nil
         saveTask = Task { @MainActor in
             let didSave = await store.connectLocalAgent(
                 appModel: appModel,
@@ -1919,6 +2054,8 @@ private struct CourseAgentSettingsView: View {
     }
 
     private func selectAgent(_ option: CourseAgentOption) {
+        store.agentError = nil
+        pendingCodexDraft = nil
         let optionModels = store.presentedModels(for: option.id)
         let defaultModel = optionModels.first(where: \.isDefault) ?? optionModels.first
         let proposed = CourseAgentSettingsDraft(
@@ -1927,6 +2064,47 @@ private struct CourseAgentSettingsView: View {
             effortID: defaultModel?.defaultReasoningEffort.wireValue ?? ""
         )
         applyDraft(CourseAgentSettingsDraftPolicy.afterSelection(proposed: proposed))
+    }
+
+    @MainActor
+    private func retryCodexSelection() {
+        let draft = pendingCodexDraft ?? currentDraft
+        if draft.agentID == CourseAgentProvider.codex {
+            applyDraft(draft)
+            startSave()
+        } else if store.activeAgentID == CourseAgentProvider.codex {
+            Task { await store.refreshAgentReadiness(appModel: appModel) }
+        }
+    }
+
+    @MainActor
+    private func signInAndRetryCodex() {
+        let draft = pendingCodexDraft ?? currentDraft
+        guard !isSigningIn,
+              draft.agentID == CourseAgentProvider.codex
+                || store.activeAgentID == CourseAgentProvider.codex else { return }
+        isSigningIn = true
+        signInTask = Task { @MainActor in
+            defer {
+                isSigningIn = false
+                signInTask = nil
+            }
+            do {
+                try await appModel.loginLocalChatGPTAccountOnThisDevice()
+                guard !Task.isCancelled else { return }
+                store.agentError = nil
+                if draft.agentID == CourseAgentProvider.codex {
+                    applyDraft(draft)
+                    startSave()
+                } else {
+                    await store.refreshAgentReadiness(appModel: appModel)
+                }
+            } catch ChatGPTOAuthError.cancelled {
+                store.agentError = "ChatGPT sign-in was cancelled. Your course agent has not changed."
+            } catch {
+                store.agentError = "ChatGPT sign-in did not finish. Please try again."
+            }
+        }
     }
 
     @MainActor
@@ -2022,26 +2200,41 @@ private struct OpenAICompatibleProviderForm: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("https://provider.example/v1", text: $baseURL)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Base URL (optional)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("https://provider.example/v1", text: $baseURL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.URL)
+                            .accessibilityIdentifier("custom-provider-base-url")
+                    }
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("API key")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        SecureField(
+                            hasStoredKey
+                                ? "Saved — enter a new key to replace"
+                                : "Enter API key",
+                            text: $apiKey
+                        )
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                        .accessibilityIdentifier("custom-provider-base-url")
+                        .accessibilityIdentifier("custom-provider-api-key")
+                    }
 
-                    SecureField(
-                        hasStoredKey
-                            ? "API key saved — enter to replace"
-                            : "API key",
-                        text: $apiKey
-                    )
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .accessibilityIdentifier("custom-provider-api-key")
-
-                    TextField("Model ID, for example gpt-oss-120b", text: $modelID)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .accessibilityIdentifier("custom-provider-model-id")
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Model ID (for a custom URL)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("For example gpt-oss-120b", text: $modelID)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("custom-provider-model-id")
+                    }
                 } header: {
                     Text("Connection")
                         .accessibilityIdentifier("custom-provider-form")
@@ -2049,7 +2242,7 @@ private struct OpenAICompatibleProviderForm: View {
                             isSaving ? "saving" : (errorMessage == nil ? "ready" : "error")
                         )
                 } footer: {
-                    Text("The API key and base URL are stored securely on this iPhone. The model ID is sent exactly as entered.")
+                    Text("For OpenAI, enter only your API key. For another provider, add its base URL and model ID. These settings are saved on this iPhone.")
                 }
 
                 Section {
@@ -2059,7 +2252,7 @@ private struct OpenAICompatibleProviderForm: View {
                 } header: {
                     Text("How it works")
                 } footer: {
-                    Text("Compatibility requires the OpenAI Responses API, streaming, and tool calling. A chat-completions-only endpoint may not work with Codex. Changing this endpoint restarts local Codex and affects existing Codex conversations too.")
+                    Text("A custom endpoint needs the OpenAI Responses API, streaming, and tool calling. A chat-completions-only endpoint may not work with Codex. Changing the key or endpoint restarts local Codex and affects existing Codex conversations too.")
                 }
 
                 if isSaving {
@@ -2077,7 +2270,7 @@ private struct OpenAICompatibleProviderForm: View {
                 if hasStoredBaseURL {
                     Section {
                         Button(
-                            "Use Default OpenAI Endpoint",
+                            "Remove custom endpoint",
                             role: .destructive,
                             action: onClearCustomEndpoint
                         )
@@ -2130,10 +2323,49 @@ private struct OpenAICompatibleProviderSheet: View {
     @State private var isSaving = false
     @State private var errorMessage: String?
 
+    private struct SavedConfiguration {
+        let baseURL: String?
+        let apiKey: String?
+        let modelID: String?
+
+        static func load() throws -> Self {
+            let credentials = OpenAIApiKeyStore.shared
+            return Self(
+                baseURL: try credentials.loadBaseURL(),
+                apiKey: try credentials.load(),
+                modelID: try credentials.loadModelID()
+            )
+        }
+
+        func restore() throws {
+            let credentials = OpenAIApiKeyStore.shared
+            if let apiKey {
+                try credentials.save(apiKey)
+            } else {
+                try credentials.clear()
+            }
+            if let baseURL {
+                try credentials.saveBaseURL(baseURL)
+            } else {
+                try credentials.clearBaseURL()
+            }
+            if let modelID {
+                try credentials.saveModelID(modelID)
+            } else {
+                try credentials.clearModelID()
+            }
+        }
+    }
+
     init(initialModelID: String, onSaved: @escaping (String) -> Void) {
         self.onSaved = onSaved
-        _baseURL = State(initialValue: (try? OpenAIApiKeyStore.shared.loadBaseURL()) ?? "")
-        _modelID = State(initialValue: initialModelID)
+        let savedBaseURL = (try? OpenAIApiKeyStore.shared.loadBaseURL()) ?? ""
+        _baseURL = State(initialValue: savedBaseURL)
+        _modelID = State(
+            initialValue: savedBaseURL.isEmpty
+                ? ""
+                : (try? OpenAIApiKeyStore.shared.loadModelID()) ?? initialModelID
+        )
     }
 
     var body: some View {
@@ -2155,17 +2387,36 @@ private struct OpenAICompatibleProviderSheet: View {
     }
 
     private var canSave: Bool {
-        OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL) != nil
+        let hasKey = hasStoredKey || !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedBaseURL.isEmpty {
+            return hasKey && trimmedModelID.isEmpty
+        }
+        return hasKey
+            && OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL) != nil
             && OpenAICompatibleProviderConfiguration.normalizedModelID(modelID) != nil
-            && (hasStoredKey || !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     @MainActor
     private func save() async {
-        guard let normalizedBaseURL = OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL),
-              let normalizedModelID = OpenAICompatibleProviderConfiguration.normalizedModelID(modelID) else {
-            errorMessage = "Enter a valid http or https base URL and a model ID."
-            return
+        let normalizedBaseURL: String?
+        let normalizedModelID: String?
+        if baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                errorMessage = "Add a base URL for a custom model, or leave both fields blank for OpenAI."
+                return
+            }
+            normalizedBaseURL = nil
+            normalizedModelID = nil
+        } else {
+            guard let baseURL = OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL),
+                  let modelID = OpenAICompatibleProviderConfiguration.normalizedModelID(modelID) else {
+                errorMessage = "Enter a valid http or https base URL and a model ID."
+                return
+            }
+            normalizedBaseURL = baseURL
+            normalizedModelID = modelID
         }
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard hasStoredKey || !trimmedKey.isEmpty else {
@@ -2175,8 +2426,11 @@ private struct OpenAICompatibleProviderSheet: View {
 
         isSaving = true
         defer { isSaving = false }
+        var previousConfiguration: SavedConfiguration?
+        let previousAuthPreference = appModel.localAuthPreference
         do {
             errorMessage = nil
+            previousConfiguration = try SavedConfiguration.load()
             #if DEBUG
             switch LF05LiveAcceptanceControl.current() {
             case .saving:
@@ -2193,14 +2447,34 @@ private struct OpenAICompatibleProviderSheet: View {
             if !trimmedKey.isEmpty {
                 try OpenAIApiKeyStore.shared.save(trimmedKey)
             }
-            try OpenAIApiKeyStore.shared.saveBaseURL(normalizedBaseURL)
+            if let normalizedBaseURL {
+                try OpenAIApiKeyStore.shared.saveBaseURL(normalizedBaseURL)
+            } else {
+                try OpenAIApiKeyStore.shared.clearBaseURL()
+            }
+            if let normalizedModelID {
+                try OpenAIApiKeyStore.shared.saveModelID(normalizedModelID)
+            } else {
+                try OpenAIApiKeyStore.shared.clearModelID()
+            }
+            appModel.setLocalAuthPreference(.apiKey)
             try await appModel.restartLocalServer()
             hasStoredKey = OpenAIApiKeyStore.shared.hasStoredKey
             hasStoredBaseURL = OpenAIApiKeyStore.shared.hasStoredBaseURL
-            onSaved(normalizedModelID)
+            onSaved(normalizedModelID ?? "")
             dismiss()
         } catch {
-            errorMessage = error.localizedDescription
+            if let previousConfiguration {
+                do {
+                    try previousConfiguration.restore()
+                    appModel.setLocalAuthPreference(previousAuthPreference)
+                    try await appModel.restartLocalServer()
+                } catch {
+                    errorMessage = "Provider settings could not be restored. Check the saved key and endpoint before retrying."
+                    return
+                }
+            }
+            errorMessage = "The provider could not be saved. Your previous settings were restored; try again."
         }
     }
 
@@ -2208,15 +2482,27 @@ private struct OpenAICompatibleProviderSheet: View {
     private func clearCustomEndpoint() async {
         isSaving = true
         defer { isSaving = false }
+        var previousConfiguration: SavedConfiguration?
         do {
             errorMessage = nil
+            previousConfiguration = try SavedConfiguration.load()
             try OpenAIApiKeyStore.shared.clearBaseURL()
+            try OpenAIApiKeyStore.shared.clearModelID()
             try await appModel.restartLocalServer()
             hasStoredBaseURL = false
             onSaved("")
             dismiss()
         } catch {
-            errorMessage = error.localizedDescription
+            if let previousConfiguration {
+                do {
+                    try previousConfiguration.restore()
+                    try await appModel.restartLocalServer()
+                } catch {
+                    errorMessage = "The previous endpoint could not be restored. Check provider settings before retrying."
+                    return
+                }
+            }
+            errorMessage = "The custom endpoint could not be removed. Your previous settings were restored; try again."
         }
     }
 }
@@ -2227,52 +2513,54 @@ private struct CourseFeaturedCard: View {
 
     var body: some View {
         Button(action: action) {
-            ZStack(alignment: .bottomLeading) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("CONTINUE LEARNING")
+                    .font(.caption2.weight(.bold))
+                    .tracking(1.2)
+                    .foregroundStyle(.white.opacity(0.85))
+                Text(course.title)
+                    .font(.system(.title, design: .rounded, weight: .bold))
+                    .foregroundStyle(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    ProgressView(value: course.progress)
+                        .tint(.white)
+                        .frame(maxWidth: 130)
+                    Text("\(Int(course.progress * 100))%")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                    Spacer(minLength: 0)
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.blue)
+                        .frame(width: 46, height: 46)
+                        .background(.white, in: Circle())
+                }
+            }
+            .padding(19)
+            .frame(maxWidth: .infinity, minHeight: 236, alignment: .bottomLeading)
+            .background {
                 CourseArtwork(
                     course: course,
                     symbolAlignment: .topTrailing,
                     symbolPadding: 24
                 )
-                    .frame(height: 236)
-                    .clipped()
-
-                LinearGradient(
-                    colors: [.clear, .black.opacity(0.88)],
-                    startPoint: .center,
-                    endPoint: .bottom
-                )
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("CONTINUE LEARNING")
-                        .font(.caption2.weight(.bold))
-                        .tracking(1.2)
-                        .foregroundStyle(.white.opacity(0.72))
-                    Text(course.title)
-                        .font(.system(size: 29, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                    HStack(spacing: 10) {
-                        ProgressView(value: course.progress)
-                            .tint(.white)
-                            .frame(maxWidth: 130)
-                        Text("\(Int(course.progress * 100))%")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.white.opacity(0.85))
-                        Spacer()
-                        Image(systemName: "play.fill")
-                            .font(.headline)
-                            .foregroundStyle(.blue)
-                            .frame(width: 46, height: 46)
-                            .background(.white, in: Circle())
-                    }
+                .overlay {
+                    LinearGradient(
+                        colors: [.clear, .black.opacity(0.88)],
+                        startPoint: .center,
+                        endPoint: .bottom
+                    )
                 }
-                .padding(19)
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: 236)
             .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
             .shadow(color: .black.opacity(0.14), radius: 18, y: 8)
         }
         .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(course.title)
+        .accessibilityValue("\(Int(course.progress * 100))% complete")
+        .accessibilityHint("Opens this course")
     }
 }
 
@@ -2292,21 +2580,23 @@ private struct CourseGridCard: View {
                     Text(course.title)
                         .font(.headline)
                         .foregroundStyle(.primary)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(course.subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    HStack(spacing: 5) {
-                        Image(systemName: "rectangle.stack")
-                        Text("\(course.lessonCount)")
-                        Text("·")
-                        Text(course.duration)
+                        .lineLimit(2)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label(course.lessonCount == 1 ? "1 lesson" : "\(course.lessonCount) lessons", systemImage: "rectangle.stack")
+                        if !course.duration.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text(course.duration)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
             .background(.background, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.black.opacity(0.05)))
@@ -2346,24 +2636,24 @@ private struct CourseArtwork: View {
 
     var body: some View {
         let accent = Color(hex: accentHex)
-        ZStack {
-            LinearGradient(
-                colors: [accent.opacity(0.72), accent, .black.opacity(0.86)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+        LinearGradient(
+            colors: [accent.opacity(0.72), accent, .black.opacity(0.86)],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+        .overlay {
+            ZStack {
+                Circle()
+                    .fill(.white.opacity(0.12))
+                    .frame(width: 190, height: 190)
+                    .blur(radius: 2)
+                    .offset(x: 95, y: -60)
 
-            Circle()
-                .fill(.white.opacity(0.12))
-                .frame(width: 190, height: 190)
-                .blur(radius: 2)
-                .offset(x: 95, y: -60)
-
-            Circle()
-                .stroke(.white.opacity(0.2), lineWidth: 1)
-                .frame(width: 118, height: 118)
-                .offset(x: 82, y: -45)
-
+                Circle()
+                    .stroke(.white.opacity(0.2), lineWidth: 1)
+                    .frame(width: 118, height: 118)
+                    .offset(x: 82, y: -45)
+            }
         }
         .overlay(alignment: symbolAlignment) {
             Image(systemName: "book.pages.fill")
@@ -2383,22 +2673,11 @@ private enum CourseDetailSection: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-private enum CourseDetailLayout {
-    static let stickyActionScrollClearance: CGFloat = 132
-}
-
-private struct CourseActionHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
 private struct CourseDetailPresentation<LearnSection: View, StructureSection: View>: View {
     let course: LearningCourse
     @Binding private var selectedSection: CourseDetailSection
     let onTalkToCourseAgent: () -> Void
-    @State private var actionHeight: CGFloat = CourseDetailLayout.stickyActionScrollClearance
+    private let progressSummary: String?
     private let readingAction: AnyView?
     private let learnSection: LearnSection
     private let structureSection: StructureSection
@@ -2407,6 +2686,7 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
         course: LearningCourse,
         selectedSection: Binding<CourseDetailSection>,
         onTalkToCourseAgent: @escaping () -> Void,
+        progressSummary: String? = nil,
         readingAction: AnyView? = nil,
         @ViewBuilder learnSection: () -> LearnSection,
         @ViewBuilder structureSection: () -> StructureSection
@@ -2414,6 +2694,7 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
         self.course = course
         _selectedSection = selectedSection
         self.onTalkToCourseAgent = onTalkToCourseAgent
+        self.progressSummary = progressSummary
         self.readingAction = readingAction
         self.learnSection = learnSection()
         self.structureSection = structureSection()
@@ -2434,8 +2715,6 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
                             }
                         }
                         .pickerStyle(.segmented)
-                        .padding(4)
-                        .background(.thinMaterial, in: Capsule())
                         .accessibilityIdentifier("course-detail-section-picker")
                         .accessibilityValue(selectedSection.rawValue)
                     }
@@ -2447,30 +2726,19 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
                         structureSection
                     }
 
-                    if course.workspaceID != nil {
-                        Color.clear
-                            .frame(height: max(CourseDetailLayout.stickyActionScrollClearance, actionHeight))
-                            .accessibilityHidden(true)
-                    }
                 }
                 .padding(.horizontal, 18)
                 .padding(.top, 14)
                 .padding(.bottom, 32)
             }
         }
-        .overlay(alignment: .bottom) {
+        .courseBottomBar {
             if course.workspaceID != nil {
+                // Floating glass controls; the safe-area bar supplies the
+                // system scroll-edge effect instead of an opaque bar.
                 bottomActionBar
-                    .background {
-                        GeometryReader { geometry in
-                            Color.clear
-                                .preference(key: CourseActionHeightKey.self, value: geometry.size.height)
-                                .allowsHitTesting(false)
-                        }
-                    }
             }
         }
-        .onPreferenceChange(CourseActionHeightKey.self) { actionHeight = $0 }
         .navigationTitle("Course")
         .navigationBarTitleDisplayMode(.inline)
         .accessibilityElement(children: .contain)
@@ -2478,49 +2746,64 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
     }
 
     private var courseHeader: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 14) {
             CourseArtwork(course: course)
-                .frame(width: 88, height: 88)
-                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .frame(width: 60, height: 60)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(course.title)
-                    .font(.system(size: 27, weight: .bold, design: .rounded))
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
                     .lineLimit(2)
-                Text(course.subtitle)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(progressSummary ?? course.subtitle)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                Label(
-                    course.status == .ready ? "Ready to learn" : "In progress",
-                    systemImage: "checkmark.circle.fill"
-                )
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.secondary)
-                .labelStyle(CourseCompletionLabelStyle())
+                    .lineLimit(1)
+                    .accessibilityIdentifier("course-progress-summary")
             }
 
             Spacer(minLength: 0)
         }
+        .padding(14)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 24, style: .continuous)
+        )
     }
 
     private var bottomActionBar: some View {
-        VStack(spacing: 10) {
-            if let readingAction { readingAction }
-            Button(action: onTalkToCourseAgent) {
-                Label("Talk to Course Agent", systemImage: "bubble.left.and.bubble.right.fill")
-                    .font(.headline)
-                    .foregroundStyle(.blue)
-                    .padding(.horizontal, 22)
-                    .frame(minHeight: 52)
-                    .background(.regularMaterial, in: Capsule())
-                    .shadow(color: .black.opacity(0.1), radius: 8, y: 3)
+        GlassMorphContainer(spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                if let readingAction {
+                    readingAction
+                } else {
+                    Spacer(minLength: 0)
+                }
+                agentButton
             }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("talk-to-course-agent-button")
         }
         .padding(.horizontal, 18)
         .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var agentButton: some View {
+        let button = Button(action: onTalkToCourseAgent) {
+            Image(systemName: "bubble.left.and.bubble.right.fill")
+                .font(.title3)
+                .frame(width: 34, height: 34)
+        }
+        .buttonBorderShape(.circle)
+        .controlSize(.regular)
+        .accessibilityLabel("Talk to Course Agent")
+        .accessibilityIdentifier("talk-to-course-agent-button")
+
+        if #available(iOS 26.0, *) {
+            button.buttonStyle(.glass)
+        } else {
+            button.buttonStyle(.bordered)
+        }
     }
 
 }
@@ -2586,7 +2869,8 @@ private struct CourseDetailView: View {
     @State private var structureReloadGeneration = 0
     @State private var displayedStructureCourseID: String?
     @State private var displayedStructureWorkspaceID: String?
-    @State private var expandedLearningNodeIDs: Set<String> = []
+    @State private var selectedChapterID: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var courseAgentNavigationError: String?
 
     init(
@@ -2659,6 +2943,7 @@ private struct CourseDetailView: View {
             course: course,
             selectedSection: $selectedSection,
             onTalkToCourseAgent: resumeCourseAgent,
+            progressSummary: progressSummary,
             readingAction: readingAction,
             learnSection: { learnSection },
             structureSection: { structureSection }
@@ -2701,53 +2986,85 @@ private struct CourseDetailView: View {
             course: course,
             node: node,
             store: store,
-            title: store.readingBookmark(for: course) == nil ? "Start course" : "Continue course"
+            title: store.readingBookmark(for: course) == nil ? "Start course" : "Continue course",
+            usesGlass: true
         ))
     }
 
+    private var resumeNode: CourseLearningNode? {
+        CourseReadingOrder.resume(in: learningNodes, bookmark: store.readingBookmark(for: course))
+    }
+
+    private var progressSummary: String {
+        let lessons = CourseReadingOrder.lessons(in: learningNodes)
+        let ready = lessons.filter { $0.status == .generated }.count
+        var parts = ["\(learningNodes.count) \(learningNodes.count == 1 ? "chapter" : "chapters")"]
+        if !lessons.isEmpty {
+            parts.append("\(ready) of \(lessons.count) lessons ready")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var displayedChapter: (index: Int, node: CourseLearningNode)? {
+        let nodes = learningNodes
+        guard !nodes.isEmpty else { return nil }
+        if let selectedChapterID,
+           let index = nodes.firstIndex(where: { $0.id == selectedChapterID }) {
+            return (index, nodes[index])
+        }
+        if let resumeID = resumeNode?.id,
+           let index = nodes.firstIndex(where: { CourseLearningPathLayout.contains(resumeID, in: $0) }) {
+            return (index, nodes[index])
+        }
+        return (0, nodes[0])
+    }
+
     private var learnSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Learning path")
-                .font(.system(size: 28, weight: .bold, design: .rounded))
+        VStack(alignment: .leading, spacing: 18) {
+            if let chapter = displayedChapter {
+                CourseChapterSwitcherCard(
+                    chapters: learningNodes,
+                    selectedIndex: chapter.index,
+                    generationDisabled: store.isCourseNodeGenerationDisabled,
+                    runtimeID: course.agentRuntimeKind ?? CourseAgentProvider.codex,
+                    onSelect: { id in
+                        withAnimation(
+                            reduceMotion ? .easeInOut(duration: 0.2) : .snappy(duration: 0.24)
+                        ) { selectedChapterID = id }
+                    },
+                    onGenerate: generate
+                )
 
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "point.3.filled.connected.trianglepath.dotted")
-                    .font(.headline)
-                    .foregroundStyle(.blue)
-                    .frame(width: 34, height: 34)
-                    .background(.blue.opacity(0.1), in: Circle())
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Learn at your own pace")
-                        .font(.subheadline.weight(.semibold))
-                    Text("Open any ready module. Generate a pending section when you want to continue, and your agent will adapt it to your progress.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                if let resume = resumeNode,
+                   !CourseLearningPathLayout.contains(resume.id, in: chapter.node) {
+                    Button {
+                        withAnimation(
+                            reduceMotion ? .easeInOut(duration: 0.2) : .snappy(duration: 0.24)
+                        ) { selectedChapterID = nil }
+                    } label: {
+                        Label("Back to Up next", systemImage: "arrow.uturn.backward")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Back to Up next, \(resume.title)")
+                    .padding(.horizontal, 4)
+                    .accessibilityIdentifier("course-path-back-to-up-next")
                 }
+
+                CourseLessonPathView(
+                    chapter: chapter.node,
+                    chapterNumber: chapter.index + 1,
+                    currentNodeID: resumeNode?.id,
+                    generationDisabled: store.isCourseNodeGenerationDisabled,
+                    runtimeID: course.agentRuntimeKind ?? CourseAgentProvider.codex,
+                    onOpenMarkdown: { pageID in
+                        store.openCoursePage(courseID: course.id, pageID: pageID)
+                    },
+                    onGenerate: generate
+                )
+                .id(chapter.node.id)
+                .transition(.opacity)
             }
-            .padding(14)
-            .background(.blue.opacity(0.06), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-
-            CourseLearningTreeView(
-                nodes: learningNodes,
-                expandedNodeIDs: $expandedLearningNodeIDs,
-                generationDisabled: store.isCourseNodeGenerationDisabled,
-                runtimeID: course.agentRuntimeKind ?? CourseAgentProvider.codex,
-                onOpenMarkdown: { pageID in
-                    store.openCoursePage(courseID: course.id, pageID: pageID)
-                },
-                onGenerate: { node in
-                    store.generateCourseNodeInBackground(
-                        for: course,
-                        node: node,
-                        appModel: appModel,
-                        appState: appState
-                    )
-                }
-            )
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(.background, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
 
             if store.backgroundGenerationErrorCourseID == course.id,
                let error = store.backgroundGenerationError {
@@ -2757,7 +3074,15 @@ private struct CourseDetailView: View {
                 )
             }
         }
-        .onAppear(perform: expandInitialLearningNode)
+    }
+
+    private func generate(_ node: CourseLearningNode) {
+        store.generateCourseNodeInBackground(
+            for: course,
+            node: node,
+            appModel: appModel,
+            appState: appState
+        )
     }
 
     @ViewBuilder
@@ -2831,14 +3156,6 @@ private struct CourseDetailView: View {
         let result = loadWorkspaceFiles()
         workspaceSnapshot = result.value
         structureErrors.workspaceFiles = result.errorMessage
-    }
-
-    private func expandInitialLearningNode() {
-        guard expandedLearningNodeIDs.isEmpty,
-              let firstReadyFolder = learningNodes.first(where: {
-                  $0.kind == .folder && !$0.children.isEmpty && $0.status != .pendingGeneration
-              }) else { return }
-        expandedLearningNodeIDs.insert(firstReadyFolder.id)
     }
 }
 
@@ -3148,13 +3465,8 @@ private struct CourseLearningTreeNodeView: View {
             ) {
                 Button(generationRequest.controlTitle) { onGenerate(node) }
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 7)
-                    .background(.blue, in: Capsule())
-                    .frame(minWidth: 44, minHeight: 44)
-                    .contentShape(Rectangle())
-                    .buttonStyle(.plain)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
                     .accessibilityIdentifier(
                         "generate-course-node-\(node.id)"
                     )
@@ -3281,6 +3593,846 @@ struct CourseNodeGenerationErrorView: View {
     }
 }
 
+@MainActor
+enum CourseLearningPathLayout {
+    struct Section: Equatable {
+        let node: CourseLearningNode
+        /// "3.2" for a chapter's section, "3.2.1" for a nested one.
+        let number: String
+        /// 1 for a chapter's direct section, 2 or more for nested sections.
+        let depth: Int
+        let readyCount: Int
+        let lessonCount: Int
+    }
+
+    struct Stop: Equatable {
+        let node: CourseLearningNode
+        /// Zig-zag position, restarted at every section so each begins centered.
+        let step: Int
+        /// "3.2 · Title" when a one-lesson section is folded into its lesson.
+        let eyebrow: String?
+        let sectionTitle: String?
+        let positionInSection: Int
+        let sectionLessonCount: Int
+        /// Only the first creatable stop in a section says "Tap to create".
+        let showsCreateHint: Bool
+    }
+
+    struct Entry: Identifiable, Equatable {
+        enum Kind: Equatable {
+            case section(Section)
+            /// Lessons that resume a parent after one of its nested sections,
+            /// so they don't read as part of the section above them.
+            case continuation(String)
+            case lesson(Stop)
+        }
+
+        let id: String
+        let kind: Kind
+    }
+
+    static func contains(_ nodeID: String, in node: CourseLearningNode) -> Bool {
+        node.id == nodeID || node.children.contains { contains(nodeID, in: $0) }
+    }
+
+    /// Flattens one chapter into ordered path entries. Sections stay open so
+    /// the path reads as one continuous scroll; depth is carried by numbering
+    /// and header weight rather than indentation.
+    static func entries(
+        for chapter: CourseLearningNode,
+        chapterNumber: Int,
+        runtimeID: String
+    ) -> [Entry] {
+        var entries: [Entry] = []
+
+        func appendStops(
+            _ leaves: [CourseLearningNode],
+            sectionTitle: String?,
+            eyebrow: String? = nil
+        ) {
+            var hintShown = false
+            for (index, leaf) in leaves.enumerated() {
+                let creatable = leaf.status == .pendingGeneration
+                    && CourseExperienceStore.directGenerationRequest(
+                        for: leaf,
+                        runtimeID: runtimeID
+                    ) != nil
+                let showsHint = creatable && !hintShown
+                if creatable { hintShown = true }
+                entries.append(Entry(id: leaf.id, kind: .lesson(Stop(
+                    node: leaf,
+                    step: index,
+                    eyebrow: eyebrow,
+                    sectionTitle: sectionTitle,
+                    positionInSection: index + 1,
+                    sectionLessonCount: leaves.count,
+                    showsCreateHint: showsHint
+                ))))
+            }
+        }
+
+        func visit(_ children: [CourseLearningNode], parentTitle: String?, prefix: String, depth: Int) {
+            var pendingLeaves: [CourseLearningNode] = []
+            var sectionIndex = 0
+            func flushLeaves() {
+                guard !pendingLeaves.isEmpty else { return }
+                if sectionIndex > 0 {
+                    let label = parentTitle.map { "\(prefix) \($0), continued" }
+                        ?? "More in chapter \(prefix)"
+                    entries.append(Entry(
+                        id: "continuation-\(prefix)-\(pendingLeaves[0].id)",
+                        kind: .continuation(label)
+                    ))
+                }
+                appendStops(pendingLeaves, sectionTitle: parentTitle)
+                pendingLeaves = []
+            }
+            for child in children {
+                guard child.kind == .folder else {
+                    pendingLeaves.append(child)
+                    continue
+                }
+                flushLeaves()
+                sectionIndex += 1
+                let number = "\(prefix).\(sectionIndex)"
+                // A section holding exactly one lesson reads better as that
+                // lesson with a small eyebrow than as a header over one stop.
+                if child.children.count == 1, child.children[0].kind != .folder {
+                    appendStops(
+                        child.children,
+                        sectionTitle: child.title,
+                        eyebrow: "\(number) · \(child.title)"
+                    )
+                    continue
+                }
+                let lessons = CourseReadingOrder.lessons(in: [child])
+                entries.append(Entry(id: "section-\(child.id)", kind: .section(Section(
+                    node: child,
+                    number: number,
+                    depth: depth,
+                    readyCount: lessons.filter { $0.status == .generated }.count,
+                    lessonCount: lessons.count
+                ))))
+                visit(child.children, parentTitle: child.title, prefix: number, depth: depth + 1)
+            }
+            flushLeaves()
+        }
+
+        visit(chapter.children, parentTitle: nil, prefix: String(chapterNumber), depth: 1)
+        return entries
+    }
+
+    /// A gentle trail, restarted per section. Flattens at accessibility sizes.
+    static func leadingInset(step: Int, isAccessibilitySize: Bool) -> CGFloat {
+        guard !isAccessibilitySize else { return 20 }
+        // A triangle wave (0, 1, 2, 1, 0, …) keeps every stop on one of three
+        // evenly spaced columns, so neighbours never land on uneven offsets.
+        let column = [0, 1, 2, 1][step % 4]
+        return 24 + CGFloat(column) * 26
+    }
+}
+
+/// One create style everywhere: a small bordered capsule.
+private struct CourseCreateCapsule: View {
+    let node: CourseLearningNode
+    let request: CourseDirectGenerationRequest
+    let generationDisabled: Bool
+    let onGenerate: (CourseLearningNode) -> Void
+
+    var body: some View {
+        Button("Create", systemImage: "sparkles") { onGenerate(node) }
+            .font(.subheadline.weight(.semibold))
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .controlSize(.small)
+            .disabled(generationDisabled)
+            .accessibilityIdentifier("generate-course-node-\(node.id)")
+            .accessibilityLabel(request.accessibilityLabel)
+            .accessibilityHint(
+                generationDisabled
+                    ? "Wait for the current course agent request to finish."
+                    : request.accessibilityHint
+            )
+            .accessibilityValue(
+                generationDisabled ? "pending_generation-disabled" : "pending_generation"
+            )
+    }
+}
+
+private struct CourseChapterSwitcherCard: View {
+    let chapters: [CourseLearningNode]
+    let selectedIndex: Int
+    let generationDisabled: Bool
+    let runtimeID: String
+    let onSelect: (String) -> Void
+    let onGenerate: (CourseLearningNode) -> Void
+
+    private var chapter: CourseLearningNode { chapters[selectedIndex] }
+
+    private static func readiness(of node: CourseLearningNode) -> String {
+        let lessons = CourseReadingOrder.lessons(in: [node])
+        let ready = lessons.filter { $0.status == .generated }.count
+        return "\(ready) of \(lessons.count) ready"
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Menu {
+                ForEach(Array(chapters.enumerated()), id: \.element.id) { index, node in
+                    Button {
+                        onSelect(node.id)
+                    } label: {
+                        Text("\(index + 1). \(node.title)")
+                        Text(
+                            index == selectedIndex
+                                ? "Current · \(Self.readiness(of: node))"
+                                : Self.readiness(of: node)
+                        )
+                    }
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("\(selectedIndex + 1). \(chapter.title)")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
+                            .lineLimit(2)
+                        Text(Self.readiness(of: chapter))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .tint(.primary)
+            .accessibilityIdentifier("course-chapter-switcher")
+            .accessibilityLabel(
+                "Chapter \(selectedIndex + 1) of \(chapters.count), \(chapter.title), \(Self.readiness(of: chapter))"
+            )
+            .accessibilityHint("Choose another chapter.")
+
+            if chapter.status == .pendingGeneration,
+               let request = CourseExperienceStore.directGenerationRequest(
+                   for: chapter,
+                   runtimeID: runtimeID
+               ) {
+                CourseCreateCapsule(
+                    node: chapter,
+                    request: request,
+                    generationDisabled: generationDisabled,
+                    onGenerate: onGenerate
+                )
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+        )
+    }
+}
+
+private struct CourseSectionHeader: View {
+    let section: CourseLearningPathLayout.Section
+    let isFirst: Bool
+    let generationDisabled: Bool
+    let runtimeID: String
+    let onGenerate: (CourseLearningNode) -> Void
+
+    private var request: CourseDirectGenerationRequest? {
+        CourseExperienceStore.directGenerationRequest(for: section.node, runtimeID: runtimeID)
+    }
+
+    private var isWriting: Bool {
+        section.node.status == .generating
+            || section.node.children.contains { $0.status == .generating }
+    }
+
+    var body: some View {
+        if section.depth == 1 {
+            primaryHeader
+        } else {
+            subsectionHeader
+        }
+    }
+
+    private var primaryHeader: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if !isFirst {
+                Divider().padding(.bottom, 24)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(section.number)
+                    .font(.footnote.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text(section.node.title)
+                    .font(.title3.weight(.semibold))
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityLabel(
+                "Section \(section.number), \(section.node.title), \(section.readyCount) of \(section.lessonCount) lessons ready"
+            )
+            HStack(spacing: 8) {
+                Group {
+                    if section.lessonCount > 0, section.readyCount == section.lessonCount {
+                        Label("All \(section.lessonCount) ready", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Text("\(section.readyCount) of \(section.lessonCount) ready")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .font(.subheadline)
+                .accessibilityHidden(true)
+                Spacer(minLength: 0)
+                if isWriting {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Writing…")
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                } else if let request {
+                    CourseCreateCapsule(
+                        node: section.node,
+                        request: request,
+                        generationDisabled: generationDisabled,
+                        onGenerate: onGenerate
+                    )
+                }
+            }
+            .padding(.top, 6)
+        }
+        .padding(.top, isFirst ? 0 : 8)
+        .padding(.bottom, 12)
+        .padding(.horizontal, 20)
+    }
+
+    private var subsectionHeader: some View {
+        Text("\(section.number) \(section.node.title)")
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 16)
+            .padding(.bottom, 4)
+            .padding(.horizontal, 20)
+            .contextMenu {
+                if let request, !generationDisabled {
+                    Button("Create", systemImage: "sparkles") { onGenerate(section.node) }
+                        .accessibilityHint(request.accessibilityHint)
+                }
+            }
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityLabel(
+                "Section \(section.number), \(section.node.title), \(section.readyCount) of \(section.lessonCount) lessons ready"
+            )
+            .accessibilityActions {
+                if request != nil, !generationDisabled {
+                    Button("Create section") { onGenerate(section.node) }
+                }
+            }
+    }
+}
+
+private struct CourseLessonPathView: View {
+    let chapter: CourseLearningNode
+    let chapterNumber: Int
+    let currentNodeID: String?
+    let generationDisabled: Bool
+    let runtimeID: String
+    let onOpenMarkdown: (String) -> Void
+    let onGenerate: (CourseLearningNode) -> Void
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let entries = CourseLearningPathLayout.entries(
+            for: chapter,
+            chapterNumber: chapterNumber,
+            runtimeID: runtimeID
+        )
+        ScrollViewReader { proxy in
+            pathStack(entries)
+                .onAppear {
+                    // Bring a far-down "Up next" into view; near the top the
+                    // header context matters more than centering.
+                    guard let currentNodeID,
+                          let index = entries.firstIndex(where: { $0.id == currentNodeID }),
+                          index > 3 else { return }
+                    DispatchQueue.main.async {
+                        if reduceMotion {
+                            proxy.scrollTo(currentNodeID, anchor: .center)
+                        } else {
+                            withAnimation(.snappy) { proxy.scrollTo(currentNodeID, anchor: .center) }
+                        }
+                    }
+                }
+        }
+    }
+
+    private func pathStack(_ entries: [CourseLearningPathLayout.Entry]) -> some View {
+        VStack(spacing: 20) {
+            ForEach(entries) { entry in
+                switch entry.kind {
+                case .section(let section):
+                    CourseSectionHeader(
+                        section: section,
+                        isFirst: entries.first?.id == entry.id,
+                        generationDisabled: generationDisabled,
+                        runtimeID: runtimeID,
+                        onGenerate: onGenerate
+                    )
+                case .continuation(let label):
+                    Text(label)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 16)
+                        .padding(.horizontal, 20)
+                        .accessibilityAddTraits(.isHeader)
+                case .lesson(let stop):
+                    let inset = CourseLearningPathLayout.leadingInset(
+                        step: stop.step,
+                        isAccessibilitySize: dynamicTypeSize.isAccessibilitySize
+                    )
+                    VStack(alignment: .leading, spacing: 0) {
+                        CourseLessonPathStop(
+                            stop: stop,
+                            isCurrent: stop.node.id == currentNodeID,
+                            generationDisabled: generationDisabled,
+                            runtimeID: runtimeID,
+                            onOpenMarkdown: onOpenMarkdown,
+                            onGenerate: onGenerate
+                        )
+                        if !stop.node.children.isEmpty {
+                            CourseBranchList(
+                                lesson: stop.node,
+                                generationDisabled: generationDisabled,
+                                runtimeID: runtimeID,
+                                onOpenMarkdown: onOpenMarkdown,
+                                onGenerate: onGenerate
+                            )
+                            // Hang branches from the center of the lesson badge.
+                            .padding(.leading, CourseLessonPathStop.badgeCenterOffset)
+                        }
+                    }
+                    .padding(.leading, inset)
+                    .padding(.trailing, 20)
+                }
+            }
+        }
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-learning-tree")
+    }
+}
+
+private struct CourseLessonPathStop: View {
+    let stop: CourseLearningPathLayout.Stop
+    let isCurrent: Bool
+    let generationDisabled: Bool
+    let runtimeID: String
+    let onOpenMarkdown: (String) -> Void
+    let onGenerate: (CourseLearningNode) -> Void
+
+    @ScaledMetric(relativeTo: .body) private var scaledBadge: CGFloat = 60
+    /// Horizontal center of a default-size badge within its row.
+    static let badgeCenterOffset: CGFloat = (60 + 14) / 2
+
+    private var node: CourseLearningNode { stop.node }
+    private var badgeSize: CGFloat { min(max(scaledBadge, 60), 72) }
+
+    private var generationRequest: CourseDirectGenerationRequest? {
+        CourseExperienceStore.directGenerationRequest(for: node, runtimeID: runtimeID)
+    }
+
+    private var isEnabled: Bool {
+        switch node.status {
+        case .generated: node.pageID != nil
+        case .pendingGeneration: generationRequest != nil && !generationDisabled
+        case .generating, .partiallyGenerated: false
+        }
+    }
+
+    private var isWriting: Bool {
+        node.status == .generating || node.status == .partiallyGenerated
+    }
+
+    private var caption: String? {
+        switch node.status {
+        case .generated:
+            if isCurrent { return "Up next" }
+            if let role = node.role, role != .lesson { return role.displayName }
+            return nil
+        case .pendingGeneration:
+            if generationRequest == nil { return "Not started" }
+            return stop.showsCreateHint ? "Tap to create" : nil
+        case .generating, .partiallyGenerated:
+            return "Writing…"
+        }
+    }
+
+    private var stateDescription: String {
+        switch node.status {
+        case .generated: isCurrent ? "up next" : "ready"
+        case .pendingGeneration: generationRequest == nil ? "not started" : "not created yet"
+        case .generating, .partiallyGenerated: "being written"
+        }
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                badge
+                VStack(alignment: .leading, spacing: 2) {
+                    if let eyebrow = stop.eyebrow {
+                        Text(eyebrow)
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Text(node.title)
+                        .font(.body.weight(isCurrent ? .semibold : .regular))
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let caption {
+                        Text(caption)
+                            .font(.footnote)
+                            .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // Writing stops stay at full strength; only truly unavailable ones dim.
+        .disabled(!isEnabled && !isWriting)
+        .allowsHitTesting(isEnabled)
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(isWriting ? .updatesFrequently : [])
+        .accessibilityIdentifier(
+            node.status == .pendingGeneration && generationRequest != nil
+                ? "generate-course-node-\(node.id)"
+                : CourseLearningTreeAccessibilityPolicy.rowIdentifier(for: node)
+        )
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityHint(
+            node.status == .pendingGeneration && generationRequest != nil
+                ? "Creates this lesson with your course agent."
+                : ""
+        )
+        .accessibilityValue(
+            node.status == .pendingGeneration && generationDisabled
+                ? "pending_generation-disabled"
+                : node.status.rawValue
+        )
+    }
+
+    private var accessibilityLabel: String {
+        var parts = [node.title]
+        if let section = stop.sectionTitle {
+            parts.append("lesson \(stop.positionInSection) of \(stop.sectionLessonCount) in \(section)")
+        } else {
+            parts.append("lesson \(stop.positionInSection) of \(stop.sectionLessonCount)")
+        }
+        parts.append(stateDescription)
+        return parts.joined(separator: ", ")
+    }
+
+    @ViewBuilder
+    private var badge: some View {
+        let isPendingCreatable = node.status == .pendingGeneration && generationRequest != nil
+        ZStack {
+            // Every layer shares one center; depth comes from a concentric
+            // edge rather than an offset base that reads as misalignment.
+            Circle()
+                .fill(fill)
+                .frame(width: badgeSize, height: badgeSize)
+            Circle()
+                .strokeBorder(edgeColor, lineWidth: 1)
+                .frame(width: badgeSize, height: badgeSize)
+            if isPendingCreatable {
+                Circle()
+                    .strokeBorder(
+                        Color.secondary.opacity(0.5),
+                        style: StrokeStyle(lineWidth: 1.5, dash: [4, 4])
+                    )
+                    .frame(width: badgeSize, height: badgeSize)
+            }
+            if isCurrent {
+                Circle()
+                    .stroke(Color.accentColor.opacity(0.35), lineWidth: 4)
+                    .frame(width: badgeSize + 12, height: badgeSize + 12)
+            }
+            switch node.status {
+            case .generating, .partiallyGenerated:
+                ProgressView()
+            default:
+                Image(systemName: symbol)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(symbolColor)
+                    // The play triangle's visual weight sits left of its box.
+                    .offset(x: symbol == "play.fill" ? 2 : 0)
+            }
+        }
+        .frame(width: badgeSize + 14, height: badgeSize + 14)
+    }
+
+    private var fill: Color {
+        switch node.status {
+        case .generated: isCurrent ? .accentColor : Color.accentColor.opacity(0.14)
+        default: Color(uiColor: .tertiarySystemFill)
+        }
+    }
+
+    private var edgeColor: Color {
+        switch node.status {
+        case .generated: isCurrent ? .clear : Color.accentColor.opacity(0.25)
+        case .pendingGeneration where generationRequest != nil: .clear
+        default: Color(uiColor: .separator)
+        }
+    }
+
+    private var symbol: String {
+        guard node.status == .generated else {
+            return generationRequest == nil ? "circle.dotted" : "sparkle"
+        }
+        if isCurrent { return "play.fill" }
+        switch node.role {
+        case .explainer: return "lightbulb.fill"
+        case .module: return "square.stack.3d.up.fill"
+        default: return "book.fill"
+        }
+    }
+
+    private var symbolColor: Color {
+        switch node.status {
+        case .generated: isCurrent ? .white : .accentColor
+        default: .secondary
+        }
+    }
+
+    private func action() {
+        switch node.status {
+        case .generated:
+            if let pageID = node.pageID { onOpenMarkdown(pageID) }
+        case .pendingGeneration:
+            if generationRequest != nil { onGenerate(node) }
+        case .generating, .partiallyGenerated:
+            break
+        }
+    }
+}
+
+/// Optional side paths the agent grew from a learner's question. They hang
+/// off their lesson and never change the main reading order.
+private struct CourseBranchList: View {
+    let lesson: CourseLearningNode
+    let generationDisabled: Bool
+    let runtimeID: String
+    let onOpenMarkdown: (String) -> Void
+    let onGenerate: (CourseLearningNode) -> Void
+
+    @State private var showsAll = false
+    private let collapsedLimit = 2
+
+    var body: some View {
+        let branches = lesson.children
+        let visible = showsAll ? branches : Array(branches.prefix(collapsedLimit))
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(visible.enumerated()), id: \.element.id) { index, branch in
+                CourseBranchRow(
+                    branch: branch,
+                    isLast: index == visible.count - 1
+                        && (showsAll || branches.count <= collapsedLimit),
+                    generationDisabled: generationDisabled,
+                    runtimeID: runtimeID,
+                    onOpenMarkdown: onOpenMarkdown,
+                    onGenerate: onGenerate
+                )
+            }
+            if !showsAll, branches.count > collapsedLimit {
+                Button {
+                    withAnimation(.snappy(duration: 0.24)) { showsAll = true }
+                } label: {
+                    Text("+\(branches.count - collapsedLimit) more side \(branches.count - collapsedLimit == 1 ? "path" : "paths")")
+                        .font(.footnote.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .padding(.leading, CourseBranchRow.connectorWidth + 4)
+                .padding(.top, 6)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Side paths from \(lesson.title)")
+    }
+}
+
+private struct CourseBranchRow: View {
+    static let connectorWidth: CGFloat = 22
+    private static let badgeSize: CGFloat = 36
+
+    let branch: CourseLearningNode
+    let isLast: Bool
+    let generationDisabled: Bool
+    let runtimeID: String
+    let onOpenMarkdown: (String) -> Void
+    let onGenerate: (CourseLearningNode) -> Void
+
+    private var generationRequest: CourseDirectGenerationRequest? {
+        CourseExperienceStore.directGenerationRequest(for: branch, runtimeID: runtimeID)
+    }
+
+    private var isEnabled: Bool {
+        switch branch.status {
+        case .generated: branch.pageID != nil
+        case .pendingGeneration: generationRequest != nil && !generationDisabled
+        case .generating, .partiallyGenerated: false
+        }
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .center, spacing: 0) {
+                CourseBranchConnector(isLast: isLast)
+                    .stroke(
+                        Color.accentColor.opacity(0.35),
+                        style: StrokeStyle(lineWidth: 2, lineCap: .butt, lineJoin: .round)
+                    )
+                    .frame(width: Self.connectorWidth)
+                    .frame(maxHeight: .infinity)
+                badge
+                    .padding(.trailing, 10)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(branch.title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(2)
+                    if let question = branch.originQuestion, !question.isEmpty {
+                        Text("“\(question)”")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    if !branch.children.isEmpty {
+                        Text("\(branch.children.count) follow-up\(branch.children.count == 1 ? "" : "s")")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                .padding(.vertical, 8)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .allowsHitTesting(isEnabled)
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("course-branch-\(branch.id)")
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityAddTraits(isEnabled ? .isButton : [])
+    }
+
+    private var accessibilityLabel: String {
+        var parts = ["Side path", branch.title]
+        if let question = branch.originQuestion, !question.isEmpty {
+            parts.append("from your question: \(question)")
+        }
+        switch branch.status {
+        case .generated: parts.append("ready")
+        case .pendingGeneration: parts.append("not created yet")
+        case .generating, .partiallyGenerated: parts.append("being written")
+        }
+        if !branch.children.isEmpty {
+            parts.append("\(branch.children.count) follow-ups")
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    private var badge: some View {
+        ZStack {
+            Circle()
+                .fill(branch.status == .generated
+                      ? Color.accentColor.opacity(0.14)
+                      : Color(uiColor: .tertiarySystemFill))
+            Circle()
+                .strokeBorder(
+                    branch.status == .generated
+                        ? Color.accentColor.opacity(0.25)
+                        : Color(uiColor: .separator),
+                    lineWidth: 1
+                )
+            switch branch.status {
+            case .generating, .partiallyGenerated:
+                ProgressView().controlSize(.small)
+            case .pendingGeneration:
+                Image(systemName: "sparkle")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            case .generated:
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+        }
+        .frame(width: Self.badgeSize, height: Self.badgeSize)
+    }
+
+    private func action() {
+        switch branch.status {
+        case .generated:
+            if let pageID = branch.pageID { onOpenMarkdown(pageID) }
+        case .pendingGeneration:
+            if generationRequest != nil { onGenerate(branch) }
+        case .generating, .partiallyGenerated:
+            break
+        }
+    }
+}
+
+/// A trunk line that runs down the left edge and curves into each branch.
+private struct CourseBranchConnector: Shape {
+    let isLast: Bool
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let midY = rect.midY
+        let radius = min(10, rect.width / 2, midY)
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX, y: midY - radius))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX + radius, y: midY),
+            control: CGPoint(x: rect.minX, y: midY)
+        )
+        path.addLine(to: CGPoint(x: rect.maxX, y: midY))
+        if !isLast {
+            path.move(to: CGPoint(x: rect.minX, y: midY - radius))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        }
+        return path
+    }
+}
+
 enum CourseLearningTreeAccessibilityPolicy {
     static func rowIdentifier(for node: CourseLearningNode) -> String {
         "course-learning-node-\(node.id)"
@@ -3302,6 +4454,138 @@ enum CourseLearningTreeAccessibilityPolicy {
         }
     }
 }
+
+#if DEBUG
+/// Renders the lesson path for a nested fixture course so nesting, section
+/// headers, and every stop state can be inspected without an agent.
+struct CourseLearningPathUITestHarnessView: View {
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-test-course-learning-path")
+    }
+
+    @State private var selectedIndex = 0
+
+    private static func lesson(
+        _ id: String,
+        _ title: String,
+        _ status: CourseLearningNode.GenerationStatus = .pendingGeneration,
+        role: CourseLearningNode.Role = .lesson
+    ) -> CourseLearningNode {
+        CourseLearningNode(
+            id: id,
+            title: title,
+            kind: .markdown,
+            status: status,
+            role: role,
+            pageID: status == .generated ? "page-\(id)" : nil
+        )
+    }
+
+    private static func branch(
+        _ id: String,
+        _ title: String,
+        _ status: CourseLearningNode.GenerationStatus = .pendingGeneration,
+        question: String,
+        followUps: [CourseLearningNode] = []
+    ) -> CourseLearningNode {
+        var node = lesson(id, title, status, role: .explainer)
+        node.originQuestion = question
+        node.children = followUps
+        return node
+    }
+
+    private static func folder(
+        _ id: String,
+        _ title: String,
+        role: CourseLearningNode.Role,
+        _ children: [CourseLearningNode]
+    ) -> CourseLearningNode {
+        let statuses = Set(children.map(\.status))
+        let status: CourseLearningNode.GenerationStatus = statuses == [.generated]
+            ? .generated
+            : statuses == [.pendingGeneration] ? .pendingGeneration : .partiallyGenerated
+        return CourseLearningNode(
+            id: id, title: title, kind: .folder, status: status, role: role, children: children
+        )
+    }
+
+    static let chapters: [CourseLearningNode] = [
+        folder("valuation", "Cash-flow valuation and yield measures", role: .chapter, [
+            {
+                var node = lesson("intro", "Why yields, not prices, are quoted", .generated)
+                node.children = [
+                    branch("why-bey", "Why bills quote a discount rate", .generated,
+                           question: "Why don't bills just quote a yield like notes?",
+                           followUps: [branch("bey-history", "A short history of bill quoting", .generated,
+                                              question: "When did that convention start?")]),
+                    branch("clean-dirty", "Clean versus dirty in practice", .generating,
+                           question: "Which price do traders actually see on screen?"),
+                    branch("par-yield", "What a par yield really means",
+                           question: "Is par yield the same as coupon rate?"),
+                ]
+                return node
+            }(),
+            folder("pricing", "Pricing Treasury securities", role: .subchapter, [
+                lesson("pv", "Present value of coupon cash flows", .generated),
+                lesson("accrued", "Accrued interest and dirty prices", .generated),
+                lesson("conventions", "Day-count conventions", .generated, role: .explainer),
+            ]),
+            folder("yields", "Yield measures", role: .subchapter, [
+                lesson("ytm", "Yield to maturity", .generating),
+                folder("bey", "Bond-equivalent yields", role: .subchapter, [
+                    lesson("bey-bills", "Discount rate versus BEY for bills"),
+                    lesson("bey-notes", "Semiannual compounding for notes"),
+                ]),
+                lesson("worked", "Worked example: a 10-year note", role: .module),
+            ]),
+            folder("lab", "Pricing lab", role: .subchapter, [
+                lesson("lab-1", "Build a pricing spreadsheet", role: .module),
+            ]),
+        ]),
+        folder("risk", "Duration, convexity, and portfolio risk", role: .chapter, [
+            folder("duration", "Duration", role: .subchapter, [
+                lesson("macaulay", "Macaulay and modified duration"),
+                lesson("dv01", "Dollar duration and DV01"),
+            ]),
+            folder("convexity", "Convexity", role: .subchapter, [
+                lesson("second-order", "Second-order price approximation"),
+                lesson("hedging", "Hedging with convexity in mind"),
+            ]),
+        ]),
+    ]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                CourseChapterSwitcherCard(
+                    chapters: Self.chapters,
+                    selectedIndex: selectedIndex,
+                    generationDisabled: false,
+                    runtimeID: CourseAgentProvider.codex,
+                    onSelect: { id in
+                        selectedIndex = Self.chapters.firstIndex { $0.id == id } ?? 0
+                    },
+                    onGenerate: { _ in }
+                )
+                CourseLessonPathView(
+                    chapter: Self.chapters[selectedIndex],
+                    chapterNumber: selectedIndex + 1,
+                    currentNodeID: "accrued",
+                    generationDisabled: false,
+                    runtimeID: CourseAgentProvider.codex,
+                    onOpenMarkdown: { _ in },
+                    onGenerate: { _ in }
+                )
+                .id(selectedIndex)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .accessibilityIdentifier("course-learning-path-harness")
+    }
+}
+#endif
 
 #if DEBUG
 struct CourseGenerationControlUITestHarnessView: View {
@@ -4363,7 +5647,10 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
                         agentID: "codex",
                         connectionState: .idle,
                         isAgentAvailable: true,
-                        onConnect: recordMemoryOnlyAction
+                        needsAuthentication: false,
+                        isSigningIn: false,
+                        onConnect: recordMemoryOnlyAction,
+                        onSignIn: recordMemoryOnlyAction
                     )
                 }
                 .padding(20)
@@ -4392,10 +5679,13 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
                         agentID: "codex",
                         connectionState: setupConnectionState,
                         isAgentAvailable: true,
+                        needsAuthentication: false,
+                        isSigningIn: false,
                         onConnect: {
                             recordMemoryOnlyAction()
                             didRetry = true
-                        }
+                        },
+                        onSignIn: recordMemoryOnlyAction
                     )
                 }
                 .padding(20)
@@ -4429,7 +5719,7 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
                 onResumeDraft: recordMemoryOnlyAction,
                 onNewCourse: recordMemoryOnlyAction
             )
-            .navigationBarHidden(true)
+            .toolbar(.visible, for: .navigationBar)
         }
     }
 
@@ -4517,7 +5807,14 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
 
                     if scenario == .lf27AgentError {
                         CourseAgentSettingsErrorSection(
-                            message: "The selected agent’s model catalog could not be loaded. Try again."
+                            message: "ChatGPT sign-in could not be verified. Sign in again or try again.",
+                            showsCodexRecovery: true,
+                            showsChatGPTSignIn: true,
+                            hasCustomEndpoint: false,
+                            isSigningIn: false,
+                            onSignIn: recordMemoryOnlyAction,
+                            onRetry: recordMemoryOnlyAction,
+                            onOpenProvider: recordMemoryOnlyAction
                         )
                     }
                 }

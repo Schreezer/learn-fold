@@ -209,10 +209,14 @@ enum DebugLaunchSignalAuthorityInventory {
     static let legacyPrimaryArguments: Set<String> = [
         "--ui-test-course-draft-recovery",
         "--ui-test-course-reading",
+        "--ui-test-starter-course",
         "--ui-test-course-generation-control",
+        "--ui-test-course-learning-path",
+        "--ui-test-visualization-gallery",
         "--ui-test-course-retry",
         "--ui-test-course-save-recovery",
         "--ui-test-course-chat-continuity",
+        "--ui-test-course-chat-question",
         "--ui-test-conversation-display",
     ]
 
@@ -1391,8 +1395,14 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         // the final zombie.
         LLog.info("lifecycle", "applicationWillTerminate — closing alleycat endpoint")
         let semaphore = DispatchSemaphore(value: 0)
-        Task { @MainActor in
-            await self.appRuntime?.shutdownAlleycatEndpoint()
+        // The client handle is read synchronously because this hook already
+        // runs on the main actor. The close itself must not need the main
+        // actor: the `wait` below blocks the main thread, so a `Task
+        // { @MainActor }` could never start and the endpoint would never
+        // close — it would only burn the whole termination budget.
+        let client = appRuntime?.alleycatEndpointClient
+        Task.detached {
+            await client?.shutdownAlleycatEndpoint()
             semaphore.signal()
         }
         // applicationWillTerminate gets ~5s before the OS kills us.
@@ -1472,9 +1482,15 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 
     private func notificationPayloadJson(_ userInfo: [AnyHashable: Any]) -> String? {
         guard !userInfo.isEmpty else { return nil }
-        let payload = Dictionary(uniqueKeysWithValues: userInfo.map { key, value in
-            (String(describing: key), String(describing: value))
-        })
+        // Distinct `AnyHashable` keys from a remote payload can share one
+        // description (for example NSNumber(1) and "1"). Keep the first rather
+        // than trapping while logging a push notification.
+        let payload = Dictionary(
+            userInfo.map { key, value in
+                (String(describing: key), String(describing: value))
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8)
         else {
@@ -1505,6 +1521,7 @@ struct LitterApp: App {
         #else
         let suppressesLiveDependencies = false
         #endif
+        if !suppressesLiveDependencies { LearnfoldAnalytics.shared.configure() }
         _appModel = State(
             initialValue: Self.liveDependency(
                 suppressed: suppressesLiveDependencies,
@@ -1583,10 +1600,12 @@ struct LitterApp: App {
             LLog.info("lifecycle", "scenePhase changed", fields: ["phase": newPhase.debugName])
             switch newPhase {
             case .background:
+                LearnfoldAnalytics.shared.flush()
                 appRuntime.appDidEnterBackground()
             case .inactive:
                 appRuntime.appDidBecomeInactive()
             case .active:
+                LearnfoldAnalytics.shared.capture(.appOpened)
                 appRuntime.appDidBecomeActive()
             default:
                 break
@@ -1958,7 +1977,10 @@ struct ContentView: View {
                 Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
 
                 #if DEBUG
-                if CourseReadingUITestHarness.isEnabled {
+                if StarterCourseUITestHarness.isEnabled {
+                    StarterCourseUITestHarness()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseReadingUITestHarness.isEnabled {
                     CourseReadingUITestHarness()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if MarketingScreenshotHarnessView.isEnabled {
@@ -1967,11 +1989,20 @@ struct ContentView: View {
                 } else if CourseRetryUITestHarnessView.isEnabled {
                     CourseRetryUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseLearningPathUITestHarnessView.isEnabled {
+                    CourseLearningPathUITestHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if VisualizationGalleryHarnessView.isEnabled {
+                    VisualizationGalleryHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseGenerationControlUITestHarnessView.isEnabled {
                     CourseGenerationControlUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseDraftRecoveryUITestHarnessView.isEnabled {
                     CourseDraftRecoveryUITestHarnessView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseChatQuestionUITestHarnessView.isEnabled {
+                    CourseChatQuestionUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseChatContinuityUITestHarnessView.isEnabled {
                     CourseChatContinuityUITestHarnessView()
@@ -2625,7 +2656,10 @@ private struct HomeNavigationView: View {
         .sheet(isPresented: $showProjectPicker) {
             ProjectPickerSheet(
                 projects: homeDashboardModel.projects,
-                serverNamesById: Dictionary(uniqueKeysWithValues: homeDashboardModel.connectedServers.map { ($0.id, $0.displayName) }),
+                serverNamesById: Dictionary(
+                    homeDashboardModel.connectedServers.map { ($0.id, $0.displayName) },
+                    uniquingKeysWith: { first, _ in first }
+                ),
                 onSelect: { project in
                     homeDashboardModel.selectedServerId = project.serverId
                     homeDashboardModel.selectedProject = project

@@ -42,6 +42,7 @@ final class OpenAIApiKeyStore: @unchecked Sendable {
     private let service = "com.chirag.learnfold.openai-api-key"
     private let apiKeyAccount = "default"
     private let baseURLAccount = "openai-base-url"
+    private let modelIDAccount = "openai-model-id"
     private let apiKeyEnvKey = "OPENAI_API_KEY"
     private let baseURLEnvKey = "OPENAI_BASE_URL"
 
@@ -61,6 +62,10 @@ final class OpenAIApiKeyStore: @unchecked Sendable {
 
     func loadBaseURL() throws -> String? {
         try load(account: baseURLAccount)
+    }
+
+    func loadModelID() throws -> String? {
+        try load(account: modelIDAccount)
     }
 
     private func load(account: String) throws -> String? {
@@ -98,6 +103,10 @@ final class OpenAIApiKeyStore: @unchecked Sendable {
     func saveBaseURL(_ baseURL: String) throws {
         try save(value: baseURL, account: baseURLAccount)
         applyToEnvironment()
+    }
+
+    func saveModelID(_ modelID: String) throws {
+        try save(value: modelID, account: modelIDAccount)
     }
 
     private func save(value: String, account: String) throws {
@@ -142,6 +151,10 @@ final class OpenAIApiKeyStore: @unchecked Sendable {
     func clearBaseURL() throws {
         try clear(account: baseURLAccount)
         unsetenv(baseURLEnvKey)
+    }
+
+    func clearModelID() throws {
+        try clear(account: modelIDAccount)
     }
 
     private func clear(account: String) throws {

@@ -695,11 +695,15 @@ actor CourseSourceIngestionCoordinator {
             data = received
             finalURL = responseURL
             statusCode = http.statusCode
-            responseHeaders = Dictionary(uniqueKeysWithValues: http.allHeaderFields.compactMap {
-                key, value in
-                guard let key = key as? String else { return nil }
-                return (key.lowercased(), String(describing: value))
-            })
+            // Lowercasing can collapse two header names a remote server sent
+            // with different casing. Keep the first rather than trapping.
+            responseHeaders = Dictionary(
+                http.allHeaderFields.compactMap { key, value -> (String, String)? in
+                    guard let key = key as? String else { return nil }
+                    return (key.lowercased(), String(describing: value))
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
         } else {
             let download = try await PinnedHTTPDownloader.download(
                 url,
@@ -822,6 +826,42 @@ actor CourseSourceIngestionCoordinator {
         return pages.joined(separator: "\n\n")
     }
 
+    /// Drops every `open … close` region in a single forward pass.
+    ///
+    /// The equivalent `<tag…>.*?</tag>` regex rescans to the end of the
+    /// document from every candidate opening tag, so a downloaded page that
+    /// never closes the tag costs O(n²) — 20 MB of `"<script "` would hang
+    /// ingestion indefinitely. Closing delimiters are monotonic: once none
+    /// remains, none can appear later, so the search stops after one miss.
+    private static func removingRegion(in html: String, open: String, close: String) -> String {
+        let options: String.CompareOptions = [.regularExpression, .caseInsensitive]
+        var result = ""
+        result.reserveCapacity(html.count)
+        var cursor = html.startIndex
+        var mayHaveClosing = true
+        while let opening = html.range(of: open, options: options, range: cursor..<html.endIndex) {
+            result += html[cursor..<opening.lowerBound]
+            result += " "
+            if mayHaveClosing,
+               let closing = html.range(
+                   of: close, options: options, range: opening.upperBound..<html.endIndex
+               ) {
+                cursor = closing.upperBound
+                continue
+            }
+            mayHaveClosing = false
+            // Unclosed: drop the opening delimiter only, and keep the rest of
+            // the document as text rather than discarding it.
+            if let tagEnd = html.range(of: ">", range: opening.upperBound..<html.endIndex) {
+                cursor = tagEnd.upperBound
+            } else {
+                cursor = html.endIndex
+            }
+        }
+        result += html[cursor...]
+        return result
+    }
+
     private static func extractHTML(data: Data) throws -> String {
         guard var html = String(data: data, encoding: .utf8)
                 ?? String(data: data, encoding: .isoLatin1) else {
@@ -830,17 +870,12 @@ actor CourseSourceIngestionCoordinator {
         // NSAttributedString's HTML importer may fetch linked resources. This
         // deliberately small offline parser only transforms bytes already in
         // memory and therefore cannot initiate secondary requests.
-        for pattern in [
-            "(?is)<!--.*?-->",
-            "(?is)<script\\b[^>]*>.*?</script\\s*>",
-            "(?is)<style\\b[^>]*>.*?</style\\s*>",
-            "(?is)<noscript\\b[^>]*>.*?</noscript\\s*>",
-            "(?is)<svg\\b[^>]*>.*?</svg\\s*>",
-        ] {
-            html = html.replacingOccurrences(
-                of: pattern,
-                with: " ",
-                options: .regularExpression
+        html = Self.removingRegion(in: html, open: "<!--", close: "-->")
+        for tag in ["script", "style", "noscript", "svg"] {
+            html = Self.removingRegion(
+                in: html,
+                open: "<\\s*\(tag)\\b",
+                close: "</\\s*\(tag)\\s*>"
             )
         }
         html = html.replacingOccurrences(

@@ -88,10 +88,15 @@ private struct AccountConnectionView: View {
                 Spacer()
                 if server.isLocal, server.account != nil {
                     Button("Logout") {
-                        Task { await logout() }
+                        Task {
+                            isWorking = true
+                            await logout()
+                            isWorking = false
+                        }
                     }
                     .litterFont(.footnote)
                     .foregroundColor(LitterTheme.danger)
+                    .disabled(isWorking)
                 }
             }
             .padding(.horizontal, 20)
@@ -116,7 +121,7 @@ private struct AccountConnectionView: View {
                 .foregroundColor(LitterTheme.textMuted)
                 .padding(.horizontal, 20)
 
-            if server.isLocal, !isChatGPTAccount {
+            if server.isLocal {
                 Button {
                     Task {
                         isWorking = true
@@ -129,7 +134,7 @@ private struct AccountConnectionView: View {
                             ProgressView().tint(LitterTheme.textOnAccent).scaleEffect(0.8)
                         }
                         Image(systemName: "person.crop.circle.badge.checkmark")
-                        Text("Login with ChatGPT")
+                        Text(isChatGPTAccount ? "Sign in again with ChatGPT" : "Sign in with ChatGPT")
                             .litterFont(.subheadline)
                     }
                     .foregroundColor(LitterTheme.textOnAccent)
@@ -140,6 +145,14 @@ private struct AccountConnectionView: View {
                 }
                 .padding(.horizontal, 16)
                 .disabled(isWorking)
+                .accessibilityIdentifier("account.chatgpt.signIn")
+
+                if isChatGPTAccount {
+                    Text("If your Codex session expired, sign in again to restore access.")
+                        .litterFont(.caption)
+                        .foregroundColor(LitterTheme.textSecondary)
+                        .padding(.horizontal, 20)
+                }
             }
 
             if server.isLocal, allowsLocalEnvApiKey {
@@ -247,7 +260,7 @@ private struct AccountConnectionView: View {
             await appModel.refreshSnapshot()
             authError = nil
         } catch {
-            authError = error.localizedDescription
+            authError = "Couldn't verify this account. If your session expired, sign in again below."
         }
     }
 
@@ -262,7 +275,7 @@ private struct AccountConnectionView: View {
         } catch ChatGPTOAuthError.cancelled {
             return
         } catch {
-            authError = error.localizedDescription
+            authError = "Couldn't complete ChatGPT sign-in. Please try again."
         }
     }
 
@@ -271,9 +284,12 @@ private struct AccountConnectionView: View {
             authError = "API keys can only be saved for the local server."
             return
         }
+        var didSaveKey = false
         do {
             authError = nil
             try OpenAIApiKeyStore.shared.save(key)
+            didSaveKey = true
+            appModel.setLocalAuthPreference(.apiKey)
             if case .apiKey? = server.account {
                 _ = try await appModel.client.logoutAccount(serverId: server.serverId)
             }
@@ -285,7 +301,9 @@ private struct AccountConnectionView: View {
             }
             dismiss()
         } catch {
-            authError = error.localizedDescription
+            authError = didSaveKey
+                ? "The API key was saved, but Codex could not restart. Reconnect this device and try again."
+                : "The API key could not be saved on this iPhone. Please try again."
         }
     }
 
@@ -297,6 +315,7 @@ private struct AccountConnectionView: View {
         do {
             try? ChatGPTOAuthTokenStore.shared.clear()
             try? OpenAIApiKeyStore.shared.clear()
+            appModel.setLocalAuthPreference(nil)
             _ = try await appModel.client.logoutAccount(serverId: server.serverId)
             try await appModel.restartLocalServer()
             authError = nil

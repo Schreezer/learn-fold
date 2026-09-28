@@ -24,6 +24,7 @@ struct SettingsView: View {
     #if !targetEnvironment(macCatalyst)
     @Environment(\.scenePhase) private var scenePhase
     #endif
+    @AppStorage(LearnfoldAnalyticsPolicy.preferenceKey) private var analyticsEnabled = true
     @AppStorage("fontFamily") private var fontFamily = FontFamilyOption.mono.rawValue
     @AppStorage("collapseTurns") private var collapseTurns = false
     @AppStorage(ConversationDisplayPreferenceKey.reasoning) private var reasoningDisplayMode = ConversationDetailDisplayMode.collapsed.rawValue
@@ -68,6 +69,15 @@ struct SettingsView: View {
                     conversationSection
                     petSection
                     experimentalSection
+                    Section {
+                        Toggle("Share anonymous usage analytics", isOn: $analyticsEnabled)
+                            .accessibilityIdentifier("settings.analytics.enabled")
+                            .onChange(of: analyticsEnabled) { _, enabled in
+                                LearnfoldAnalytics.shared.setEnabled(enabled)
+                            }
+                    } footer: {
+                        Text("Help improve Learnfold by sharing which features you use with PostHog. Course content, questions, email addresses and recordings are never included.")
+                    }
                     accountSection
                     serversSection
                 }
@@ -1213,10 +1223,15 @@ private struct SettingsConnectionAccountSection: View {
                 Spacer()
                 if server.isLocal, server.account != nil {
                     Button("Logout") {
-                        Task { await logout() }
+                        Task {
+                            isAuthWorking = true
+                            await logout()
+                            isAuthWorking = false
+                        }
                     }
                     .litterFont(.caption)
                     .foregroundColor(LitterTheme.danger)
+                    .disabled(isAuthWorking)
                 }
             }
             .listRowBackground(LitterTheme.surface.opacity(0.6))
@@ -1235,7 +1250,7 @@ private struct SettingsConnectionAccountSection: View {
                     .listRowBackground(LitterTheme.surface.opacity(0.6))
             }
 
-            if server.isLocal, !isChatGPTAccount {
+            if server.isLocal {
                 Button {
                     Task {
                         isAuthWorking = true
@@ -1248,13 +1263,21 @@ private struct SettingsConnectionAccountSection: View {
                             ProgressView().tint(LitterTheme.textPrimary).scaleEffect(0.8)
                         }
                         Image(systemName: "person.crop.circle.badge.checkmark")
-                        Text("Login with ChatGPT")
+                        Text(isChatGPTAccount ? "Sign in again with ChatGPT" : "Sign in with ChatGPT")
                             .litterFont(.subheadline)
                     }
                     .foregroundColor(LitterTheme.accent)
                 }
                 .disabled(isAuthWorking)
                 .listRowBackground(LitterTheme.surface.opacity(0.6))
+                .accessibilityIdentifier("settings.account.chatgpt.signIn")
+
+                if isChatGPTAccount {
+                    Text("If your Codex session expired, sign in again to restore access.")
+                        .litterFont(.caption)
+                        .foregroundColor(LitterTheme.textSecondary)
+                        .listRowBackground(LitterTheme.surface.opacity(0.6))
+                }
             }
 
             if server.isLocal, allowsLocalEnvApiKey {
@@ -1426,7 +1449,7 @@ private struct SettingsConnectionAccountSection: View {
         } catch ChatGPTOAuthError.cancelled {
             return
         } catch {
-            authError = error.localizedDescription
+            authError = "Couldn't complete ChatGPT sign-in. Please try again."
         }
     }
 
@@ -1459,7 +1482,7 @@ private struct SettingsConnectionAccountSection: View {
             refreshStoredCredentialFlags()
             authError = nil
         } catch {
-            authError = error.localizedDescription
+            authError = "Couldn't verify this account. If your session expired, sign in again above."
         }
     }
 
@@ -1468,9 +1491,12 @@ private struct SettingsConnectionAccountSection: View {
             authError = "API keys can only be saved for the local server."
             return
         }
+        var didSaveKey = false
         do {
             authError = nil
             try OpenAIApiKeyStore.shared.save(key)
+            didSaveKey = true
+            appModel.setLocalAuthPreference(.apiKey)
             if case .apiKey? = server.account {
                 _ = try await appModel.client.logoutAccount(serverId: server.serverId)
             }
@@ -1481,7 +1507,9 @@ private struct SettingsConnectionAccountSection: View {
                 return
             }
         } catch {
-            authError = error.localizedDescription
+            authError = didSaveKey
+                ? "The API key was saved, but Codex could not restart. Reconnect this device and try again."
+                : "The API key could not be saved on this iPhone. Please try again."
         }
     }
 
@@ -1497,6 +1525,9 @@ private struct SettingsConnectionAccountSection: View {
         do {
             authError = nil
             try OpenAIApiKeyStore.shared.saveBaseURL(baseURL)
+            if OpenAIApiKeyStore.shared.hasStoredKey {
+                appModel.setLocalAuthPreference(.apiKey)
+            }
             try await appModel.restartLocalServer()
             refreshStoredCredentialFlags()
             guard hasStoredBaseURL else {
@@ -1505,7 +1536,7 @@ private struct SettingsConnectionAccountSection: View {
             }
             openAIBaseURL = ""
         } catch {
-            authError = error.localizedDescription
+            authError = "The custom endpoint could not be activated. Check its URL and try again."
         }
     }
 
@@ -1521,7 +1552,7 @@ private struct SettingsConnectionAccountSection: View {
             refreshStoredCredentialFlags()
             openAIBaseURL = ""
         } catch {
-            authError = error.localizedDescription
+            authError = "The default endpoint could not be restored. Reconnect Codex and try again."
         }
     }
 
@@ -1533,6 +1564,7 @@ private struct SettingsConnectionAccountSection: View {
         do {
             try? ChatGPTOAuthTokenStore.shared.clear()
             try? OpenAIApiKeyStore.shared.clear()
+            appModel.setLocalAuthPreference(nil)
             _ = try await appModel.client.logoutAccount(serverId: server.serverId)
             try await appModel.restartLocalServer()
             refreshStoredCredentialFlags()

@@ -311,8 +311,11 @@ enum ChatGPTOAuth {
     ) async throws -> ChatGPTOAuthTokenBundle {
         let components = try validateCallbackURL(callbackURL)
 
+        // A callback URL is attacker-reachable and may repeat a parameter.
+        // Keep the first occurrence instead of trapping on a duplicate key.
         let queryItems = Dictionary(
-            uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") }
+            (components.queryItems ?? []).map { ($0.name, $0.value ?? "") },
+            uniquingKeysWith: { first, _ in first }
         )
         if let error = queryItems["error"], !error.isEmpty {
             let description = queryItems["error_description"]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -340,8 +343,11 @@ enum ChatGPTOAuth {
     ) async throws -> String {
         let components = try validateCallbackURL(callbackURL)
 
+        // A callback URL is attacker-reachable and may repeat a parameter.
+        // Keep the first occurrence instead of trapping on a duplicate key.
         let queryItems = Dictionary(
-            uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") }
+            (components.queryItems ?? []).map { ($0.name, $0.value ?? "") },
+            uniquingKeysWith: { first, _ in first }
         )
         if let error = queryItems["error"], !error.isEmpty {
             let description = queryItems["error_description"]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -892,7 +898,17 @@ private final class ChatGPTOAuthLoopbackServer: @unchecked Sendable {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw ChatGPTOAuthError.invalidCallbackURL
         }
-        let listener = try NWListener(using: .tcp, on: nwPort)
+        // `bindHost` was stored but never applied: `NWListener(using:on:)`
+        // listens on every interface, so the sign-in callback port was
+        // reachable from the local network for the duration of the flow.
+        // Pin it to loopback, which is the only place the callback arrives.
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(
+            host: NWEndpoint.Host(bindHost),
+            port: nwPort
+        )
+        parameters.allowLocalEndpointReuse = true
+        let listener = try NWListener(using: parameters)
         self.listener = listener
         listener.newConnectionHandler = { [weak self] connection in
             self?.handle(connection)
@@ -962,8 +978,17 @@ private final class ChatGPTOAuthLoopbackServer: @unchecked Sendable {
     }
 
     func stop() {
-        let state = withStateLock { () -> (Task<Void, Never>?, NWListener?) in
-            let state = (timeoutTask, listener)
+        // Dropping a pending continuation never resumes the task awaiting it,
+        // so the sign-in flow would hang forever (and the runtime logs a
+        // leaked-continuation misuse). Hand them back a cancellation instead.
+        let state = withStateLock {
+            () -> (
+                Task<Void, Never>?,
+                NWListener?,
+                CheckedContinuation<String, Error>?,
+                CheckedContinuation<URL, Error>?
+            ) in
+            let state = (timeoutTask, listener, startContinuation, callbackContinuation)
             timeoutTask = nil
             listener = nil
             startContinuation = nil
@@ -974,6 +999,8 @@ private final class ChatGPTOAuthLoopbackServer: @unchecked Sendable {
         }
         state.0?.cancel()
         state.1?.cancel()
+        state.2?.resume(throwing: ChatGPTOAuthError.cancelled)
+        state.3?.resume(throwing: ChatGPTOAuthError.cancelled)
     }
 
     private func handle(_ connection: NWConnection) {

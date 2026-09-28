@@ -142,8 +142,11 @@ struct CourseWorkspaceSnapshot: Equatable, Sendable {
         let candidate = fileURL.resolvingSymlinksInPath().standardizedFileURL
         let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
         guard candidate.path.hasPrefix(prefix) else { return nil }
+        // `URL.path` is already decoded. Decoding again renamed any file whose
+        // real name contains an escape-like sequence ("report%20v2.md" became
+        // "report v2.md"), and returned nil outright for names percent-decoding
+        // rejects ("50%.md"), hiding those files from the workspace entirely.
         return String(candidate.path.dropFirst(prefix.count))
-            .removingPercentEncoding
     }
 
     static func readText(

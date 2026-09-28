@@ -426,9 +426,24 @@ enum AppleCoursePlanValidator {
                 "summary",
                 "title",
             ]
+            // Only flag keys in a serialized position. Ordinary prose such as
+            // "Write a one-page summary: ..." must not reject a whole plan.
+            let structuralPrefixes: Set<Character> = [",", "{", "[", "\"", "\n"]
             return schemaKeys.contains { key in
-                normalized.contains("\(key):")
-                    || normalized.contains("\"\(key)\":")
+                if normalized.contains("\"\(key)\":") { return true }
+                var searchStart = normalized.startIndex
+                while let match = normalized.range(
+                    of: "\(key):",
+                    range: searchStart..<normalized.endIndex
+                ) {
+                    let preceding = normalized[normalized.startIndex..<match.lowerBound]
+                        .last(where: { $0 != " " && $0 != "\t" })
+                    guard let preceding, !structuralPrefixes.contains(preceding) else {
+                        return true
+                    }
+                    searchStart = match.upperBound
+                }
+                return false
             }
         }
 
@@ -475,9 +490,17 @@ enum AppleCoursePlanValidator {
             > CoursePlanHierarchyPolicy.maximumEstimatedDurationLength {
             return "estimated_duration must be at most \(CoursePlanHierarchyPolicy.maximumEstimatedDurationLength) characters"
         }
-        if narrativeFields.contains(where: { !isNaturalLanguage($0) })
-            || !isNaturalLanguage(brief.estimatedDuration, minimumWords: 1) {
-            return "all plan summary fields must contain natural language, not serialized schema fragments"
+        let namedNarrativeFields = [
+            ("summary", brief.summary),
+            ("outcome", brief.outcome),
+            ("starting_point", brief.startingPoint),
+            ("focus_gap", brief.focusGap),
+        ]
+        if let field = namedNarrativeFields.first(where: { !isNaturalLanguage($0.1) })?.0 {
+            return "\(field) must be natural language of at least two words, not a serialized schema fragment"
+        }
+        if !isNaturalLanguage(brief.estimatedDuration, minimumWords: 1) {
+            return "estimated_duration must be natural language, not a serialized schema fragment"
         }
         if !(1...8).contains(brief.chapters.count) {
             return "the plan must contain between 1 and 8 chapters"
@@ -494,11 +517,13 @@ enum AppleCoursePlanValidator {
                 > CoursePlanHierarchyPolicy.maximumChapterObjectiveLength {
                 return "every chapter objective must be at most \(CoursePlanHierarchyPolicy.maximumChapterObjectiveLength) characters"
             }
-            if chapter.id.wholeMatch(of: planIDPattern) == nil
-                || !isNaturalLanguage(chapter.title, minimumWords: 1)
+            if chapter.id.wholeMatch(of: planIDPattern) == nil {
+                return "chapter ID '\(chapter.id)' must match ^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$"
+            }
+            if !isNaturalLanguage(chapter.title, minimumWords: 1)
                 || !isNaturalLanguage(chapter.objective)
             {
-                return "every chapter needs a valid ID plus natural-language title and objective"
+                return "chapter '\(chapter.id)' needs a natural-language title and an objective of at least two words"
             }
             if chapter.deliverables.contains(where: {
                 $0.count > CoursePlanHierarchyPolicy.maximumDeliverableLength
@@ -507,10 +532,13 @@ enum AppleCoursePlanValidator {
             }
             if !(1...CoursePlanHierarchyPolicy.maximumDirectChildren).contains(
                 chapter.deliverables.count
-            )
-                || chapter.deliverables.contains(where: { !isNaturalLanguage($0) })
-            {
+            ) {
                 return "every chapter needs 1 to \(CoursePlanHierarchyPolicy.maximumDirectChildren) natural-language deliverables"
+            }
+            if let deliverable = chapter.deliverables.first(where: {
+                !isNaturalLanguage($0, minimumWords: 1)
+            }) {
+                return "chapter '\(chapter.id)' deliverable '\(deliverable.prefix(80))' must be natural language, not a serialized schema fragment"
             }
         }
         return CoursePlanHierarchyPolicy.validationIssue(
@@ -1323,9 +1351,10 @@ enum AppleCoursePlanningProfileSelectionPolicy {
         requirements: AppleCoursePlanningRequirements,
         measurements: [AppleCoursePlanningProfileMeasurement]
     ) -> AppleCoursePlanningProfileMeasurement? {
-        let byProfile = Dictionary(uniqueKeysWithValues: measurements.map {
-            ($0.profile, $0)
-        })
+        let byProfile = Dictionary(
+            measurements.map { ($0.profile, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         return AppleCoursePlanningProfile.selectionOrder.lazy.compactMap { profile in
             guard
                 profile.supports(requirements),
@@ -1852,7 +1881,8 @@ enum AppleCoursePlanningSchemaPolicy {
 enum AppleCoursePlanningPromptPolicy {
     private static let fullInstructions = """
     You are Learnfold’s concise course planner. Assess the learner’s starting point before \
-    proposing a course. Use the exact requested chapter count; otherwise use 3 to 8 focused \
+    proposing a course. \(CourseChatQuestionPromptPolicy.compactInstructions) \
+    Use the exact requested chapter count; otherwise use 3 to 8 focused \
     chapters. When ready, call present_course_plan once with every typed field. For a new plan, use \
     revision 1. For a revision, reuse plan_id and unchanged node IDs, then increase revision. \
     Each chapter must contain 1 to 6 ordered children. A child is either a lesson/module/explainer \
@@ -1880,7 +1910,8 @@ enum AppleCoursePlanningPromptPolicy {
         case .focused:
             """
             You are Learnfold’s concise course planner. Assess the learner’s starting point before \
-            proposing a course. This focused turn supports 1 to 4 chapters and at most 24 total \
+            proposing a course. \(CourseChatQuestionPromptPolicy.compactInstructions) \
+            This focused turn supports 1 to 4 chapters and at most 24 total \
             native pages. Use the exact requested chapter count only when it fits those limits. \
             When ready, call present_course_plan once with every typed field. For a new plan, use \
             revision 1. For a revision, reuse plan_id and unchanged node IDs, then increase \
@@ -2603,8 +2634,14 @@ enum AppleCoursePlanTransitionPolicy {
 
         let priorEntries = CoursePlanHierarchyPolicy.outlineEntries(for: prior)
         let proposedEntries = CoursePlanHierarchyPolicy.outlineEntries(for: proposed)
-        let priorByID = Dictionary(uniqueKeysWithValues: priorEntries.map { ($0.id, $0) })
-        let proposedByID = Dictionary(uniqueKeysWithValues: proposedEntries.map { ($0.id, $0) })
+        // A proposed revision is model-generated and may repeat a node ID.
+        // Validation must reject it, never trap while building the lookup.
+        let priorByID = Dictionary(
+            priorEntries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }
+        )
+        let proposedByID = Dictionary(
+            proposedEntries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }
+        )
         let sharedIDs = Set(priorByID.keys).intersection(proposedByID.keys)
 
         for id in sharedIDs {
@@ -5008,14 +5045,16 @@ private extension SystemAppleCourseAgentRuntime {
         semantic controls and an aria-live result, fit a phone width, make the first frame useful, \
         and use no network requests, external resources, external links, host bridges, infinite \
         animation, Markdown fences, or html, head, or body tags. Return an empty string when prose, \
-        a table, or a formula is clearer. \(courseHierarchyInstructions) For a selected-passage question, \
+        a table, or a formula is clearer. Give every generated lesson two or three short \
+        follow_up_questions a curious learner might ask next about that lesson. \
+        \(courseHierarchyInstructions) For a selected-passage question, \
         autonomously choose the \
         smallest sufficient response: answer only in chat for a short-lived clarification; add or \
         revise a focused section on the referenced page when it durably improves that lesson; or \
         create an explainer child page and link it from the lesson when a reusable deep dive would \
         interrupt the lesson’s flow. Do not edit merely because tools are available, preserve \
         unrelated content, and never claim an edit succeeded until the native-editor tool returns \
-        success.
+        success. \(CourseChatQuestionPromptPolicy.compactInstructions)
         """
     }
 

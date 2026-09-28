@@ -3182,7 +3182,11 @@ impl MobileClient {
         };
         let queued_draft = has_active_turn
             .then(|| {
-                queued_follow_up_draft_from_inputs(&params.input, AppQueuedFollowUpKind::Message)
+                queued_follow_up_draft_from_inputs(
+                    &params.input,
+                    AppQueuedFollowUpKind::Message,
+                    params.additional_context.clone(),
+                )
             })
             .flatten();
         if let Some(draft) = queued_draft.clone() {
@@ -3218,7 +3222,7 @@ impl MobileClient {
                             client_user_message_id: None,
                             input: direct_params.input.clone(),
                             responsesapi_client_metadata: None,
-                            additional_context: None,
+                            additional_context: direct_params.additional_context.clone(),
                             expected_turn_id: active_turn_id,
                         },
                     },
@@ -3335,7 +3339,7 @@ impl MobileClient {
                         client_user_message_id: None,
                         input: draft.inputs,
                         responsesapi_client_metadata: None,
-                        additional_context: None,
+                        additional_context: draft.additional_context,
                         expected_turn_id: active_turn_id,
                     },
                 },

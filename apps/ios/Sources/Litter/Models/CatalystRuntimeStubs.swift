@@ -59,6 +59,10 @@ final class AppRuntimeController {
         await appModel.client.shutdownAlleycatEndpoint()
     }
 
+    /// See the iOS `AppRuntimeController` for why termination needs a handle it
+    /// can use without hopping back to the blocked main actor.
+    var alleycatEndpointClient: AppClient? { appModel?.client }
+
     func reconnectSavedServers() async {
         guard let appModel else { return }
         let servers = SavedServerStore.reconnectRecords(

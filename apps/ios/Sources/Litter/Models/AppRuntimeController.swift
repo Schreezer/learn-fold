@@ -97,6 +97,11 @@ final class AppRuntimeController {
         await appModel.client.shutdownAlleycatEndpoint()
     }
 
+    /// The endpoint-owning client, read synchronously. `applicationWillTerminate`
+    /// blocks the main thread, so it cannot await a main-actor hop; it takes this
+    /// `Sendable` handle first and closes the endpoint off the main actor.
+    var alleycatEndpointClient: AppClient? { appModel?.client }
+
     func reconnectSavedServers() async {
         guard let appModel else { return }
         await lifecycle.reconnectSavedServers(appModel: appModel)

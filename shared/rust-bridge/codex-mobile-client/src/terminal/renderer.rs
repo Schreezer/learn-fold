@@ -593,6 +593,7 @@ impl TerminalRenderer {
             service_tier: None,
             effort: None,
             output_schema: None,
+            application_context: None,
         };
         store
             .start_turn(payload.thread_key, request)

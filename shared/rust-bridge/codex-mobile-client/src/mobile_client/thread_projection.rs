@@ -69,12 +69,13 @@ pub(super) fn queued_follow_up_preview_from_inputs(
     inputs: &[upstream::UserInput],
     kind: AppQueuedFollowUpKind,
 ) -> Option<AppQueuedFollowUpPreview> {
-    queued_follow_up_draft_from_inputs(inputs, kind).map(|draft| draft.preview)
+    queued_follow_up_draft_from_inputs(inputs, kind, None).map(|draft| draft.preview)
 }
 
 pub(super) fn queued_follow_up_draft_from_inputs(
     inputs: &[upstream::UserInput],
     kind: AppQueuedFollowUpKind,
+    additional_context: Option<HashMap<String, upstream::AdditionalContextEntry>>,
 ) -> Option<crate::store::QueuedFollowUpDraft> {
     let text = queued_follow_up_text_from_inputs(inputs)?;
 
@@ -85,6 +86,7 @@ pub(super) fn queued_follow_up_draft_from_inputs(
             text,
         },
         inputs: inputs.to_vec(),
+        additional_context,
         source_message_json: queued_follow_up_message_json_from_inputs(inputs),
     })
 }

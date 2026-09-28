@@ -154,9 +154,10 @@ struct HomeDashboardView: View {
         // paginated threads, loaded items and attached live listeners are now
         // separate states.
         let visible = visibleSessions
-        let byPinnedKey = Dictionary(uniqueKeysWithValues: visible.map {
-            (SavedThreadsStore.PinnedKey(threadKey: $0.key), $0)
-        })
+        let byPinnedKey = Dictionary(
+            visible.map { (SavedThreadsStore.PinnedKey(threadKey: $0.key), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let pinnedFirst = pinnedThreadKeys.compactMap { byPinnedKey[$0] }
         for session in pinnedFirst where !session.isResumed {
             let id = hydrationId(session.key)
@@ -1748,12 +1749,15 @@ private struct SessionPulsingDots: View {
                     .opacity(phase == i ? 1.0 : 0.25)
             }
         }
-        .onAppear {
-            Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
-                Task { @MainActor in
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        phase = (phase + 1) % 3
-                    }
+        // A scheduled Timer here would be retained by the run loop and outlive
+        // the row, so every reappearance in the lazy list left another one
+        // ticking forever. `task` is cancelled when the row goes away.
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(300))
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    phase = (phase + 1) % 3
                 }
             }
         }

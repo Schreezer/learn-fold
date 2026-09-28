@@ -4,6 +4,81 @@ final class CourseReadingUITests: XCTestCase {
     override func setUp() { continueAfterFailure = false }
 
     @MainActor
+    func testPageChatOpensWithCurrentPageAndReturnsToReading() {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["SNAPPY_SKIP_AGENT_SETUP"] = "1"
+        app.launchEnvironment["LEARNFOLD_READING_TEST_TOKEN"] = UUID().uuidString
+        app.launchEnvironment["LEARNFOLD_READING_TEST_APPEARANCE"] = "dark"
+        app.launchArguments = ["--ui-test-course-reading"]
+        app.launch()
+        let start = app.buttons["course-continue"]
+        XCTAssertTrue(start.waitForExistence(timeout: 25))
+        XCTAssertEqual(app.staticTexts["reading-fixture"].value as? String, "dark")
+        XCTAssertTrue(waitForHittable(start))
+        start.tap()
+        XCTAssertTrue(waitForPage("article-one", in: app))
+        let ask = app.buttons["course-page-ask-ai"]
+        XCTAssertTrue(waitForHittable(ask))
+        app.swipeUp()
+        XCTAssertTrue(ask.isHittable, "Chat stays available while reading")
+        capture("Ask AI native page toolbar", app)
+        ask.tap()
+        let context = app.descendants(matching: .any).matching(identifier: "course-page-chat-context").firstMatch
+        XCTAssertTrue(context.waitForExistence(timeout: 15), app.debugDescription)
+        XCTAssertTrue(context.staticTexts["What a proof reveals"].exists)
+        capture("AI chat with current page context", app)
+        app.navigationBars.buttons["Done"].tap()
+        XCTAssertTrue(waitForPage("article-one", in: app))
+        XCTAssertTrue(waitForHittable(ask))
+        app.buttons["course-page-edit-toggle"].tap()
+        XCTAssertFalse(ask.exists, "Reading chat does not cover editing controls")
+        app.buttons["course-page-edit-toggle"].tap()
+        XCTAssertTrue(waitForHittable(ask))
+        let next = app.buttons["course-next-lesson"]
+        for _ in 0..<22 where !next.isHittable { app.swipeUp() }
+        // XCTest reports a partly exposed button as hittable, but its center
+        // can still lie behind the native bottom toolbar. Reveal it fully.
+        app.swipeUp()
+        XCTAssertTrue(next.isHittable)
+        next.tap()
+        XCTAssertTrue(waitForPage("article-two", in: app))
+        XCTAssertTrue(waitForHittable(ask))
+        ask.tap()
+        XCTAssertTrue(context.waitForExistence(timeout: 15))
+        XCTAssertTrue(context.staticTexts["A verifier's challenge"].exists)
+        XCTAssertFalse(context.staticTexts["What a proof reveals"].exists)
+        capture("AI chat follows the next page", app)
+        let composer = app.descendants(matching: .any).matching(identifier: "course-chat-composer").firstMatch
+        XCTAssertTrue(waitForHittable(composer))
+        composer.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10))
+        capture("Rounded composer with keyboard in dark mode", app)
+        composer.typeText("Why is the challenge random?")
+        let send = app.buttons["course-chat-send"]
+        XCTAssertTrue(waitForHittable(send))
+        send.tap()
+        XCTAssertTrue(app.staticTexts[
+            "The local chat fixture received your question and the current lesson content."
+        ].waitForExistence(timeout: 20), app.debugDescription)
+        capture("Page question dispatched with lesson content", app)
+
+        app.terminate()
+        app.launchEnvironment["LEARNFOLD_READING_TEST_APPEARANCE"] = "light"
+        app.launch()
+        XCTAssertTrue(start.waitForExistence(timeout: 25))
+        XCTAssertTrue(waitForHittable(start))
+        start.tap()
+        XCTAssertTrue(waitForPage("article-two", in: app))
+        XCTAssertTrue(waitForHittable(ask))
+        ask.tap()
+        XCTAssertTrue(waitForHittable(composer))
+        composer.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10))
+        capture("Rounded composer with keyboard in light mode", app)
+    }
+
+    @MainActor
     func testInteractiveVisualizationRendersAndRunsJavaScript() {
         let app = XCUIApplication()
         app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
@@ -40,6 +115,46 @@ final class CourseReadingUITests: XCTestCase {
             .firstMatch
         XCTAssertTrue(changedState.waitForExistence(timeout: 10), app.debugDescription)
         capture("Interactive visualization after JavaScript interaction", app)
+    }
+
+    @MainActor
+    func testLegacyQuestionSectionStaysHiddenWhileReading() {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["SNAPPY_SKIP_AGENT_SETUP"] = "1"
+        app.launchEnvironment["LEARNFOLD_READING_TEST_TOKEN"] = UUID().uuidString
+        app.launchEnvironment["LEARNFOLD_READING_TEST_APPEARANCE"] = "dark"
+        app.launchArguments = ["--ui-test-course-reading"]
+        app.launch()
+        let start = app.buttons["course-continue"]
+        XCTAssertTrue(start.waitForExistence(timeout: 25), app.debugDescription)
+        XCTAssertTrue(waitForHittable(start))
+        start.tap()
+        XCTAssertTrue(waitForPage("article-one", in: app))
+        let next = app.buttons["course-next-lesson"]
+        for _ in 0..<22 where !next.isHittable { app.swipeUp() }
+        app.swipeUp()
+        XCTAssertTrue(next.isHittable)
+        next.tap()
+        XCTAssertTrue(waitForPage("article-two", in: app))
+
+        // Pages written before the questions feature was removed still carry a
+        // trailing "Keep asking" list. Reading must not surface it, as prompts
+        // or as page text.
+        XCTAssertFalse(app.buttons["course-follow-up-question-0"].exists)
+        let questionBlocks = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH 'native-editor-block-' AND (label CONTAINS %@ OR value CONTAINS %@)",
+            "Why is the challenge random?", "Why is the challenge random?"
+        ))
+        XCTAssertEqual(questionBlocks.count, 0, app.debugDescription)
+        capture("Lesson end without question prompts", app)
+
+        // Editing still shows the leftover section so it can be deleted.
+        app.buttons["course-page-edit-toggle"].tap()
+        XCTAssertTrue(questionBlocks.firstMatch.waitForExistence(timeout: 10), app.debugDescription)
+        app.buttons["course-page-edit-toggle"].tap()
+        XCTAssertTrue(waitForPage("article-two", in: app))
+        XCTAssertEqual(questionBlocks.count, 0, app.debugDescription)
     }
 
     @MainActor

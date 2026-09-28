@@ -6,6 +6,7 @@ enum LocalAccountLoginFlowError: LocalizedError {
     case localServerUnavailable
     case remoteServer
     case loginDidNotAttach
+    case apiKeyDidNotAttach
 
     var errorDescription: String? {
         switch self {
@@ -15,13 +16,75 @@ enum LocalAccountLoginFlowError: LocalizedError {
             return "ChatGPT login is only available for the local server."
         case .loginDidNotAttach:
             return "ChatGPT login completed, but the local account did not attach."
+        case .apiKeyDidNotAttach:
+            return "The saved API key could not attach to local Codex."
         }
+    }
+}
+
+private extension Account {
+    var isChatGPT: Bool {
+        if case .chatgpt = self { return true }
+        return false
     }
 }
 
 @MainActor
 @Observable
 final class AppModel {
+    enum LocalAuthPreference: String {
+        case chatGPT
+        case apiKey
+    }
+
+    enum StoredLocalAuthPreference: Equatable {
+        case customProvider
+        case chatGPT
+        case apiKey
+        case none
+
+        var prefersAPIKey: Bool {
+            self == .customProvider || self == .apiKey
+        }
+    }
+
+    static func storedLocalAuthPreference(
+        baseURL: String?,
+        apiKey: String?,
+        hasChatGPTTokens: Bool,
+        explicitPreference: LocalAuthPreference? = nil
+    ) -> StoredLocalAuthPreference {
+        let hasAPIKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if explicitPreference == .chatGPT { return .chatGPT }
+        if explicitPreference == .apiKey && !hasAPIKey { return .none }
+        if hasAPIKey,
+           OpenAICompatibleProviderConfiguration.normalizedBaseURL(baseURL ?? "") != nil {
+            return .customProvider
+        }
+        if hasAPIKey { return .apiKey }
+        if hasChatGPTTokens { return .chatGPT }
+        return .none
+    }
+
+    private static let localAuthPreferenceKey = "learnfold.localCodexAuthPreference"
+
+    var localAuthPreference: LocalAuthPreference? {
+        UserDefaults.standard.string(forKey: Self.localAuthPreferenceKey)
+            .flatMap(LocalAuthPreference.init(rawValue:))
+    }
+
+    var prefersLocalChatGPTAuth: Bool {
+        localAuthPreference == .chatGPT
+    }
+
+    func setLocalAuthPreference(_ preference: LocalAuthPreference?) {
+        if let preference {
+            UserDefaults.standard.set(preference.rawValue, forKey: Self.localAuthPreferenceKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.localAuthPreferenceKey)
+        }
+    }
+
     private struct PendingThreadStateEvent: Sendable {
         let state: AppThreadStateRecord
         let sessionSummary: AppSessionSummary
@@ -459,6 +522,30 @@ final class AppModel {
             )
         )
         await refreshSnapshot()
+        guard case .chatgpt? = snapshot?.serverSnapshot(for: serverId)?.account else {
+            throw LocalAccountLoginFlowError.loginDidNotAttach
+        }
+        setLocalAuthPreference(.chatGPT)
+    }
+
+    func loginLocalChatGPTAccountOnThisDevice() async throws {
+        if snapshot?.servers.first(where: \.isLocal) == nil {
+            await refreshSnapshot()
+        }
+        let localServer = snapshot?.servers.first(where: \.isLocal)
+        let serverId: String
+        if let localServer, localServer.isConnected {
+            serverId = localServer.serverId
+        } else {
+            serverId = try await serverBridge.connectLocalServer(
+                serverId: localServer?.serverId ?? "local",
+                displayName: resolvedLocalServerDisplayName(),
+                host: "127.0.0.1",
+                port: 0
+            )
+            await refreshSnapshot()
+        }
+        try await loginLocalChatGPTAccount(serverId: serverId)
     }
 
     func ensureLocalAuthForThreadStart(serverId: String) async throws -> Bool {
@@ -472,6 +559,29 @@ final class AppModel {
         }
         guard server.isLocal else {
             return true
+        }
+        let preferredAuth = await preferredStoredLocalAuth()
+        if preferredAuth.prefersAPIKey {
+            if case .apiKey? = server.account { return true }
+            await restoreStoredLocalAuthState(serverId: serverId)
+            guard case .apiKey? = snapshot?.serverSnapshot(for: serverId)?.account else {
+                throw LocalAccountLoginFlowError.apiKeyDidNotAttach
+            }
+            return true
+        }
+        if preferredAuth == .chatGPT {
+            if case .chatgpt? = server.account { return true }
+            await restoreStoredLocalAuthState(serverId: serverId)
+            if case .chatgpt? = snapshot?.serverSnapshot(for: serverId)?.account { return true }
+            do {
+                try await loginLocalChatGPTAccount(serverId: serverId)
+            } catch ChatGPTOAuthError.cancelled {
+                return false
+            }
+            return true
+        }
+        if localAuthPreference == .apiKey {
+            throw LocalAccountLoginFlowError.apiKeyDidNotAttach
         }
         guard server.requiresOpenaiAuth else {
             return true
@@ -501,12 +611,9 @@ final class AppModel {
         guard let server = snapshot?.serverSnapshot(for: serverId), server.isLocal else {
             return false
         }
-        guard server.account == nil else {
-            return false
-        }
-        let storedApiKey = await loadStoredLocalApiKey()?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let storedTokens = await loadStoredLocalChatGPTTokens()
-        guard storedTokens != nil || storedApiKey?.isEmpty == false else {
+        let preferredAuth = await preferredStoredLocalAuth()
+        guard preferredAuth != .none,
+              !Self.account(server.account, matches: preferredAuth) else {
             return false
         }
 
@@ -519,7 +626,7 @@ final class AppModel {
             ]
         )
         await restoreStoredLocalAuthState(serverId: serverId)
-        return snapshot?.serverSnapshot(for: serverId)?.account != nil
+        return Self.account(snapshot?.serverSnapshot(for: serverId)?.account, matches: preferredAuth)
     }
 
     func resolvedLocalServerDisplayName() -> String {
@@ -558,6 +665,7 @@ final class AppModel {
     }
 
     func restoreStoredLocalAuthState(serverId: String) async {
+        let explicitPreference = localAuthPreference
         let storedApiKey: String?
         if let rawApiKey = await loadStoredLocalApiKey() {
             let trimmedApiKey = rawApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -565,12 +673,40 @@ final class AppModel {
         } else {
             storedApiKey = nil
         }
-        let storedTokens = await loadStoredLocalChatGPTTokens()
+        let storedBaseURL = await loadStoredLocalBaseURL()
+        let storedTokens: ChatGPTOAuthTokenBundle?
+        if explicitPreference == .chatGPT || (explicitPreference == nil && storedApiKey == nil) {
+            storedTokens = await loadStoredLocalChatGPTTokens()
+        } else {
+            storedTokens = nil
+        }
+        let preferredAuth = Self.storedLocalAuthPreference(
+            baseURL: storedBaseURL,
+            apiKey: storedApiKey,
+            hasChatGPTTokens: storedTokens != nil,
+            explicitPreference: explicitPreference
+        )
 
-        guard storedApiKey != nil || storedTokens != nil else { return }
+        guard preferredAuth != .none else { return }
+        if preferredAuth == .chatGPT && storedTokens == nil { return }
+
+        if preferredAuth.prefersAPIKey,
+           case .chatgpt? = snapshot?.serverSnapshot(for: serverId)?.account {
+            do {
+                _ = try await client.logoutAccount(serverId: serverId)
+                await refreshSnapshot()
+            } catch {
+                LLog.warn(
+                    "auth",
+                    "clearing attached ChatGPT session before API key restore failed",
+                    fields: ["serverId": serverId, "error": error.localizedDescription]
+                )
+            }
+        }
 
         for attempt in 0...Self.localAuthRestoreRetryDelays.count {
-            if let storedTokens,
+            if preferredAuth == .chatGPT,
+               let storedTokens,
                await restoreStoredLocalChatGPTAuth(
                 serverId: serverId,
                 storedTokens: storedTokens
@@ -579,7 +715,7 @@ final class AppModel {
                 return
             }
 
-            if let storedApiKey {
+            if preferredAuth.prefersAPIKey, let storedApiKey {
                 OpenAIApiKeyStore.shared.applyToEnvironment()
                 if await loginStoredLocalApiKeyAuth(serverId: serverId, apiKey: storedApiKey) {
                     await refreshSnapshot()
@@ -601,7 +737,7 @@ final class AppModel {
             try? await Task.sleep(for: delay)
         }
 
-        guard storedApiKey != nil else { return }
+        guard preferredAuth.prefersAPIKey, storedApiKey != nil else { return }
         OpenAIApiKeyStore.shared.applyToEnvironment()
         guard await reconnectLocalServerForStoredApiKeyRestore(serverId: serverId) else { return }
         if let storedApiKey, await loginStoredLocalApiKeyAuth(serverId: serverId, apiKey: storedApiKey) {
@@ -611,8 +747,12 @@ final class AppModel {
 
     func restoreMissingLocalAuthStateIfNeeded() async {
         guard let snapshot else { return }
+        let preferredAuth = await preferredStoredLocalAuth()
         let localServerIds = snapshot.servers
-            .filter { $0.isLocal && $0.account == nil }
+            .filter {
+                $0.isLocal && preferredAuth != .none
+                    && !Self.account($0.account, matches: preferredAuth)
+            }
             .map(\.serverId)
 
         guard !localServerIds.isEmpty else { return }
@@ -655,6 +795,70 @@ final class AppModel {
                 fields: ["error": error.localizedDescription]
             )
             return nil
+        }
+    }
+
+    private func loadStoredLocalBaseURL() async -> String? {
+        do {
+            return try OpenAIApiKeyStore.shared.loadBaseURL()
+        } catch let error as NSError where isTransientLocalKeychainFailure(error) {
+            for delay in [0.5, 1.0, 2.0] {
+                LLog.warn(
+                    "auth",
+                    "local custom provider URL unavailable until keychain unlock; retrying",
+                    fields: ["delaySeconds": delay]
+                )
+                try? await Task.sleep(for: .seconds(delay))
+                do {
+                    return try OpenAIApiKeyStore.shared.loadBaseURL()
+                } catch let retryError as NSError where isTransientLocalKeychainFailure(retryError) {
+                    continue
+                } catch {
+                    LLog.error(
+                        "auth",
+                        "loading stored local custom provider URL failed",
+                        fields: ["error": error.localizedDescription]
+                    )
+                    return nil
+                }
+            }
+            return nil
+        } catch {
+            LLog.error(
+                "auth",
+                "loading stored local custom provider URL failed",
+                fields: ["error": error.localizedDescription]
+            )
+            return nil
+        }
+    }
+
+    private func preferredStoredLocalAuth() async -> StoredLocalAuthPreference {
+        let explicitPreference = localAuthPreference
+        let storedBaseURL = await loadStoredLocalBaseURL()
+        let storedApiKey = await loadStoredLocalApiKey()
+        let storedTokens: ChatGPTOAuthTokenBundle?
+        if explicitPreference == .chatGPT || (explicitPreference == nil && storedApiKey == nil) {
+            storedTokens = await loadStoredLocalChatGPTTokens()
+        } else {
+            storedTokens = nil
+        }
+        return Self.storedLocalAuthPreference(
+            baseURL: storedBaseURL,
+            apiKey: storedApiKey,
+            hasChatGPTTokens: storedTokens != nil,
+            explicitPreference: explicitPreference
+        )
+    }
+
+    private static func account(_ account: Account?, matches preference: StoredLocalAuthPreference) -> Bool {
+        switch preference {
+        case .customProvider, .apiKey:
+            return account == .apiKey
+        case .chatGPT:
+            return account?.isChatGPT == true
+        case .none:
+            return account == nil
         }
     }
 

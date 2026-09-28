@@ -355,6 +355,26 @@ enum CourseChatTimelinePolicy {
             })
     }
 
+    static func shouldShowIntro(in items: [ConversationItem]) -> Bool {
+        !items.contains(where: { item in
+            if case .user = item.content { return true }
+            return false
+        })
+    }
+
+    static func firstLearnerAwaitingReplyID(in items: [ConversationItem]) -> String? {
+        let learnerItems = items.filter { item in
+            if case .user = item.content { return true }
+            return false
+        }
+        guard learnerItems.count == 1,
+              let learner = learnerItems.first,
+              !hasAssistantContentAfterLatestLearner(in: items) else {
+            return nil
+        }
+        return learner.id
+    }
+
     private struct MessageSignature: Hashable {
         enum Role: Hashable {
             case learner
@@ -436,7 +456,9 @@ enum CourseChatTimelinePolicy {
             }
             let projectedText: String?
             if let learnerMessage = remoteLearnerMessage(from: data.text) {
-                projectedText = learnerMessage
+                projectedText = CoursePageChatContext.learnerQuestion(from: learnerMessage) ?? learnerMessage
+            } else if let question = CoursePageChatContext.learnerQuestion(from: data.text) {
+                projectedText = question
             } else if hidesSelectionEnvelope {
                 projectedText = selectionQuestion(from: data.text)
             } else {
@@ -766,6 +788,7 @@ struct CourseChatView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var store: CourseExperienceStore
     let selectionContext: CourseTextReference?
+    let pageContext: CoursePageChatContext?
     let selectionDiscussionID: UUID?
     let showsDismissButton: Bool
     let onSelectionDiscussionReplaced: (CourseSelectionDiscussion) -> Void
@@ -775,6 +798,14 @@ struct CourseChatView: View {
     @State private var showsFileImporter = false
     @State private var attachmentError: CourseSourceAttachmentErrorPresentation?
     @State private var hasSentSelectionContext = false
+    /// The page snapshot is context for the thread, not for each turn. Sending
+    /// it again on every message re-embedded the whole page (up to 12,000
+    /// characters) into the transcript; the agent can re-read the page by its
+    /// page_id, which the first prompt gives it.
+    @State private var hasSentPageContext = false
+    /// A follow-up question tapped on the page waits here until the agent can
+    /// take it, so the learner never has to retype it.
+    @State private var pendingInitialQuestion: String?
     @State private var isNearBottom = true
     @State private var autoFollowStreaming = true
     @State private var userIsDraggingScroll = false
@@ -782,24 +813,29 @@ struct CourseChatView: View {
     @State private var isResolvingDiscussion = false
     @State private var resolveError: String?
     @State private var isReconnectingAgent = false
+    @State private var signInTask: Task<Void, Never>?
     @State private var draftWorkspaceID: String?
     @FocusState private var composerFocused: Bool
 
     init(
         store: CourseExperienceStore,
         selectionContext: CourseTextReference? = nil,
+        pageContext: CoursePageChatContext? = nil,
         selectionDiscussionID: UUID? = nil,
         showsDismissButton: Bool = false,
         onSelectionDiscussionReplaced: @escaping (CourseSelectionDiscussion) -> Void = { _ in }
     ) {
         self.store = store
         self.selectionContext = selectionContext
+        self.pageContext = pageContext
         self.selectionDiscussionID = selectionDiscussionID
         self.showsDismissButton = showsDismissButton
         self.onSelectionDiscussionReplaced = onSelectionDiscussionReplaced
         _draftWorkspaceID = State(
             initialValue: store.draftWorkspaceID(for: selectionDiscussionID)
         )
+        _pendingInitialQuestion = State(initialValue: pageContext?.initialQuestion)
+        _inputText = State(initialValue: pageContext?.initialQuestion ?? "")
     }
 
     private var activeThreadKey: ThreadKey? {
@@ -832,6 +868,12 @@ struct CourseChatView: View {
         CourseChatTimelinePolicy.mergedConversationItems(
             localMessages: localMessages,
             liveItems: liveConversationItems
+        )
+    }
+
+    private var firstLearnerAwaitingReplyID: String? {
+        CourseChatTimelinePolicy.firstLearnerAwaitingReplyID(
+            in: remoteTimelineItems
         )
     }
 
@@ -978,7 +1020,7 @@ struct CourseChatView: View {
     }
 
     private var codexNeedsSignIn: Bool {
-        CourseChatAuthPolicy.needsSignIn(
+        let needsAuthentication = CourseChatAuthPolicy.needsSignIn(
             isCodex: displayedAgentID == .codex,
             requiresOpenAIAuth: courseServer?.requiresOpenaiAuth == true,
             hasAccount: courseServer?.account != nil,
@@ -987,11 +1029,28 @@ struct CourseChatView: View {
                 for: selectionDiscussionID
             )
         )
+        return needsAuthentication && !usesCodexAPIKeyAuth
+    }
+
+    private var usesCodexAPIKeyAuth: Bool {
+        if appModel.prefersLocalChatGPTAuth { return false }
+        if appModel.localAuthPreference == .apiKey { return true }
+        return AppModel.storedLocalAuthPreference(
+            baseURL: try? OpenAIApiKeyStore.shared.loadBaseURL(),
+            apiKey: try? OpenAIApiKeyStore.shared.load(),
+            hasChatGPTTokens: false,
+            explicitPreference: appModel.localAuthPreference
+        ).prefersAPIKey
     }
 
     private var isAgentReady: Bool {
         if CourseAgentProvider.usesLocalMessages(displayedAgentID) {
             return displayedConnectionState == .connected
+        }
+        if displayedAgentID == .codex,
+           usesCodexAPIKeyAuth,
+           courseServer?.account != .apiKey {
+            return false
         }
         return CourseChatAuthPolicy.isReady(
             isCodex: displayedAgentID == .codex,
@@ -1017,7 +1076,22 @@ struct CourseChatView: View {
                                 agentName: displayedAgentID.displayLabel,
                                 focusedQAState: focusedQAState
                             )
-                        } else {
+                        } else if let pageContext {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label(pageContext.pageTitle, systemImage: "doc.text")
+                                    .font(.headline)
+                                Text("Ask anything about this page. Its content is included with your message.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                            .background(.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 18))
+                            .accessibilityElement(children: .contain)
+                            .accessibilityIdentifier("course-page-chat-context")
+                        } else if CourseChatTimelinePolicy.shouldShowIntro(
+                            in: remoteTimelineItems
+                        ) {
                             CourseChatIntro(
                                 agentID: displayedAgentID,
                                 supportsBinarySources: CourseAgentProvider.supportsBinarySources(
@@ -1050,7 +1124,9 @@ struct CourseChatView: View {
                             }
                         } else if !remoteTimelineItems.isEmpty || liveThread != nil {
                             ConversationTurnTimeline(
-                                items: remoteTimelineItems,
+                                items: CourseChatQuestionPolicy.strippingQuestions(
+                                    from: remoteTimelineItems
+                                ),
                                 isLive: liveThread?.hasActiveTurn == true,
                                 serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
                                 originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
@@ -1077,6 +1153,16 @@ struct CourseChatView: View {
                             )
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .id("course-live-timeline")
+                        }
+
+                        if let pendingQuestion {
+                            CourseChatQuestionOptionsView(
+                                question: pendingQuestion,
+                                isEnabled: canSendQuestionOption,
+                                onSelect: sendQuestionOption
+                            )
+                            .padding(.top, 2)
+                            .id("course-chat-question")
                         }
 
                         if isAgentWorking && displayedAgentError == nil {
@@ -1141,6 +1227,20 @@ struct CourseChatView: View {
                                 .id("course-brief")
                         }
 
+                        if selectionDiscussionID == nil,
+                           selectionContext == nil,
+                           pageContext == nil,
+                           !isAgentWorking,
+                           let planIssue = store.coursePlanIssue {
+                            CoursePlanIssueCard(message: planIssue) {
+                                store.requestCoursePlanCorrection(
+                                    appModel: appModel,
+                                    appState: appState
+                                )
+                            }
+                            .id("course-plan-issue")
+                        }
+
                         if let agentError = displayedAgentError {
                             let recoveryPresentation =
                                 store.hermesRecoveryPresentation(
@@ -1183,6 +1283,12 @@ struct CourseChatView: View {
                                 ),
                                 submissionRecoveryState: displayedSubmissionRecoveryState,
                                 hermesRecoveryProvenance: recoveryPresentation?.provenance,
+                                isCheckingStatus: store.isCheckingSubmissionStatus(
+                                    selectionDiscussionID: selectionDiscussionID
+                                ),
+                                statusCheckOutcome: store.submissionStatusCheckOutcome(
+                                    selectionDiscussionID: selectionDiscussionID
+                                ),
                                 onReconnect: reconnectAgent,
                                 onRetrySubmission: retryCurrentSubmission,
                                 onCheckStatus: checkSubmissionStatus,
@@ -1260,7 +1366,10 @@ struct CourseChatView: View {
                 .onChange(of: localMessages.count) { _, _ in
                     guard CourseAgentProvider.usesLocalMessages(displayedAgentID) else { return }
                     withAnimation(.easeOut(duration: 0.3)) {
-                        if store.showsBrief {
+                        if firstLearnerAwaitingReplyID != nil,
+                           let firstLearner = localMessages.first(where: { $0.role == .learner }) {
+                            proxy.scrollTo(firstLearner.id, anchor: .top)
+                        } else if store.showsBrief {
                             proxy.scrollTo("course-brief", anchor: .bottom)
                         } else if let last = localMessages.last {
                             proxy.scrollTo(last.id, anchor: .bottom)
@@ -1269,6 +1378,9 @@ struct CourseChatView: View {
                 }
                 .onChange(of: remoteTimelineItems.count) { _, _ in
                     guard CourseAgentProvider.usesAppServer(displayedAgentID) else { return }
+                    if selectionDiscussionID == nil, selectionContext == nil, pageContext == nil {
+                        store.applyCompletedCoursePlanToolCalls(appModel: appModel)
+                    }
                     requestFollowScrollAfterLayout(proxy)
                 }
                 .onChange(of: localStreamingTextLength) { _, _ in
@@ -1296,7 +1408,7 @@ struct CourseChatView: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("course-request-lifecycle")
         .accessibilityValue(requestLifecycle?.rawValue ?? "")
-        .safeAreaInset(edge: .bottom, spacing: 0) {
+        .courseBottomBar {
             courseChatComposerInset
         }
         .litterFontFamily(.system)
@@ -1304,11 +1416,15 @@ struct CourseChatView: View {
         // zoom is a separate preference and otherwise makes this screen's
         // messages larger than its surrounding controls and guidance.
         .environment(\.textScale, 1.0)
-        .navigationTitle(selectionContext == nil ? (store.generatedCourseID == nil ? "New Course" : "Course Agent") : "Ask about this passage")
+        .navigationTitle(pageContext != nil ? "Ask AI" : selectionContext == nil ? (store.generatedCourseID == nil ? "New Course" : "Course Agent") : "Ask about this passage")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            if let draft = store.takeDraft(for: selectionDiscussionID) {
+            if pendingInitialQuestion == nil, let draft = store.takeDraft(for: selectionDiscussionID) {
                 inputText = draft
+            }
+            sendPendingInitialQuestionIfReady()
+            if selectionDiscussionID == nil, selectionContext == nil, pageContext == nil {
+                store.applyCompletedCoursePlanToolCalls(appModel: appModel)
             }
             hasSentSelectionContext =
                 selectionDiscussionID.map {
@@ -1316,11 +1432,22 @@ struct CourseChatView: View {
                 } ?? false
         }
         .onDisappear {
+            signInTask?.cancel()
+            signInTask = nil
             store.saveDraft(
                 inputText,
                 for: selectionDiscussionID,
                 expectedWorkspaceID: draftWorkspaceID
             )
+        }
+        .onChange(of: isAgentReady) { _, _ in
+            sendPendingInitialQuestionIfReady()
+        }
+        .onChange(of: isAgentWorking) { _, working in
+            sendPendingInitialQuestionIfReady()
+            if !working, selectionDiscussionID == nil, selectionContext == nil, pageContext == nil {
+                store.applyCompletedCoursePlanToolCalls(appModel: appModel)
+            }
         }
         .onChange(of: store.lastAcceptedSelectionContextID) { _, acceptedID in
             if acceptedID == selectionContext?.id {
@@ -1328,7 +1455,8 @@ struct CourseChatView: View {
             }
         }
         .onChange(of: restoredDraftText) { _, restoredDraft in
-            guard let restoredDraft,
+            guard pendingInitialQuestion == nil,
+                  let restoredDraft,
                   !restoredDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   restoredDraft != inputText else { return }
             inputText = restoredDraft
@@ -1366,68 +1494,66 @@ struct CourseChatView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 6) {
-                    if selectionDiscussionID != nil {
-                        Button("Resolve") {
-                            resolveDiscussion()
-                        }
-                        .font(.subheadline.weight(.semibold))
-                        .disabled(
-                            isResolvingDiscussion ||
-                                isPreparingSelectionDiscussion ||
-                                isAgentWorking ||
-                                blocksNewSubmissionForHermesRecovery
-                        )
-                        .accessibilityIdentifier("course-chat-resolve")
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if selectionDiscussionID != nil {
+                    Button("Resolve") {
+                        resolveDiscussion()
                     }
-                    if selectionDiscussionID == nil,
-                       CourseAgentProvider.isApple(displayedAgentID) {
-                        Menu {
-                            Button {
-                                store.switchCurrentAppleProvider(
-                                    to: CourseAgentProvider.applePrivateCloud
-                                )
-                            } label: {
-                                Label(
-                                    "Private Cloud Compute",
-                                    systemImage: displayedAgentID == CourseAgentProvider.applePrivateCloud
-                                        ? "checkmark.circle.fill"
-                                        : "cloud"
-                                )
-                            }
-                            .disabled(
-                                !store.canSwitchCurrentThread(
-                                    to: CourseAgentProvider.applePrivateCloud
-                                )
-                            )
-
-                            Button {
-                                store.switchCurrentAppleProvider(
-                                    to: CourseAgentProvider.appleOnDevice
-                                )
-                            } label: {
-                                Label(
-                                    "On‑Device",
-                                    systemImage: displayedAgentID == CourseAgentProvider.appleOnDevice
-                                        ? "checkmark.circle.fill"
-                                        : "iphone"
-                                )
-                            }
-                            .disabled(
-                                !store.canSwitchCurrentThread(
-                                    to: CourseAgentProvider.appleOnDevice
-                                )
+                    .font(.subheadline.weight(.semibold))
+                    .disabled(
+                        isResolvingDiscussion ||
+                            isPreparingSelectionDiscussion ||
+                            isAgentWorking ||
+                            blocksNewSubmissionForHermesRecovery
+                    )
+                    .accessibilityIdentifier("course-chat-resolve")
+                }
+                if selectionDiscussionID == nil,
+                   CourseAgentProvider.isApple(displayedAgentID) {
+                    Menu {
+                        Button {
+                            store.switchCurrentAppleProvider(
+                                to: CourseAgentProvider.applePrivateCloud
                             )
                         } label: {
-                            Image(systemName: "arrow.triangle.2.circlepath")
+                            Label(
+                                "Private Cloud Compute",
+                                systemImage: displayedAgentID == CourseAgentProvider.applePrivateCloud
+                                    ? "checkmark.circle.fill"
+                                    : "cloud"
+                            )
                         }
-                        .disabled(isAgentWorking)
-                        .accessibilityLabel("Switch Apple model")
-                        .accessibilityIdentifier("course-chat-apple-provider-switch")
+                        .disabled(
+                            !store.canSwitchCurrentThread(
+                                to: CourseAgentProvider.applePrivateCloud
+                            )
+                        )
+
+                        Button {
+                            store.switchCurrentAppleProvider(
+                                to: CourseAgentProvider.appleOnDevice
+                            )
+                        } label: {
+                            Label(
+                                "On‑Device",
+                                systemImage: displayedAgentID == CourseAgentProvider.appleOnDevice
+                                    ? "checkmark.circle.fill"
+                                    : "iphone"
+                            )
+                        }
+                        .disabled(
+                            !store.canSwitchCurrentThread(
+                                to: CourseAgentProvider.appleOnDevice
+                            )
+                        )
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath")
                     }
-                    agentStatusControl
+                    .disabled(isAgentWorking)
+                    .accessibilityLabel("Switch Apple model")
+                    .accessibilityIdentifier("course-chat-apple-provider-switch")
                 }
+                agentStatusControl
             }
         }
         .fileImporter(
@@ -1515,6 +1641,9 @@ struct CourseChatView: View {
                     allowsUnknownSubmissionAbandon: store.canAbandonUnconfirmedSubmission(
                         selectionDiscussionID: selectionDiscussionID
                     ),
+                    isCheckingStatus: store.isCheckingSubmissionStatus(
+                        selectionDiscussionID: selectionDiscussionID
+                    ),
                     onCheckStatus: checkSubmissionStatus,
                     onDiscardDraft: discardRecoveredSubmission,
                     onAbandonUnknownSubmission: abandonUnconfirmedSubmission
@@ -1522,7 +1651,9 @@ struct CourseChatView: View {
             }
             CourseChatComposer(
                 inputText: $inputText,
-                prompt: selectionDiscussionID == nil
+                prompt: pendingQuestion != nil
+                    ? CourseChatQuestion.freeTextPrompt
+                    : pageContext != nil ? "Ask about this page" : selectionDiscussionID == nil
                     ? "Message your course agent"
                     : "Ask a question",
                 sources: displayedSources,
@@ -1553,6 +1684,45 @@ struct CourseChatView: View {
         }
     }
 
+    /// The agent's newest multiple-choice question while it awaits a reply.
+    /// It disappears as soon as the learner sends anything, because that
+    /// message becomes the newest one.
+    private var pendingQuestion: CourseChatQuestion? {
+        guard !isAgentWorking, displayedAgentError == nil else { return nil }
+        if CourseAgentProvider.usesLocalMessages(displayedAgentID) {
+            return CourseChatQuestionPolicy.pendingQuestion(in: localMessages)
+        }
+        return CourseChatQuestionPolicy.pendingQuestion(in: remoteTimelineItems)
+    }
+
+    private var canSendQuestionOption: Bool {
+        isAgentReady
+            && !isAgentWorking
+            && !isPreparingSelectionDiscussion
+            && !isPreparingDisplayedSource
+            && displayedSubmissionRecoveryState?.blocksNewSubmission != true
+            && !blocksNewSubmissionForHermesRecovery
+    }
+
+    /// Sends a tapped answer through the ordinary composer path so every
+    /// readiness guard applies. If sending is refused, the answer stays in
+    /// the composer for the learner to send later.
+    private func sendQuestionOption(_ option: String) {
+        inputText = option
+        sendCurrentMessage()
+    }
+
+    /// Sends the tapped follow-up question once. If the agent is not ready the
+    /// question stays in the composer for the learner to send later.
+    private func sendPendingInitialQuestionIfReady() {
+        guard let question = pendingInitialQuestion,
+              isAgentReady,
+              !isAgentWorking,
+              inputText == question else { return }
+        pendingInitialQuestion = nil
+        sendCurrentMessage()
+    }
+
     private func sendCurrentMessage() {
         guard !isPreparingSelectionDiscussion,
               !isPreparingDisplayedSource,
@@ -1564,11 +1734,13 @@ struct CourseChatView: View {
         let accepted = store.sendMessage(
             text,
             reference: reference,
+            pageContext: hasSentPageContext ? nil : pageContext,
             selectionDiscussionID: selectionDiscussionID,
             appModel: appModel,
             appState: appState
         )
         guard accepted else { return }
+        hasSentPageContext = true
         inputText = ""
         composerFocused = false
         autoFollowStreaming = true
@@ -1688,15 +1860,43 @@ struct CourseChatView: View {
             Circle().fill(color).frame(width: 7, height: 7)
             AgentIconView(kind: displayedAgentID, size: 23)
         }
-        .frame(minWidth: 44, minHeight: 44)
-        .padding(.horizontal, 4)
-        .background(.thinMaterial, in: Capsule())
+
     }
 
     private func reconnectAgent() {
-        Task {
-            guard !isReconnectingAgent else { return }
-            isReconnectingAgent = true
+        guard !isReconnectingAgent else { return }
+        isReconnectingAgent = true
+        if codexNeedsSignIn {
+            signInTask = Task { @MainActor in
+                defer {
+                    isReconnectingAgent = false
+                    signInTask = nil
+                }
+                do {
+                    try await appModel.loginLocalChatGPTAccountOnThisDevice()
+                } catch ChatGPTOAuthError.cancelled {
+                    guard !Task.isCancelled else { return }
+                    setDisplayedSignInError("ChatGPT sign-in was cancelled. Try again to continue.")
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    setDisplayedSignInError("ChatGPT sign-in did not finish. Please try again.")
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                setDisplayedSignInError(nil)
+                if let selectionDiscussionID {
+                    await store.reconnectSelectionDiscussion(
+                        id: selectionDiscussionID,
+                        appModel: appModel
+                    )
+                } else {
+                    await store.refreshAgentReadiness(appModel: appModel)
+                }
+            }
+            return
+        }
+        Task { @MainActor in
             defer { isReconnectingAgent = false }
             if let selectionDiscussionID {
                 await store.reconnectSelectionDiscussion(
@@ -1724,11 +1924,23 @@ struct CourseChatView: View {
         }
     }
 
+    private func setDisplayedSignInError(_ message: String?) {
+        if let selectionDiscussionID {
+            store.selectionDiscussionErrors[selectionDiscussionID] = message
+        } else {
+            store.agentError = message
+        }
+    }
+
     private func requestFollowScrollAfterLayout(_ proxy: ScrollViewProxy) {
         guard !followScrollScheduled else { return }
         followScrollScheduled = true
         DispatchQueue.main.async {
             followScrollScheduled = false
+            if let firstLearnerAwaitingReplyID, !userIsDraggingScroll {
+                proxy.scrollTo(firstLearnerAwaitingReplyID, anchor: .top)
+                return
+            }
             guard CourseChatScrollPolicy.shouldFollow(
                 autoFollowEnabled: autoFollowStreaming,
                 userIsDragging: userIsDraggingScroll
@@ -1796,6 +2008,56 @@ private struct CourseRecoveredDraftProvenanceView: View {
     }
 }
 
+/// An in-flight status check does real network work, so the card shows a
+/// determinate-looking progress row instead of leaving the tap unacknowledged.
+private struct CourseStatusCheckProgressView: View {
+    var body: some View {
+        // The action button owns the spinner; this line carries the
+        // explanation so the two do not compete for attention.
+        Label("Checking with the agent…", systemImage: "arrow.triangle.2.circlepath")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Checking with the agent")
+            .accessibilityIdentifier("course-agent-error.status-check.progress")
+    }
+}
+
+/// A finished check often leaves the recovery state unchanged. Without this
+/// line the card looks identical before and after, so the learner cannot tell
+/// the check ran at all.
+private struct CourseStatusCheckOutcomeView: View {
+    let outcome: CourseSubmissionStatusCheckOutcome
+
+    var body: some View {
+        Label(outcome.statusText, systemImage: systemImage)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(foreground)
+            .accessibilityIdentifier("course-agent-error.status-check.outcome")
+    }
+
+    private var foreground: Color {
+        switch outcome.result {
+        case .stillUnconfirmed, .resolved:
+            Color.secondary
+        case .failed:
+            CourseRecoveryVisualStyle.destructiveAction
+        }
+    }
+
+    private var systemImage: String {
+        switch outcome.result {
+        case .stillUnconfirmed:
+            "clock.badge.questionmark"
+        case .resolved:
+            "checkmark.circle"
+        case .failed:
+            "exclamationmark.circle"
+        }
+    }
+}
+
 private enum CourseRecoveryVisualStyle {
     static let supportingText = Color.primary.opacity(0.78)
     static let technicalText = Color.primary.opacity(0.72)
@@ -1809,6 +2071,107 @@ private enum CourseRecoveryVisualStyle {
             ? UIColor(red: 0.38, green: 0, blue: 0.04, alpha: 1)
             : UIColor(red: 0.55, green: 0, blue: 0.08, alpha: 1)
     })
+}
+
+/// Recovery cards mix a primary recovery action with destructive and
+/// dismissive ones. The system styles render those three roles at nearly the
+/// same visual weight, so the card states its own hierarchy: one filled accent
+/// action, tinted secondary/destructive actions, and a quiet dismiss.
+private struct CourseRecoveryActionButtonStyle: ButtonStyle {
+    enum Emphasis {
+        case primary
+        case secondary
+        case destructive
+        case quiet
+    }
+
+    let emphasis: Emphasis
+    var expandsHorizontally: Bool = true
+    /// A button that is disabled because its own work is running should read
+    /// as busy, not as unavailable.
+    var isBusy: Bool = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        ActionBody(
+            configuration: configuration,
+            emphasis: emphasis,
+            expandsHorizontally: expandsHorizontally,
+            isBusy: isBusy
+        )
+    }
+
+    private struct ActionBody: View {
+        let configuration: Configuration
+        let emphasis: Emphasis
+        let expandsHorizontally: Bool
+        let isBusy: Bool
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            configuration.label
+                .font(.subheadline.weight(emphasis == .quiet ? .medium : .semibold))
+                .foregroundStyle(foreground)
+                .tint(foreground)
+                .padding(.horizontal, emphasis == .quiet ? 12 : 18)
+                .padding(.vertical, 12)
+                .frame(
+                    maxWidth: expandsHorizontally ? .infinity : nil,
+                    minHeight: 44
+                )
+                .background {
+                    if emphasis != .quiet {
+                        Capsule(style: .continuous).fill(background)
+                    }
+                }
+                .overlay {
+                    if let border {
+                        Capsule(style: .continuous)
+                            .strokeBorder(border, lineWidth: 1)
+                    }
+                }
+                .contentShape(Capsule(style: .continuous))
+                .opacity(isEnabled ? 1 : (isBusy ? 0.85 : 0.45))
+                .scaleEffect(configuration.isPressed ? 0.975 : 1)
+                .animation(.snappy(duration: 0.16), value: configuration.isPressed)
+        }
+
+        private var foreground: Color {
+            switch emphasis {
+            case .primary:
+                Color.white
+            case .secondary:
+                Color.primary
+            case .destructive:
+                CourseRecoveryVisualStyle.destructiveAction
+            case .quiet:
+                Color.secondary
+            }
+        }
+
+        private var background: Color {
+            switch emphasis {
+            case .primary:
+                Color.accentColor
+            case .secondary:
+                Color.primary.opacity(0.08)
+            case .destructive:
+                Color.red.opacity(0.12)
+            case .quiet:
+                Color.clear
+            }
+        }
+
+        private var border: Color? {
+            switch emphasis {
+            case .primary, .quiet:
+                nil
+            case .secondary:
+                Color.primary.opacity(0.12)
+            case .destructive:
+                Color.red.opacity(0.24)
+            }
+        }
+    }
 }
 
 private enum CourseHermesRecoveryCopy {
@@ -1919,11 +2282,9 @@ private struct CourseHermesRecoveryProgressView: View {
             } label: {
                 Text("Stop Recovery…")
                     .font(.subheadline.weight(.semibold))
-                    .frame(minHeight: 44)
-                    .contentShape(Rectangle())
             }
             .buttonStyle(.bordered)
-            .tint(.primary)
+            .controlSize(.large)
             .accessibilityIdentifier("course-hermes-recovery.action.stop")
 
             CourseHermesRecoveryProvenanceView(provenance: provenance)
@@ -2072,6 +2433,8 @@ private struct CourseAgentErrorCard: View {
     let allowsUnknownSubmissionAbandon: Bool
     let submissionRecoveryState: CourseAgentSubmissionRecoveryState?
     let hermesRecoveryProvenance: CourseHermesRecoveryProvenance?
+    var isCheckingStatus = false
+    var statusCheckOutcome: CourseSubmissionStatusCheckOutcome?
     let onReconnect: () -> Void
     let onRetrySubmission: () -> Void
     let onCheckStatus: () -> Void
@@ -2112,6 +2475,12 @@ private struct CourseAgentErrorCard: View {
                 CourseRecoveredDraftProvenanceView(text: provenance)
             }
 
+            if isCheckingStatus {
+                CourseStatusCheckProgressView()
+            } else if let statusCheckOutcome {
+                CourseStatusCheckOutcomeView(outcome: statusCheckOutcome)
+            }
+
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) {
                     actionButtons(expandsHorizontally: false)
@@ -2120,7 +2489,7 @@ private struct CourseAgentErrorCard: View {
                     actionButtons(expandsHorizontally: true)
                 }
             }
-            .controlSize(.large)
+            .controlSize(.regular)
 
             if let hermesRecoveryProvenance {
                 CourseHermesRecoveryProvenanceView(
@@ -2129,8 +2498,12 @@ private struct CourseAgentErrorCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(16)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("course-agent-error")
         .confirmationDialog(
@@ -2272,7 +2645,9 @@ private struct CourseAgentErrorCard: View {
            submissionRecoveryState == .acceptedReplyIncomplete {
             return "Reply interrupted"
         }
-        return "\(agentName) couldn’t continue"
+        // A failed agent switch can report the attempted provider while the
+        // selected provider is unchanged. Do not attribute that error to it.
+        return "Unable to continue"
     }
 
     private var errorSystemImage: String {
@@ -2331,12 +2706,14 @@ private struct CourseAgentErrorCard: View {
         }
 
         if allowsDismissal {
-            recoveryActionButton(
-                dismissalTitle,
-                identifier: "course-agent-error.action.dismiss",
-                expandsHorizontally: expandsHorizontally,
-                action: onDismiss
-            )
+            Button(dismissalTitle, action: onDismiss)
+                .buttonStyle(
+                    CourseRecoveryActionButtonStyle(
+                        emphasis: .quiet,
+                        expandsHorizontally: expandsHorizontally
+                    )
+                )
+                .accessibilityIdentifier("course-agent-error.action.dismiss")
         }
     }
 
@@ -2344,38 +2721,40 @@ private struct CourseAgentErrorCard: View {
     private func standardActionButtons(expandsHorizontally: Bool) -> some View {
         if needsAuthentication {
             Button(action: onReconnect) {
-                Group {
-                    if isConnecting {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Label("Sign In", systemImage: "person.crop.circle.badge.checkmark")
-                    }
-                }
-                .frame(
-                    maxWidth: expandsHorizontally ? .infinity : nil,
-                    minHeight: 44
+                actionLabel(
+                    "Sign In",
+                    systemImage: "person.crop.circle.badge.checkmark",
+                    isLoading: isConnecting,
+                    loadingTitle: "Signing In…",
+                    expandsHorizontally: expandsHorizontally
                 )
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(
+                CourseRecoveryActionButtonStyle(
+                    emphasis: .primary,
+                    expandsHorizontally: expandsHorizontally,
+                    isBusy: isConnecting
+                )
+            )
             .disabled(isConnecting)
             .accessibilityIdentifier("course-agent-error.action.sign-in")
         } else if showsReconnectAction {
             Button(action: onReconnect) {
-                Group {
-                    if isConnecting {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Label("Reconnect", systemImage: "arrow.clockwise")
-                    }
-                }
-                .frame(
-                    maxWidth: expandsHorizontally ? .infinity : nil,
-                    minHeight: 44
+                actionLabel(
+                    "Reconnect",
+                    systemImage: "arrow.clockwise",
+                    isLoading: isConnecting,
+                    loadingTitle: "Reconnecting…",
+                    expandsHorizontally: expandsHorizontally
                 )
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(
+                CourseRecoveryActionButtonStyle(
+                    emphasis: .primary,
+                    expandsHorizontally: expandsHorizontally,
+                    isBusy: isConnecting
+                )
+            )
             .disabled(isConnecting)
             .accessibilityIdentifier("course-agent-error.action.reconnect")
         } else if let submissionRecoveryState {
@@ -2384,21 +2763,30 @@ private struct CourseAgentErrorCard: View {
                 Button(action: onRetrySubmission) {
                     actionLabel("Try Again", expandsHorizontally: expandsHorizontally)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(
+                    CourseRecoveryActionButtonStyle(
+                        emphasis: .primary,
+                        expandsHorizontally: expandsHorizontally
+                    )
+                )
                 .accessibilityIdentifier("course-agent-error.action.retry-submission")
                 Button(role: .destructive) {
                     showsDiscardConfirmation = true
                 } label: {
                     actionLabel("Discard Draft", expandsHorizontally: expandsHorizontally)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(
+                    CourseRecoveryActionButtonStyle(
+                        emphasis: .destructive,
+                        expandsHorizontally: expandsHorizontally
+                    )
+                )
                 .accessibilityIdentifier("course-agent-error.action.discard-draft")
             case .acceptanceUnknown:
-                Button(action: onCheckStatus) {
-                    actionLabel("Check Status", expandsHorizontally: expandsHorizontally)
-                }
-                .buttonStyle(.borderedProminent)
-                .accessibilityIdentifier("course-agent-error.action.check-status")
+                checkStatusButton(
+                    title: "Check Status",
+                    expandsHorizontally: expandsHorizontally
+                )
                 if allowsUnknownSubmissionAbandon {
                     Button(role: .destructive) {
                         showsUnknownAbandonConfirmation = true
@@ -2408,22 +2796,52 @@ private struct CourseAgentErrorCard: View {
                             expandsHorizontally: expandsHorizontally
                         )
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(
+                        CourseRecoveryActionButtonStyle(
+                            emphasis: .destructive,
+                            expandsHorizontally: expandsHorizontally
+                        )
+                    )
+                    // A status check is mid-flight reconciliation; abandoning
+                    // the draft underneath it would race that work.
+                    .disabled(isCheckingStatus)
                     .accessibilityIdentifier(
                         "course-agent-error.action.abandon-local-draft"
                     )
                 }
             case .acceptedReplyIncomplete:
-                Button(action: onCheckStatus) {
-                    actionLabel(
-                        agentName == CourseAgentProvider.hosted.displayLabel ? "Reload Conversation" : "Check Status",
-                        expandsHorizontally: expandsHorizontally
-                    )
-                }
-                .buttonStyle(.borderedProminent)
-                .accessibilityIdentifier("course-agent-error.action.check-status")
+                checkStatusButton(
+                    title: agentName == CourseAgentProvider.hosted.displayLabel
+                        ? "Reload Conversation"
+                        : "Check Status",
+                    expandsHorizontally: expandsHorizontally
+                )
             }
         }
+    }
+
+    private func checkStatusButton(
+        title: String,
+        expandsHorizontally: Bool
+    ) -> some View {
+        Button(action: onCheckStatus) {
+            actionLabel(
+                title,
+                isLoading: isCheckingStatus,
+                loadingTitle: "Checking…",
+                expandsHorizontally: expandsHorizontally
+            )
+        }
+        .buttonStyle(
+            CourseRecoveryActionButtonStyle(
+                emphasis: .primary,
+                expandsHorizontally: expandsHorizontally,
+                isBusy: isCheckingStatus
+            )
+        )
+        .disabled(isCheckingStatus)
+        .accessibilityIdentifier("course-agent-error.action.check-status")
+        .accessibilityValue(isCheckingStatus ? "Checking" : "")
     }
 
     private func recoveryActionButton(
@@ -2433,31 +2851,41 @@ private struct CourseAgentErrorCard: View {
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            actionLabel(
-                title,
-                expandsHorizontally: expandsHorizontally,
-                emphasized: true
-            )
+            actionLabel(title, expandsHorizontally: expandsHorizontally)
         }
-        .buttonStyle(.bordered)
-        .tint(.primary)
+        .buttonStyle(
+            CourseRecoveryActionButtonStyle(
+                emphasis: .secondary,
+                expandsHorizontally: expandsHorizontally
+            )
+        )
         .accessibilityIdentifier(identifier)
     }
 
+    @ViewBuilder
     private func actionLabel(
         _ title: String,
-        expandsHorizontally: Bool,
-        emphasized: Bool = false
+        systemImage: String? = nil,
+        isLoading: Bool = false,
+        loadingTitle: String? = nil,
+        expandsHorizontally: Bool
     ) -> some View {
-        Text(title)
-            .font(.subheadline.weight(emphasized ? .semibold : .regular))
-            .multilineTextAlignment(.center)
-            .fixedSize(horizontal: !expandsHorizontally, vertical: false)
-            .frame(
-                maxWidth: expandsHorizontally ? .infinity : nil,
-                minHeight: 44
-            )
-            .contentShape(Rectangle())
+        HStack(spacing: 7) {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+            } else if let systemImage {
+                Image(systemName: systemImage)
+                    .imageScale(.small)
+            }
+            Text(isLoading ? (loadingTitle ?? title) : title)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: !expandsHorizontally, vertical: true)
+        }
+        .frame(maxWidth: expandsHorizontally ? .infinity : nil)
+        // Keep the control width steady when the label swaps to its
+        // in-flight copy so the card does not jump under the tap.
+        .animation(.none, value: isLoading)
     }
 
     private var dismissalTitle: String {
@@ -2471,6 +2899,7 @@ private struct CourseAgentErrorCard: View {
 private struct CourseSubmissionRecoveryStrip: View {
     let state: CourseAgentSubmissionRecoveryState
     let allowsUnknownSubmissionAbandon: Bool
+    var isCheckingStatus = false
     let onCheckStatus: () -> Void
     let onDiscardDraft: () -> Void
     let onAbandonUnknownSubmission: () -> Void
@@ -2485,15 +2914,28 @@ private struct CourseSubmissionRecoveryStrip: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 8)
             if state.blocksNewSubmission {
-                Button("Check Status", action: onCheckStatus)
-                    .font(.footnote.weight(.semibold))
-                    .buttonStyle(.bordered)
+                Button(action: onCheckStatus) {
+                    HStack(spacing: 6) {
+                        if isCheckingStatus {
+                            ProgressView().controlSize(.small)
+                        }
+                        Text(isCheckingStatus ? "Checking…" : "Check Status")
+                    }
+                }
+                .font(.footnote.weight(.semibold))
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .disabled(isCheckingStatus)
+                .accessibilityIdentifier("course-submission-recovery.check-status")
                 if state == .acceptanceUnknown, allowsUnknownSubmissionAbandon {
                     Button("Abandon…", role: .destructive) {
                         showsUnknownAbandonConfirmation = true
                     }
                     .font(.footnote.weight(.semibold))
                     .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .tint(.red)
+                    .disabled(isCheckingStatus)
                 }
             } else if state.canDiscardDraft {
                 Button("Discard Draft", role: .destructive) {
@@ -2501,6 +2943,8 @@ private struct CourseSubmissionRecoveryStrip: View {
                 }
                 .font(.footnote.weight(.semibold))
                 .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .tint(.red)
             }
         }
         .padding(.horizontal, 12)
@@ -2705,55 +3149,93 @@ private struct CourseChatIntro: View {
     }
 }
 
+private struct CoursePlanIssueCard: View {
+    let message: String
+    let fixAction: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("The plan couldn’t be shown", systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Ask the agent to fix it", action: fixAction)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .accessibilityIdentifier("course-plan-issue-fix")
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-plan-issue")
+    }
+}
+
 private struct CourseMessageRow: View {
     let message: CourseChatMessage
     let agentID: String
 
+    /// Agent replies keep their question sentence but never show the raw
+    /// `learnfold-question` fence; the options render separately.
+    private var displayText: String {
+        guard message.role == .agent else { return message.text }
+        return CourseChatQuestion.extract(
+            from: CoursePlanMarkdown.strippingFences(from: message.text)
+        ).text
+    }
+
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
-        HStack(alignment: .bottom, spacing: 9) {
-            if message.role == .learner { Spacer(minLength: 40) }
-
-            if message.role == .agent {
-                AgentIconView(kind: agentID, size: 27)
-                    .padding(.bottom, 5)
-            }
-
-            VStack(alignment: message.role == .learner ? .trailing : .leading, spacing: 8) {
-                if !message.sources.isEmpty {
-                    VStack(spacing: 7) {
-                        ForEach(message.sources) { source in
-                            CourseSourceTile(source: source, compact: false)
-                        }
-                    }
+        switch message.role {
+        case .agent:
+            // Agent replies read as page prose rather than chat bubbles, so
+            // longer explanations and inline questions have room to breathe.
+            VStack(alignment: .leading, spacing: 10) {
+                sourceTiles
+                if !displayText.isEmpty {
+                    CourseMarkdownMessageView(markdown: displayText)
                 }
-
-                if !message.text.isEmpty {
-                    if message.role == .agent {
-                        CourseMarkdownMessageView(markdown: message.text)
-                    } else {
+            }
+            .padding(.horizontal, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .learner:
+            HStack(alignment: .bottom, spacing: 0) {
+                Spacer(minLength: 56)
+                VStack(alignment: .trailing, spacing: 8) {
+                    sourceTiles
+                    if !displayText.isEmpty {
                         Text(message.text)
                             .font(.body)
-                            .foregroundStyle(.white)
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
                             .textSelection(.enabled)
                     }
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(
+                    Color.blue.opacity(colorScheme == .dark ? 0.28 : 0.11),
+                    in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+                )
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .background(
-                message.role == .learner ? AnyShapeStyle(Color.blue) : AnyShapeStyle(Color(uiColor: .secondarySystemGroupedBackground)),
-                in: RoundedRectangle(cornerRadius: 20, style: .continuous)
-            )
-            .overlay {
-                if message.role == .agent {
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(Color.black.opacity(0.05))
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var sourceTiles: some View {
+        if !message.sources.isEmpty {
+            VStack(spacing: 7) {
+                ForEach(message.sources) { source in
+                    CourseSourceTile(source: source, compact: false)
                 }
             }
-
-            if message.role == .agent { Spacer(minLength: 34) }
         }
-        .frame(maxWidth: .infinity)
     }
 }
 
@@ -2879,8 +3361,22 @@ private struct CourseSourceTile: View {
     }
 }
 
+// iOS 26 owns the bottom bar's scroll-edge treatment. Earlier systems retain
+// the safe-area placement without requiring the new API.
+extension View {
+    @ViewBuilder
+    func courseBottomBar<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        if #available(iOS 26.0, *) {
+            safeAreaBar(edge: .bottom, spacing: 0, content: content)
+        } else {
+            safeAreaInset(edge: .bottom, spacing: 0, content: content)
+        }
+    }
+}
+
 private struct CourseChatComposer: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.colorScheme) private var colorScheme
     @Binding var inputText: String
     let prompt: String
     let sources: [CourseSource]
@@ -2901,7 +3397,7 @@ private struct CourseChatComposer: View {
     let onPasteLink: () -> Void
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 4) {
             if isPreparing {
                 HStack(spacing: 8) {
                     ProgressView()
@@ -2931,10 +3427,12 @@ private struct CourseChatComposer: View {
                                 Button {
                                     onRemoveSource(source)
                                 } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundStyle(.secondary)
+                                    Label("Remove source", systemImage: "xmark")
+                                        .labelStyle(.iconOnly)
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(.bordered)
+                                .buttonBorderShape(.circle)
+                                .accessibilityLabel("Remove \(source.name)")
                                 .disabled(!isEditingEnabled)
                             }
                             .padding(4)
@@ -2945,7 +3443,23 @@ private struct CourseChatComposer: View {
                 }
             }
 
-            HStack(alignment: .bottom, spacing: 9) {
+            TextField(
+                prompt,
+                text: $inputText,
+                prompt: Text(prompt).foregroundColor(Color(uiColor: .secondaryLabel)),
+                axis: .vertical
+            )
+                .font(.body)
+                .lineLimit(1...(dynamicTypeSize.isAccessibilitySize ? 2 : 5))
+                .focused(isFocused)
+                .textFieldStyle(.plain)
+                .frame(minHeight: 24, alignment: .topLeading)
+                .padding(.horizontal, 8)
+                .accessibilityLabel(prompt)
+                .accessibilityIdentifier("course-chat-composer")
+                .disabled(isPreparing || !isEditingEnabled)
+
+            HStack(spacing: 12) {
                 Menu {
                     if supportsBinarySources {
                         if let checkpointPhotoAction {
@@ -2966,23 +3480,17 @@ private struct CourseChatComposer: View {
                     }
                 } label: {
                     Image(systemName: "plus")
-                        .font(.headline)
+                        .font(.system(size: 24, weight: .regular))
+                        .foregroundStyle(.primary)
                         .frame(width: 44, height: 44)
-                        .background(.thinMaterial, in: Circle())
+                        .contentShape(Circle())
                 }
+                .buttonStyle(.plain)
                 .accessibilityLabel("Add a source")
                 .accessibilityIdentifier("course-chat-add-source")
                 .disabled(isPreparing || !isEditingEnabled)
 
-                TextField(prompt, text: $inputText, axis: .vertical)
-                    .lineLimit(1...(dynamicTypeSize.isAccessibilitySize ? 2 : 5))
-                    .focused(isFocused)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(.background, in: RoundedRectangle(cornerRadius: 19, style: .continuous))
-                    .accessibilityLabel(prompt)
-                    .accessibilityIdentifier("course-chat-composer")
-                    .disabled(isPreparing || !isEditingEnabled)
+                Spacer(minLength: 0)
 
                 Button(action: isAgentWorking ? onStop : onSend) {
                     Group {
@@ -2991,17 +3499,17 @@ private struct CourseChatComposer: View {
                                 .tint(.white)
                         } else {
                             Image(systemName: isAgentWorking ? "stop.fill" : "arrow.up")
-                                .font(.headline.bold())
-                                .foregroundStyle(.white)
+                                .font(.system(size: 17, weight: .semibold))
                         }
                     }
+                    .foregroundStyle(sendIsDisabled ? Color.secondary : .white)
+                    .frame(width: 36, height: 36)
+                    .background(sendIsDisabled ? Color.primary.opacity(0.08) : Color.blue, in: Circle())
                     .frame(width: 44, height: 44)
-                    .background(sendButtonColor, in: Circle())
+                    .contentShape(Circle())
                 }
-                .disabled(
-                    isPreparing || isStopping ||
-                        (!isAgentWorking && (!isAgentReady || !canSend))
-                )
+                .buttonStyle(.plain)
+                .disabled(sendIsDisabled)
                 .accessibilityLabel(
                     isPreparing
                         ? preparationLabel
@@ -3014,23 +3522,31 @@ private struct CourseChatComposer: View {
                 .accessibilityIdentifier(isAgentWorking ? "course-chat-stop" : "course-chat-send")
             }
         }
+        .padding(.horizontal, 8)
+        .padding(.top, 14)
+        .padding(.bottom, 6)
+        .background(
+            colorScheme == .dark ? Color(white: 0.13) : Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-chat-composer-container")
         .padding(.horizontal, 12)
-        .padding(.top, 9)
-        .padding(.bottom, 7)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .top) { Divider() }
+        .padding(.vertical, 8)
+    }
+
+    private var sendIsDisabled: Bool {
+        isPreparing || isStopping || (!isAgentWorking && (!isAgentReady || !canSend))
     }
 
     private var canSend: Bool {
         !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !sources.isEmpty
     }
 
-    private var sendButtonColor: Color {
-        if isPreparing { return .gray.opacity(0.5) }
-        if isStopping { return .gray.opacity(0.5) }
-        if isAgentWorking { return .primary }
-        return isAgentReady && canSend ? .blue : .gray.opacity(0.35)
-    }
 }
 
 #if DEBUG
@@ -3094,7 +3610,7 @@ struct CourseSourceCheckpointUITestHarnessView: View {
                 }
                 .padding(16)
             }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
+            .courseBottomBar {
                 CourseChatComposer(
                     inputText: $inputText,
                     prompt: "Message your course agent",
@@ -3265,11 +3781,9 @@ private struct CourseBriefCard: View {
                 )
                     .font(.headline)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 15)
-                    .foregroundStyle(.white)
-                    .background(.blue, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
             .disabled(isAgentWorking || !isApprovalEnabled)
             .accessibilityIdentifier("build-course-button")
 
@@ -3506,7 +4020,7 @@ struct CourseDraftRecoveryUITestHarnessView: View {
                     .background(.thinMaterial)
                     .accessibilityIdentifier("courseDraftRecoveryHarness.retryResult")
             }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
+            .courseBottomBar {
                 CourseChatComposer(
                     inputText: $inputText,
                     prompt: "Message your course agent",
@@ -3560,6 +4074,10 @@ private struct CourseRecoveryCheckpointUITestHarnessView: View {
     )
 
     @State private var fixtureState: CourseRecoveryCheckpointFixtureState
+    // Mirrors the production status-check lifecycle (in flight -> outcome)
+    // without contacting a backend, so the progress state is observable here.
+    @State private var isCheckingStatus = false
+    @State private var statusCheckOutcome: CourseSubmissionStatusCheckOutcome?
     @FocusState private var composerFocused: Bool
 
     init(scenario: CourseRecoveryCheckpointUITestScenario) {
@@ -3588,7 +4106,7 @@ private struct CourseRecoveryCheckpointUITestHarnessView: View {
             .safeAreaInset(edge: .top, spacing: 0) {
                 actionResultBanner
             }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
+            .courseBottomBar {
                 if scenario.issueID == "LF-34" {
                     CourseChatComposer(
                         inputText: $fixtureState.draftText,
@@ -3744,6 +4262,8 @@ private struct CourseRecoveryCheckpointUITestHarnessView: View {
             allowsUnknownSubmissionAbandon: scenario == .lf34AcceptanceUnknown,
             submissionRecoveryState: scenario.submissionRecoveryState,
             hermesRecoveryProvenance: checkpointRecoveryPresentation?.provenance,
+            isCheckingStatus: isCheckingStatus,
+            statusCheckOutcome: statusCheckOutcome,
             onReconnect: {
                 fixtureState.apply(
                     scenario == .lf36AuthenticationRecovery
@@ -3752,7 +4272,7 @@ private struct CourseRecoveryCheckpointUITestHarnessView: View {
                 )
             },
             onRetrySubmission: { fixtureState.apply(.retrySubmission) },
-            onCheckStatus: { fixtureState.apply(.checkSubmissionStatus) },
+            onCheckStatus: beginSimulatedStatusCheck,
             onDiscardSubmission: { fixtureState.apply(.discardDraft) },
             onAbandonUnknownSubmission: { fixtureState.apply(.abandonUnknownDraft) },
             onRetryRecovery: { fixtureState.apply(.retryHermesRecovery) },
@@ -3775,6 +4295,21 @@ private struct CourseRecoveryCheckpointUITestHarnessView: View {
             initialConfirmation: initialErrorConfirmation
         )
         .accessibilityIdentifier("courseRecoveryCheckpoint.errorCard")
+    }
+
+    private func beginSimulatedStatusCheck() {
+        guard !isCheckingStatus else { return }
+        isCheckingStatus = true
+        statusCheckOutcome = nil
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(2500))
+            isCheckingStatus = false
+            statusCheckOutcome = CourseSubmissionStatusCheckOutcome(
+                result: .stillUnconfirmed,
+                finishedAt: Date()
+            )
+            fixtureState.apply(.checkSubmissionStatus)
+        }
     }
 
     private var agentName: String {
@@ -4005,6 +4540,87 @@ private struct CourseSelectionConflictCheckpointView: View {
                 modelID: "redacted-fixture-model"
             )
         )
+    }
+}
+#endif
+
+#if DEBUG
+/// Debug-only transcript for verifying inline multiple-choice questions
+/// without a live agent. Launch with `--ui-test-course-chat-question`.
+struct CourseChatQuestionUITestHarnessView: View {
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-test-course-chat-question")
+    }
+
+    @State private var messages: [CourseChatMessage] = [
+        CourseChatMessage(role: .learner, text: "Zk snarks"),
+        CourseChatMessage(
+            role: .agent,
+            text: """
+            Great topic. To personalize your course, let's understand your learning goal and background knowledge.
+
+            \(CourseChatQuestionPromptPolicy.exampleBlock)
+            """
+        ),
+    ]
+    @State private var inputText = ""
+    @State private var selectedPhoto: PhotosPickerItem?
+    @FocusState private var composerFocused: Bool
+
+    private var pendingQuestion: CourseChatQuestion? {
+        CourseChatQuestionPolicy.pendingQuestion(in: messages)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(messages) { message in
+                        CourseMessageRow(message: message, agentID: CourseAgentProvider.hosted)
+                    }
+                    if let pendingQuestion {
+                        CourseChatQuestionOptionsView(
+                            question: pendingQuestion,
+                            isEnabled: true,
+                            onSelect: send
+                        )
+                        .padding(.top, 2)
+                    }
+                }
+                .padding(16)
+            }
+            .courseBottomBar {
+                CourseChatComposer(
+                    inputText: $inputText,
+                    prompt: pendingQuestion != nil
+                        ? CourseChatQuestion.freeTextPrompt
+                        : "Message your course agent",
+                    sources: [],
+                    isFocused: $composerFocused,
+                    onRemoveSource: { _ in },
+                    onSend: { send(inputText) },
+                    isAgentWorking: false,
+                    isPreparing: false,
+                    isEditingEnabled: true,
+                    isAgentReady: true,
+                    isStopping: false,
+                    onStop: {},
+                    supportsBinarySources: true,
+                    selectedPhoto: $selectedPhoto,
+                    onChooseFile: {},
+                    onPasteLink: {}
+                )
+            }
+            .navigationTitle("New Course")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    private func send(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        messages.append(CourseChatMessage(role: .learner, text: trimmed))
+        inputText = ""
     }
 }
 #endif

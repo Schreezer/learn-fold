@@ -259,6 +259,7 @@ pub enum AppQueuedFollowUpKind {
 pub(crate) struct QueuedFollowUpDraft {
     pub preview: AppQueuedFollowUpPreview,
     pub inputs: Vec<upstream::UserInput>,
+    pub additional_context: Option<HashMap<String, upstream::AdditionalContextEntry>>,
     pub source_message_json: Option<serde_json::Value>,
 }
 

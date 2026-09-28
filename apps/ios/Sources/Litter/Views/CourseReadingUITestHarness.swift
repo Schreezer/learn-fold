@@ -26,12 +26,16 @@ struct CourseReadingUITestHarness: View {
                 ProgressView("Preparing reading fixture")
             }
         }
-        .preferredColorScheme(.light)
+        .preferredColorScheme(ThemeManager.shared.appearanceMode.preferredColorScheme ?? .light)
         .task { if store == nil { await prepare() } }
     }
 
     @MainActor
     private func prepare() async {
+        let appearance = LitterAppearanceMode(
+            rawValue: ProcessInfo.processInfo.environment["LEARNFOLD_READING_TEST_APPEARANCE"] ?? "light"
+        ) ?? .light
+        ThemeManager.shared.setAppearanceMode(appearance)
         do {
             let rawToken = ProcessInfo.processInfo.environment["LEARNFOLD_READING_TEST_TOKEN"] ?? ""
             guard let token = UUID(uuidString: rawToken)?.uuidString else { return }
@@ -112,7 +116,7 @@ struct CourseReadingUITestHarness: View {
                 _ = try workspace.createPage(title: "What a proof reveals", parentID: section.id,
                     document: articleDocument, id: "article-one")
                 _ = try workspace.createPage(title: "A verifier's challenge", parentID: section.id,
-                    document: document("## A challenge\n\nTry describing a verification step without sharing the secret.", role: "lesson"), id: "article-two")
+                    document: document("## A challenge\n\nTry describing a verification step without sharing the secret.\n\n## Keep asking\n\n- Why is the challenge random?\n- What could a cheating prover do?", role: "lesson"), id: "article-two")
                 let second = try workspace.createPage(title: "Finite Fields", parentID: workspace.rootPageID,
                     document: document("", role: "chapter"), id: "chapter-two")
                 _ = try workspace.createPage(title: "The math playground", parentID: second.id,
@@ -147,12 +151,13 @@ private struct ReadingFixtureNavigation: View {
             Text("LOCAL READING FIXTURE · SIMULATED GENERATION")
                 .font(.caption2)
                 .accessibilityIdentifier("reading-fixture")
+                .accessibilityValue(ThemeManager.shared.appearanceMode.rawValue)
         }
     }
 }
 
 @MainActor
-private final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
+final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
     private var attempts = 0
     func availability() -> HostedCourseAgentAvailability { .init(available: true, reason: "Local fixture") }
     func restoredMessages(sessionID: UUID) async throws -> [HostedCourseAgentStoredMessage] { [] }
@@ -161,6 +166,16 @@ private final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
               onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
               onPartialResponse: @escaping @MainActor (String) -> Void,
               onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void) async throws {
+        if prompt.contains("My question: Why is the challenge random?") {
+            guard prompt.contains("<current_course_page page_id=\"article-two\""),
+                  prompt.contains("Try describing a verification step without sharing the secret.") else {
+                throw NSError(domain: "ReadingFixture", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "The current page context did not reach the dispatcher."
+                ])
+            }
+            onPartialResponse("The local chat fixture received your question and the current lesson content.")
+            return
+        }
         attempts += 1
         try await Task.sleep(for: .seconds(3))
         if attempts == 1 {

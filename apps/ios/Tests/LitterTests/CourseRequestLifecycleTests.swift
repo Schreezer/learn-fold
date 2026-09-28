@@ -172,6 +172,55 @@ final class CourseRequestLifecycleTests: XCTestCase {
         )
     }
 
+    func testCourseIntroDisappearsAfterFirstLearnerMessage() {
+        let assistant = ConversationItem(
+            id: "assistant",
+            content: .assistant(
+                ConversationAssistantMessageData(
+                    text: "What would you like to learn?",
+                    agentNickname: nil,
+                    agentRole: nil,
+                    phase: nil
+                )
+            )
+        )
+        let learner = ConversationItem(
+            id: "learner",
+            content: .user(
+                ConversationUserMessageData(
+                    text: "Teach me about zk-SNARKs.",
+                    images: []
+                )
+            )
+        )
+
+        XCTAssertTrue(CourseChatTimelinePolicy.shouldShowIntro(in: []))
+        XCTAssertTrue(CourseChatTimelinePolicy.shouldShowIntro(in: [assistant]))
+        XCTAssertFalse(
+            CourseChatTimelinePolicy.shouldShowIntro(in: [assistant, learner])
+        )
+
+        let optimisticItems = CourseChatTimelinePolicy.mergedConversationItems(
+            localMessages: [CourseChatMessage(role: .learner, text: "Hi there")],
+            liveItems: []
+        )
+        XCTAssertFalse(CourseChatTimelinePolicy.shouldShowIntro(in: optimisticItems))
+        XCTAssertEqual(
+            CourseChatTimelinePolicy.firstLearnerAwaitingReplyID(in: optimisticItems),
+            optimisticItems.first?.id
+        )
+        XCTAssertEqual(
+            CourseChatTimelinePolicy.firstLearnerAwaitingReplyID(in: [assistant, learner]),
+            learner.id
+        )
+        XCTAssertNil(
+            CourseChatTimelinePolicy.firstLearnerAwaitingReplyID(in: [learner, assistant])
+        )
+        XCTAssertNil(
+            CourseChatTimelinePolicy.firstLearnerAwaitingReplyID(in: [learner, learner])
+        )
+    }
+
     func testFocusedQAStateTracksTheLiveAnswerBoundary() {
         XCTAssertEqual(
             CourseFocusedQAState.project(
