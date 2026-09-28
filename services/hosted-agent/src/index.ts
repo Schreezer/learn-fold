@@ -7,7 +7,7 @@ import { generateText } from "ai"
 import { ProviderProgress, PROVIDER_STEP_TIMEOUT_MS } from "./provider-progress"
 import { HostedTelemetry, observedProviderFetch } from "./telemetry"
 import { isAuthorized, unauthorized } from "./auth"
-import { COURSE_AGENT_PROMPT } from "./course-prompt"
+import { COURSE_AGENT_PROMPT, LEGACY_COURSE_AGENT_PROMPT, QUESTION_CHOICE_CAPABILITY } from "./course-prompt"
 import { createHostedModel, DEFAULT_MODEL } from "./provider"
 import { authorizeGuestRoute, enforceGuestTurnLimit, guestSession } from "./guest"
 export { GuestUsage } from "./guest"
@@ -25,6 +25,22 @@ function workspaceIDFrom(context: TurnContext): string | null {
   const normalized = value.trim()
   if (!normalized || normalized.length > MAX_WORKSPACE_ID_LENGTH) return null
   return /^[a-zA-Z0-9._-]+$/.test(normalized) ? normalized : null
+}
+
+function supportsQuestionChoices(context: TurnContext): boolean {
+  const capabilities = context.body?.clientCapabilities
+  return Array.isArray(capabilities) && capabilities.includes(QUESTION_CHOICE_CAPABILITY)
+}
+
+function courseSystemPrompt(system: string, supportsChoices: boolean): string {
+  const prompt = supportsChoices ? COURSE_AGENT_PROMPT : LEGACY_COURSE_AGENT_PROMPT
+  // Preserve any extra system instructions Think supplies around our prompt.
+  const additional = system.includes(COURSE_AGENT_PROMPT)
+    ? system.replace(COURSE_AGENT_PROMPT, "").trim()
+    : system.includes(LEGACY_COURSE_AGENT_PROMPT)
+      ? system.replace(LEGACY_COURSE_AGENT_PROMPT, "").trim()
+      : system.trim()
+  return additional ? `${prompt}\n\n${additional}` : prompt
 }
 
 function textFromMessage(message: unknown): string | null {
@@ -88,7 +104,7 @@ export class HostedCourseAgent extends Think<HostedEnv> {
   }
 
   override getSystemPrompt(): string {
-    return COURSE_AGENT_PROMPT
+    return LEGACY_COURSE_AGENT_PROMPT
   }
 
   override getSkills() {
@@ -113,7 +129,7 @@ export class HostedCourseAgent extends Think<HostedEnv> {
   override async beforeTurn(context: TurnContext): Promise<TurnConfig> {
     // Think's tool auto-continuations have no request body. Keep the course
     // binding in durable storage so they also survive object restarts.
-    const workspaceID = await this.ctx.storage.transaction(async (storage) => {
+    const { workspaceID, questionChoices } = await this.ctx.storage.transaction(async (storage) => {
       const saved = await storage.get<string>("learnfold.workspaceId")
       const supplied = workspaceIDFrom(context)
       const resolved = context.continuation && context.body === undefined ? saved : supplied
@@ -124,7 +140,16 @@ export class HostedCourseAgent extends Think<HostedEnv> {
         throw new Error("This Hosted conversation belongs to a different course workspace.")
       }
       if (!saved) await storage.put("learnfold.workspaceId", resolved)
-      return resolved
+      // A tool auto-continuation has no request body. Keep the client renderer
+      // capability with its turn so a tool call cannot switch prompt formats.
+      const savedChoices = await storage.get<boolean>("learnfold.questionChoices")
+      const questionChoices = context.continuation
+        ? savedChoices === true
+        : supportsQuestionChoices(context)
+      if (savedChoices !== questionChoices) {
+        await storage.put("learnfold.questionChoices", questionChoices)
+      }
+      return { workspaceID: resolved, questionChoices }
     })
     await enforceGuestTurnLimit(this.name, this.env)
     const clientToolNames = Object.keys(context.tools).filter((name) =>
@@ -147,7 +172,7 @@ export class HostedCourseAgent extends Think<HostedEnv> {
       : ""
     this.telemetry.prepared(context.continuation, context.messages.length, activeTools.length)
     return {
-      instructions: `${context.system}\n\nCurrent Learnfold workspace_id: ${workspaceID}${approvalInstructions}`,
+      instructions: `${courseSystemPrompt(context.system, questionChoices)}\n\nCurrent Learnfold workspace_id: ${workspaceID}${approvalInstructions}`,
       activeTools,
       maxSteps: this.name.startsWith("guest-") ? 12 : 24,
       sendReasoning: false,
