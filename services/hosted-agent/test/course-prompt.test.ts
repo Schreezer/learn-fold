@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest"
 
-import { COURSE_AGENT_PROMPT, QUESTION_FENCE } from "../src/course-prompt"
+import { COURSE_AGENT_PROMPT, LEGACY_COURSE_AGENT_PROMPT, QUESTION_CHOICE_CAPABILITY, QUESTION_FENCE } from "../src/course-prompt"
 
 describe("course prompt", () => {
+  it("keeps the pre-choice prompt for clients without the question renderer", () => {
+    expect(QUESTION_CHOICE_CAPABILITY).toBe("learnfold-question-v1")
+    expect(LEGACY_COURSE_AGENT_PROMPT).toContain("assess the learner")
+    expect(LEGACY_COURSE_AGENT_PROMPT).toContain("present_course_plan")
+    expect(LEGACY_COURSE_AGENT_PROMPT).toContain("native-editor")
+    expect(LEGACY_COURSE_AGENT_PROMPT).not.toContain(QUESTION_FENCE)
+  })
+
   it("teaches the multiple-choice fence the iOS chat parses", () => {
     expect(QUESTION_FENCE).toBe("learnfold-question")
     expect(COURSE_AGENT_PROMPT).toContain(`\`\`\`${QUESTION_FENCE}\n`)
