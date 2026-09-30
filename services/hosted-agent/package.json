@@ -18,7 +18,7 @@
     "ai": "7.0.56"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "0.18.8",
+    "@cloudflare/vitest-pool-workers": "0.22.0",
     "@types/node": "24.10.0",
     "typescript": "5.9.2",
     "vitest": "4.1.10",
