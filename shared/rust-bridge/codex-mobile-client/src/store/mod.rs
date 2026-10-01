@@ -5,6 +5,11 @@ pub mod reconcile;
 pub mod reducer;
 pub mod snapshot;
 pub mod updates;
+pub mod chat;
+#[cfg(test)]
+mod chat_fixtures;
+pub mod timeline;
+pub mod turn;
 mod voice;
 
 pub use agent_metadata::{AgentMetadataStore, AppAgentMetadata};

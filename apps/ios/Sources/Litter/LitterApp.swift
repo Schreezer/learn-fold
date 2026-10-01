@@ -2010,6 +2010,9 @@ struct ContentView: View {
                 } else if ConversationDisplayUITestHarnessView.isEnabled {
                     ConversationDisplayUITestHarnessView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if ChatScreenUITestHarness.isEnabled {
+                    ChatScreenUITestHarness()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     courseExperienceRoot
                 }

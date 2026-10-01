@@ -139,7 +139,7 @@ pub struct AppThreadStateRecord {
     pub initial_turns_loaded: bool,
 }
 
-fn merged_hydrated_items(
+pub(crate) fn merged_hydrated_items(
     items: &[crate::conversation_uniffi::HydratedConversationItem],
     local_overlay_items: &[crate::conversation_uniffi::HydratedConversationItem],
 ) -> Vec<HydratedConversationItem> {

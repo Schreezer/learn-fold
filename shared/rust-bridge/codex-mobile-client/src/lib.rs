@@ -187,6 +187,7 @@ pub mod recorder;
 pub mod remote_path;
 pub mod saved_apps;
 pub mod session;
+pub mod source;
 pub(crate) mod slingshot_url;
 pub mod ssh;
 pub mod ssh_bridge;

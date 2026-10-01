@@ -62,6 +62,8 @@ pub(crate) enum UiEvent {
         key: ThreadKey,
         turn_id: String,
         error: Option<String>,
+        /// The turn ended because it was interrupted (`TurnStatus::Interrupted`).
+        interrupted: bool,
     },
     TurnDiffUpdated {
         key: ThreadKey,
@@ -335,6 +337,10 @@ impl EventProcessor {
                     key,
                     turn_id: n.turn.id.clone(),
                     error,
+                    interrupted: matches!(
+                        n.turn.status,
+                        codex_app_server_protocol::TurnStatus::Interrupted
+                    ),
                 });
             }
             ServerNotification::TurnDiffUpdated(n) => {
@@ -1419,7 +1425,9 @@ mod tests {
                 key,
                 turn_id,
                 error,
+                interrupted,
             } => {
+                assert!(!interrupted);
                 assert_eq!(key.thread_id, "thr_2");
                 assert_eq!(turn_id, "turn_2");
                 assert!(error.is_none());

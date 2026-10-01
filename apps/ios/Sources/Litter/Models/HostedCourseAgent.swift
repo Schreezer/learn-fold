@@ -38,6 +38,7 @@ protocol HostedCourseAgentRuntime: AnyObject {
         workspaceID: String,
         courseDirectory: URL,
         prompt: String,
+        messageID: UUID?,
         onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
@@ -102,6 +103,7 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         workspaceID: String,
         courseDirectory: URL,
         prompt: String,
+        messageID: UUID?,
         onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
@@ -132,6 +134,7 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
                 sessionId: sessionID.uuidString.lowercased(),
                 workspaceId: workspaceID,
                 prompt: prompt,
+                messageId: messageID?.uuidString.lowercased(),
                 tools: definitions,
                 toolHandler: handler,
                 listener: listener

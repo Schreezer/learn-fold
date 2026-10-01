@@ -178,10 +178,21 @@ impl HostedAgentClient {
             .active_cancellations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(active
+        let cancelled = active
             .get(&session_id)
             .map(|entry| entry.sender.send(true).is_ok())
-            .unwrap_or(false))
+            .unwrap_or(false);
+        drop(active);
+        if cancelled
+            && let Some(client) = crate::ffi::shared::shared_mobile_client_if_initialized()
+        {
+            // The chat shows "Stopping…" until `send` settles the turn.
+            client.app_store.chat_local_action(
+                &crate::source::hosted::hosted_thread_key(&session_id),
+                crate::store::turn::LocalAction::Stop,
+            );
+        }
+        Ok(cancelled)
     }
 
     /// Reads the server-authoritative transcript. No local transcript is used
@@ -194,6 +205,7 @@ impl HostedAgentClient {
         validate_session_id(&session_id)?;
         let (mut socket, messages) = self.connect(&session_id).await?;
         let _ = socket.close(None).await;
+        crate::source::hosted::HostedAdapter::attach(&session_id).hydrate(&messages);
         Ok(project_messages(&messages))
     }
 
@@ -201,11 +213,17 @@ impl HostedAgentClient {
     /// compaction, recovery and auto-continuation. Client tool calls are
     /// executed synchronously at the UniFFI boundary, then returned to Think
     /// with `autoContinue` so its agent loop resumes durably.
+    ///
+    /// `message_id` is the learner message's id. Pass the platform's
+    /// optimistic message id so the chat row and a later
+    /// `UserMessageFailed` refer to the same message; `None` mints one.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
         session_id: String,
         workspace_id: String,
         prompt: String,
+        message_id: Option<String>,
         tools: Vec<HostedAgentToolDefinition>,
         tool_handler: Box<dyn HostedAgentToolHandler>,
         listener: Box<dyn HostedAgentEventListener>,
@@ -217,20 +235,60 @@ impl HostedAgentClient {
                 detail: "the prompt is empty".into(),
             });
         }
-
         let client_tools = tool_schemas(&tools)?;
+
+        // HostedAdapter mirrors this turn into the shared store as canonical
+        // source events; the listener keeps working unchanged.
+        let mut adapter = crate::source::hosted::HostedAdapter::attach(&session_id);
+        let message_id = message_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let request_id = Uuid::new_v4().to_string();
+        adapter.begin(&message_id, &prompt);
+        let result = self
+            .send_turn(
+                session_id,
+                workspace_id,
+                prompt,
+                client_tools,
+                message_id,
+                request_id,
+                tool_handler,
+                listener,
+                &mut adapter,
+            )
+            .await;
+        adapter.finish(&result);
+        result
+    }
+}
+
+impl HostedAgentClient {
+    #[allow(clippy::too_many_arguments)]
+    async fn send_turn(
+        &self,
+        session_id: String,
+        workspace_id: String,
+        prompt: String,
+        client_tools: Value,
+        message_id: String,
+        request_id: String,
+        tool_handler: Box<dyn HostedAgentToolHandler>,
+        listener: Box<dyn HostedAgentEventListener>,
+        adapter: &mut crate::source::hosted::HostedAdapter,
+    ) -> Result<HostedAgentTurnResult, HostedAgentError> {
         let mut cancellation = self.register_cancellation(&session_id);
         let (mut socket, mut messages) = self.connect(&session_id).await?;
         if *cancellation.receiver.borrow() {
             return Err(HostedAgentError::Cancelled);
         }
         messages.push(json!({
-            "id": Uuid::new_v4().to_string(),
+            "id": message_id,
             "role": "user",
             "parts": [{ "type": "text", "text": prompt }],
         }));
 
-        let request_id = Uuid::new_v4().to_string();
         let body = json!({
             "messages": messages,
             "clientTools": client_tools,
@@ -278,12 +336,12 @@ impl HostedAgentClient {
                     }
                 }
                 Some("cf_agent_chat_recovering") => {
-                    listener.on_recovering_changed(
-                        frame
-                            .get("recovering")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    );
+                    let recovering = frame
+                        .get("recovering")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    listener.on_recovering_changed(recovering);
+                    adapter.recovering(recovering);
                 }
                 Some("cf_agent_use_chat_response") => {
                     if !stream.accept_frame(&frame) {
@@ -324,6 +382,7 @@ impl HostedAgentClient {
                     if let Some(error) = stream_chunk_error(&chunk) {
                         return Err(error);
                     }
+                    adapter.chunk(&chunk);
                     if chunk.get("type").and_then(Value::as_str) == Some("text-delta") {
                         if let Some(delta) = chunk.get("delta").and_then(Value::as_str) {
                             response_text.push_str(delta);
@@ -335,12 +394,21 @@ impl HostedAgentClient {
                         if !handled_tool_calls.insert(tool_call_id.to_string()) {
                             continue;
                         }
+                        let arguments_json = serde_json::to_string(input).map_err(protocol_error)?;
+                        adapter.tool_started(tool_call_id, tool_name, &arguments_json);
                         let result = tool_handler.execute_hosted_tool(HostedAgentToolInvocation {
                             session_id: session_id.clone(),
                             tool_call_id: tool_call_id.to_string(),
                             tool_name: tool_name.to_string(),
-                            arguments_json: serde_json::to_string(input).map_err(protocol_error)?,
+                            arguments_json: arguments_json.clone(),
                         });
+                        adapter.tool_finished(
+                            tool_call_id,
+                            tool_name,
+                            &arguments_json,
+                            result.success,
+                            result.error_message.as_deref(),
+                        );
                         let output = serde_json::from_str::<Value>(&result.output)
                             .unwrap_or_else(|_| Value::String(result.output));
                         let state = if result.success {
@@ -1039,6 +1107,10 @@ mod tests {
                     serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
                         .unwrap();
                 let initial = request["id"].as_str().unwrap().to_string();
+                // The learner message keeps the platform's optimistic id.
+                let body: Value =
+                    serde_json::from_str(request["init"]["body"].as_str().unwrap()).unwrap();
+                assert_eq!(body["messages"][0]["id"], "client-message-1");
                 for (index, id) in [initial.as_str(), "continuation-1"].iter().enumerate() {
                     let chunk = json!({"type":"tool-input-available", "toolCallId":format!("call-{index}"), "toolName":"native-editor-fetch", "input":{}});
                     ws.send(WsMessage::Text(json!({"type":"cf_agent_use_chat_response", "id":id, "continuation":index > 0, "body":chunk.to_string()}).to_string().into())).await.unwrap();
@@ -1069,6 +1141,7 @@ mod tests {
                     Uuid::new_v4().to_string(),
                     "course-a".into(),
                     "Read the lesson".into(),
+                    Some("client-message-1".into()),
                     vec![],
                     Box::new(TestToolHandler),
                     Box::new(TestListener),

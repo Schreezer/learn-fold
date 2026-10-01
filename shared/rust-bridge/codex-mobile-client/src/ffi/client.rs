@@ -950,15 +950,33 @@ impl AppClient {
         server_id: String,
         params: types::AppInterruptTurnRequest,
     ) -> Result<(), ClientError> {
-        blocking_async!(self.rt, self.inner, |c| {
-            let _: upstream::TurnInterruptResponse = rpc(
-                c.as_ref(),
-                &server_id,
-                req!(server_id, TurnInterrupt, params.into()),
-            )
-            .await?;
-            Ok(())
-        })
+        // The chat shows "Stopping…" until the source settles the turn.
+        let chat_key = types::ThreadKey {
+            server_id: server_id.clone(),
+            thread_id: params.thread_id.clone(),
+        };
+        self.inner
+            .app_store
+            .chat_local_action(&chat_key, crate::store::turn::LocalAction::Stop);
+        let result: Result<(), ClientError> = async {
+            blocking_async!(self.rt, self.inner, |c| {
+                let _: upstream::TurnInterruptResponse = rpc(
+                    c.as_ref(),
+                    &server_id,
+                    req!(server_id, TurnInterrupt, params.into()),
+                )
+                .await?;
+                Ok(())
+            })
+        }
+        .await;
+        if result.is_err() {
+            // The turn was not stopped; leave "Stopping…".
+            self.inner
+                .app_store
+                .chat_local_action(&chat_key, crate::store::turn::LocalAction::StopFailed);
+        }
+        result
     }
 
     pub async fn list_collaboration_modes(

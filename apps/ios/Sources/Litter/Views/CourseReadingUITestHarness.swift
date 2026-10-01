@@ -162,7 +162,7 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
     func availability() -> HostedCourseAgentAvailability { .init(available: true, reason: "Local fixture") }
     func restoredMessages(sessionID: UUID) async throws -> [HostedCourseAgentStoredMessage] { [] }
     func cancel(sessionID: UUID) {}
-    func send(sessionID: UUID, workspaceID: String, courseDirectory: URL, prompt: String,
+    func send(sessionID: UUID, workspaceID: String, courseDirectory: URL, prompt: String, messageID: UUID?,
               onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
               onPartialResponse: @escaping @MainActor (String) -> Void,
               onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void) async throws {

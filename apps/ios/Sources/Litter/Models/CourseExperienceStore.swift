@@ -5449,6 +5449,12 @@ final class CourseExperienceStore {
                 .flatMap { selectionDiscussion(id: $0)?.appleSessionID }
                 ?? currentAppleSessionID
             if let sessionID {
+                // "Stopping…" until the cancelled send settles the turn.
+                appModel.store.ingestSourceEvents(
+                    key: Self.appleChatKey(sessionID: sessionID),
+                    source: .apple,
+                    events: [.stopRequested]
+                )
                 appleRuntime.cancel(sessionID: sessionID)
             }
             agentForwardTasks[scope]?.cancel()
@@ -6065,6 +6071,78 @@ final class CourseExperienceStore {
     func localMessages(for discussionID: UUID?) -> [CourseChatMessage] {
         let scopedMessages = discussionID.map { selectionLocalMessages[$0] ?? [] } ?? messages
         return CourseChatTranscriptPolicy.learnerVisibleMessages(scopedMessages)
+    }
+
+    // MARK: - Shared chat timeline
+
+    /// The Rust chat thread a course chat renders: the hosted or Apple
+    /// session for platform-run agents, the app-server thread otherwise.
+    /// `nil` until the scope has a session or thread.
+    func chatThreadKey(selectionDiscussionID: UUID?) -> ThreadKey? {
+        let runtimeID = selectionDiscussionAgentID(id: selectionDiscussionID)
+        let discussion = selectionDiscussionID.flatMap { selectionDiscussion(id: $0) }
+        if runtimeID == CourseAgentProvider.hosted {
+            let sessionID = selectionDiscussionID == nil
+                ? currentHostedSessionID
+                : discussion?.hostedSessionID
+            return sessionID.map(Self.hostedChatKey(sessionID:))
+        }
+        if CourseAgentProvider.isApple(runtimeID) {
+            let sessionID = selectionDiscussionID == nil
+                ? currentAppleSessionID
+                : discussion?.appleSessionID
+            return sessionID.map(Self.appleChatKey(sessionID:))
+        }
+        if let selectionDiscussionID {
+            return selectionDiscussionThreadKey(id: selectionDiscussionID)
+        }
+        return agentThreadKey
+    }
+
+    func chatViewOptions(selectionDiscussionID: UUID?) -> ChatViewOptions {
+        ChatViewOptions(
+            hidesSelectionEnvelope: selectionDiscussionID != nil,
+            showsInternalCourseActivity: false
+        )
+    }
+
+    static func hostedChatKey(sessionID: UUID) -> ThreadKey {
+        hostedChatThreadKey(sessionId: sessionID.uuidString.lowercased())
+    }
+
+    static func appleChatKey(sessionID: UUID) -> ThreadKey {
+        appleChatThreadKey(sessionId: sessionID.uuidString.lowercased())
+    }
+
+    /// How a failed Apple turn settles in the chat timeline.
+    static func appleTurnFailureOutcome(_ error: Error, runtimeID: String) -> TurnOutcome {
+        error is CancellationError || Task.isCancelled
+            ? .interrupted
+            : .failed(message: appleAgentFailureMessage(error, agentName: runtimeID.displayLabel))
+    }
+
+    /// Apple sessions run on the device, so Rust only holds their transcript
+    /// while a chat is open. Re-sends the restored messages when a chat
+    /// opens. The local copy lags a live turn, so Rust ignores the
+    /// replacement while the turn is working (queued through stopping).
+    func syncPlatformChatTranscript(selectionDiscussionID: UUID?, appStore: AppStore) {
+        let runtimeID = selectionDiscussionAgentID(id: selectionDiscussionID)
+        guard CourseAgentProvider.isApple(runtimeID),
+              let key = chatThreadKey(selectionDiscussionID: selectionDiscussionID) else { return }
+        var turnID: String?
+        let transcript = localMessages(for: selectionDiscussionID).compactMap { message -> ExternalTranscriptMessage? in
+            let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            let id = message.id.uuidString.lowercased()
+            if message.role == .learner { turnID = id }
+            return ExternalTranscriptMessage(
+                id: id,
+                role: message.role == .learner ? .user : .assistant,
+                text: text,
+                turnId: turnID
+            )
+        }
+        appStore.ingestSourceEvents(key: key, source: .apple, events: [.replaceTranscript(messages: transcript)])
     }
 
     func takeDraft(for discussionID: UUID?) -> String? {
@@ -9348,6 +9426,15 @@ final class CourseExperienceStore {
         var hermesSubmissionIntentPersisted = false
         var acceptedHermesTurn: (key: ThreadKey, turnID: String)?
         var hermesThreadKey: ThreadKey?
+        /// Set once an Apple turn is handed to the shared chat timeline.
+        var appleChatKey: ThreadKey?
+        /// True while the Apple turn has started in the chat timeline but not
+        /// settled. A failure settles it here, after the learner message is
+        /// withdrawn, so the failure never reads as part of the prior turn.
+        var appleTurnAwaitingSettle = false
+        /// Set once a hosted turn is dispatched; its chat row uses the
+        /// optimistic message id.
+        var hostedChatKey: ThreadKey?
         var ingestionReceipts: [CourseSourceIngestionReceipt] = []
         var preparedAgentText = attempt.promptText
         let isLearnerSubmission = originalText != nil && optimisticMessageID != nil
@@ -9389,10 +9476,12 @@ final class CourseExperienceStore {
                         matching: attempt.id
                     )
                 }
+                hostedChatKey = Self.hostedChatKey(sessionID: sessionID)
                 try await forwardToHostedAgent(
                     text: attempt.promptText,
                     workspaceID: workspaceID,
                     sessionID: sessionID,
+                    messageID: optimisticMessageID,
                     transcriptVisibility: transcriptVisibility,
                     onAccepted: {
                         guard !turnWasAccepted else { return }
@@ -9450,6 +9539,8 @@ final class CourseExperienceStore {
                         matching: attempt.id
                     )
                 }
+                appleChatKey = Self.appleChatKey(sessionID: sessionID)
+                appleTurnAwaitingSettle = true
                 try await forwardToAppleAgent(
                     text: preparedAgentText,
                     runtimeID: runtimeID,
@@ -9457,6 +9548,9 @@ final class CourseExperienceStore {
                     sessionID: sessionID,
                     lessonTarget: lessonTarget,
                     transcriptVisibility: transcriptVisibility,
+                    learnerText: isLearnerSubmission ? originalText : nil,
+                    clientMessageID: optimisticMessageID,
+                    appStore: appModel.store,
                     onAccepted: {
                         turnWasAccepted = true
                         if isLearnerSubmission {
@@ -9470,6 +9564,7 @@ final class CourseExperienceStore {
                     selectionContextID: selectionContextID,
                     selectionDiscussionID: selectionDiscussionID
                 )
+                appleTurnAwaitingSettle = false
                 if isLearnerSubmission {
                     clearPendingOutboundSubmission(
                         selectionDiscussionID: selectionDiscussionID,
@@ -9853,6 +9948,25 @@ final class CourseExperienceStore {
                     attempt: attempt,
                     selectionDiscussionID: selectionDiscussionID
                 )
+            if submissionWasRestored,
+               let optimisticMessageID,
+               let chatKey = appleChatKey ?? hostedChatKey {
+                // The learner's text went back to the composer, so its
+                // optimistic bubble goes too (and a resend can't duplicate
+                // it). Hosted rows carry this id via `HostedAgentClient.send`.
+                appModel.store.ingestSourceEvents(
+                    key: chatKey,
+                    source: appleChatKey != nil ? .apple : .hosted,
+                    events: [.userMessageFailed(clientMsgId: optimisticMessageID.uuidString.lowercased())]
+                )
+            }
+            if appleTurnAwaitingSettle, let appleChatKey {
+                appModel.store.ingestSourceEvents(
+                    key: appleChatKey,
+                    source: .apple,
+                    events: [.turnSettled(outcome: Self.appleTurnFailureOutcome(error, runtimeID: runtimeID))]
+                )
+            }
             let recoveryState: CourseAgentSubmissionRecoveryState? = if !isLearnerSubmission {
                 nil
             } else if turnWasAccepted {
@@ -10077,6 +10191,7 @@ final class CourseExperienceStore {
         text: String,
         workspaceID: String,
         sessionID: UUID,
+        messageID: UUID?,
         transcriptVisibility: CourseAgentTranscriptVisibility,
         onAccepted: @escaping @MainActor () -> Void,
         selectionContextID: UUID?,
@@ -10107,6 +10222,7 @@ final class CourseExperienceStore {
                 workspaceID: workspaceID,
                 courseDirectory: coursesRootURL.appendingPathComponent(workspaceID, isDirectory: true),
                 prompt: text,
+                messageID: messageID,
                 onRecoveringChanged: { [weak self] recovering in
                     guard let self, self.hostedReplyProgress[scope]?.id == progressID else { return }
                     self.hostedReplyProgress[scope]?.isRecovering = recovering
@@ -10159,6 +10275,9 @@ final class CourseExperienceStore {
         sessionID: UUID,
         lessonTarget: PreparedCourseLessonTarget?,
         transcriptVisibility: CourseAgentTranscriptVisibility,
+        learnerText: String?,
+        clientMessageID: UUID?,
+        appStore: AppStore,
         onAccepted: @escaping @MainActor () -> Void,
         selectionContextID: UUID?,
         selectionDiscussionID: UUID?
@@ -10174,6 +10293,24 @@ final class CourseExperienceStore {
             messages.append(responseMessage)
         }
 
+        // The on-device model runs here, so its turn reaches the shared chat
+        // timeline as raw source events; Rust owns rows and turn phase.
+        let chatKey = Self.appleChatKey(sessionID: sessionID)
+        let chatTurnID = (clientMessageID ?? UUID()).uuidString.lowercased()
+        let responseItemID = responseMessage.id.uuidString.lowercased()
+        let showsInChat = transcriptVisibility == .learner
+        let emit: @MainActor @Sendable ([ExternalSourceEvent]) -> Void = { events in
+            appStore.ingestSourceEvents(key: chatKey, source: .apple, events: events)
+        }
+        var startEvents: [ExternalSourceEvent] = []
+        let clientID = clientMessageID?.uuidString.lowercased()
+        if let clientID, let learnerText, !learnerText.isEmpty {
+            startEvents.append(.userMessage(clientMsgId: clientID, text: learnerText))
+        }
+        startEvents.append(.turnAccepted(clientMsgId: clientID, turnId: chatTurnID))
+        startEvents.append(.turnStarted(turnId: chatTurnID))
+        emit(startEvents)
+
         do {
             try await appleRuntime.send(
                 sessionID: sessionID,
@@ -10188,6 +10325,9 @@ final class CourseExperienceStore {
                         text: partial,
                         discussionID: selectionDiscussionID
                     )
+                    if showsInChat {
+                        emit([.textSnapshot(itemId: responseItemID, channel: .answer, text: partial)])
+                    }
                 },
                 onCoursePlan: { [weak self] plan in
                     guard let self else {
@@ -10195,7 +10335,29 @@ final class CourseExperienceStore {
                             "The course screen closed before the plan could be presented."
                         )
                     }
-                    try await self.acceptPresentedCoursePlan(plan)
+                    let toolItemID = "apple-tool:\(UUID().uuidString.lowercased())"
+                    emit([.toolStarted(
+                        itemId: toolItemID,
+                        name: CourseAgentTools.presentPlan,
+                        argumentsJson: nil
+                    )])
+                    do {
+                        try await self.acceptPresentedCoursePlan(plan)
+                    } catch {
+                        emit([.toolCompleted(
+                            itemId: toolItemID,
+                            name: CourseAgentTools.presentPlan,
+                            success: false,
+                            summary: error.localizedDescription
+                        )])
+                        throw error
+                    }
+                    emit([.toolCompleted(
+                        itemId: toolItemID,
+                        name: CourseAgentTools.presentPlan,
+                        success: true,
+                        summary: plan.title
+                    )])
                 }
             )
         } catch {
@@ -10203,8 +10365,11 @@ final class CourseExperienceStore {
                 id: responseMessage.id,
                 discussionID: selectionDiscussionID
             )
+            // The caller settles the chat turn, after it has decided whether
+            // the learner message goes back to the composer.
             throw error
         }
+        emit([.turnSettled(outcome: .completed)])
 
         if let selectionDiscussionID,
            let index = selectionDiscussions.firstIndex(where: { $0.id == selectionDiscussionID }) {
@@ -11216,6 +11381,10 @@ final class CourseExperienceStore {
         return object[CourseAgentTools.workspaceIDArgument] as? String
     }
 
+    /// Waits for an app-server course turn to settle, driven by the thread's
+    /// Rust chat phase instead of polling. Plans presented through tools are
+    /// applied as their rows arrive, and the final reply is mirrored into the
+    /// classic transcript.
     private func hydrateAgentResponse(
         for key: ThreadKey,
         previousResponseTurnID: String?,
@@ -11225,51 +11394,87 @@ final class CourseExperienceStore {
         appModel: AppModel
     ) async {
         var receivedCoursePlan = false
-        for _ in 0..<480 {
-            guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
-            try? await Task.sleep(for: .milliseconds(250))
-            guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
-            receivedCoursePlan = hydrateCoursePlanToolCalls(for: key, appModel: appModel) || receivedCoursePlan
-            guard let summary = appModel.snapshot?.sessionSummaries.first(where: { $0.key == key }) else { continue }
+        var sawActiveTurn = false
+        var settledByChat = false
+
+        func summaryHasActiveTurn() -> Bool {
+            appModel.snapshot?.sessionSummaries.first(where: { $0.key == key })?.hasActiveTurn == true
+        }
+
+        /// Mirrors the settled reply into the local transcript once the
+        /// session summary shows it. Returns true when the reply is in.
+        func appendSettledResponse() -> Bool {
+            guard let summary = appModel.snapshot?.sessionSummaries.first(where: { $0.key == key }),
+                  summary.hasActiveTurn == false else { return false }
             let response = summary.lastResponsePreview?.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard summary.hasActiveTurn == false else { continue }
-            if let response,
-               !response.isEmpty,
-               summary.lastResponseTurnId != previousResponseTurnID {
-                let responseMessage = CourseChatMessage(
-                    role: .agent,
-                    text: response,
-                    transcriptVisibility: transcriptVisibility
-                )
-                if let selectionDiscussionID {
-                    selectionLocalMessages[selectionDiscussionID, default: []].append(responseMessage)
-                } else {
-                    messages.append(responseMessage)
-                }
-                return
+            guard let response,
+                  !response.isEmpty,
+                  summary.lastResponseTurnId != previousResponseTurnID else { return false }
+            let responseMessage = CourseChatMessage(
+                role: .agent,
+                text: response,
+                transcriptVisibility: transcriptVisibility
+            )
+            if let selectionDiscussionID {
+                selectionLocalMessages[selectionDiscussionID, default: []].append(responseMessage)
+            } else {
+                messages.append(responseMessage)
             }
-            if receivedCoursePlan { return }
+            return true
+        }
+
+        _ = await Self.watchChatPhase(
+            appStore: appModel.store,
+            key: key,
+            timeout: .seconds(120)
+        ) { phase in
+            guard !Task.isCancelled, self.currentCourseWorkspaceID == workspaceID else { return true }
+            receivedCoursePlan = self.hydrateCoursePlanToolCalls(for: key, appModel: appModel)
+                || receivedCoursePlan
+            if appendSettledResponse() { return true }
+            if receivedCoursePlan, !summaryHasActiveTurn() { return true }
+            guard let phase else { return false }
+            // A question after the reply (`awaitingInput`) is a resting
+            // phase: the agent is no longer working.
+            if phase.isActive, phase != .awaitingInput {
+                sawActiveTurn = true
+                return false
+            }
+            if sawActiveTurn || !summaryHasActiveTurn() {
+                settledByChat = true
+                return true
+            }
+            return false
         }
         guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
-        let summaryHasActiveTurn = appModel.snapshot?.sessionSummaries
-            .first(where: { $0.key == key })?.hasActiveTurn == true
+        if settledByChat {
+            // The chat phase can arrive a moment before the app snapshot's
+            // session summary; give the summary a short window to catch up.
+            for _ in 0..<20 {
+                receivedCoursePlan = hydrateCoursePlanToolCalls(for: key, appModel: appModel)
+                    || receivedCoursePlan
+                if appendSettledResponse() || receivedCoursePlan { return }
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
+            }
+            // Settled without a new reply (stopped, failed or tool-only).
+            return
+        }
+        if receivedCoursePlan || appendSettledResponse() { return }
         let threadHasActiveTurn = appModel.threadSnapshot(for: key)?.hasActiveTurn == true
         guard CourseAgentHydrationPolicy.shouldSurfaceTimeoutError(
-            summaryHasActiveTurn: summaryHasActiveTurn,
+            summaryHasActiveTurn: summaryHasActiveTurn(),
             threadHasActiveTurn: threadHasActiveTurn
         ) else {
-            // Long tool-driven course turns can legitimately exceed the local
-            // preview hydration window. The live thread already communicates
-            // that state and will project its final response when it settles,
-            // but a plan presented late in the turn still has to reach the
-            // native plan card.
-            if !receivedCoursePlan {
-                await continueHydratingCoursePlanToolCalls(
-                    for: key,
-                    workspaceID: workspaceID,
-                    appModel: appModel
-                )
-            }
+            // Long tool-driven course turns can legitimately exceed the reply
+            // window. The live thread already communicates that state, but a
+            // plan presented late in the turn still has to reach the native
+            // plan card.
+            await continueHydratingCoursePlanToolCalls(
+                for: key,
+                workspaceID: workspaceID,
+                appModel: appModel
+            )
             return
         }
         let message = "The agent is still working. Reopen this discussion to inspect the live task."
@@ -11281,33 +11486,88 @@ final class CourseExperienceStore {
     }
 
     /// Applies completed `present_course_plan` calls from the live main
-    /// thread. The chat view calls this as items arrive so a plan presented
-    /// outside the response-polling window still reaches the plan card.
+    /// thread. The chat view calls this as rows arrive so a plan presented
+    /// outside the reply window still reaches the plan card.
     func applyCompletedCoursePlanToolCalls(appModel: AppModel) {
         guard generatedCourseID == nil, let key = agentThreadKey else { return }
         _ = hydrateCoursePlanToolCalls(for: key, appModel: appModel)
     }
 
-    /// Keeps applying `present_course_plan` results after the response
-    /// preview window lapses, until the turn settles or a plan is applied.
+    /// Keeps applying `present_course_plan` results after the reply window
+    /// lapses, until the turn settles or a plan is applied.
     private func continueHydratingCoursePlanToolCalls(
         for key: ThreadKey,
         workspaceID: String,
         appModel: AppModel
     ) async {
-        for _ in 0..<(30 * 60 * 2) {
-            guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
-            try? await Task.sleep(for: .milliseconds(500))
-            guard !Task.isCancelled, currentCourseWorkspaceID == workspaceID else { return }
-            if hydrateCoursePlanToolCalls(for: key, appModel: appModel) { return }
-            let summaryHasActiveTurn = appModel.snapshot?.sessionSummaries
-                .first(where: { $0.key == key })?.hasActiveTurn == true
-            let threadHasActiveTurn = appModel.threadSnapshot(for: key)?.hasActiveTurn == true
-            if !summaryHasActiveTurn && !threadHasActiveTurn {
-                _ = hydrateCoursePlanToolCalls(for: key, appModel: appModel)
-                return
+        _ = await Self.watchChatPhase(
+            appStore: appModel.store,
+            key: key,
+            timeout: .seconds(30 * 60)
+        ) { phase in
+            guard !Task.isCancelled, self.currentCourseWorkspaceID == workspaceID else { return true }
+            if self.hydrateCoursePlanToolCalls(for: key, appModel: appModel) { return true }
+            if let phase, !phase.isActive || phase == .awaitingInput {
+                _ = self.hydrateCoursePlanToolCalls(for: key, appModel: appModel)
+                return true
             }
+            return false
         }
+    }
+
+    /// What `watchChatPhase` hands its callback for one chat update: the
+    /// phase, `.some(nil)` for a structural change, or `nil` to skip it.
+    /// Text deltas are skipped: they arrive per token and can't change the
+    /// phase or present a plan, so re-checking on each would be wasted work.
+    static func chatPhaseWatchSignal(for update: ChatUpdate) -> ChatTurnPhase?? {
+        switch update {
+        case .snapshot(_, let phase, _, _, _, _), .phaseChanged(let phase, _, _, _):
+            .some(phase)
+        case .rowsChanged, .connectionChanged:
+            .some(nil)
+        case .textAppended:
+            nil
+        }
+    }
+
+    /// Calls `onUpdate` with the thread's turn phase each time its Rust chat
+    /// state changes (`nil` for changes that are not phase changes), until
+    /// `onUpdate` returns true or `timeout` passes. Returns whether
+    /// `onUpdate` finished the watch.
+    static func watchChatPhase(
+        appStore: AppStore,
+        key: ThreadKey,
+        timeout: Duration,
+        onUpdate: (ChatTurnPhase?) -> Bool
+    ) async -> Bool {
+        let subscription = appStore.subscribeChat(key: key)
+        let (stream, continuation) = AsyncStream.makeStream(of: ChatTurnPhase?.self)
+        let pump = Task { @MainActor in
+            while !Task.isCancelled {
+                guard let update = try? await subscription.nextUpdate() else { break }
+                guard !Task.isCancelled else { break }
+                if let signal = chatPhaseWatchSignal(for: update) {
+                    continuation.yield(signal)
+                }
+            }
+            continuation.finish()
+        }
+        let timer = Task {
+            try? await Task.sleep(for: timeout)
+            continuation.finish()
+        }
+        defer {
+            timer.cancel()
+            pump.cancel()
+            // `nextUpdate()` can't be cancelled; a resync wakes it so the
+            // pump exits and the subscription is released.
+            subscription.resync()
+        }
+        for await phase in stream {
+            if Task.isCancelled { return false }
+            if onUpdate(phase) { return true }
+        }
+        return false
     }
 
     private func hydrateCoursePlanToolCalls(for key: ThreadKey, appModel: AppModel) -> Bool {

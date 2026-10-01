@@ -5389,6 +5389,86 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertNotNil(defaults.data(forKey: "learnfold.course.activeDraftSources"))
     }
 
+    func testUnacceptedAppleFailureWithdrawsTheChatBubbleWithoutANotice() async throws {
+        let defaults = try makeDefaults()
+        let coursesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WithdrawnAppleTurn-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: coursesRoot) }
+        let runtime = TestAppleCourseAgentRuntime()
+        runtime.failsBeforeAcceptance = true
+        let store = CourseExperienceStore(
+            defaults: defaults,
+            environment: ["SNAPPY_RESET_ONBOARDING": "1"],
+            appleRuntime: runtime,
+            coursesRootURL: coursesRoot
+        )
+        let appModel = AppModel()
+        await store.connectLocalAgent(
+            appModel: appModel,
+            agentID: CourseAgentProvider.appleOnDevice
+        )
+        store.beginNewCourse()
+
+        XCTAssertTrue(store.sendMessage("Withdraw me", appModel: appModel, appState: AppState()))
+        for _ in 0..<100 where store.isAgentRequestPending {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(store.courseChatDraft, "Withdraw me")
+        XCTAssertNotNil(store.agentError)
+
+        let key = try XCTUnwrap(store.chatThreadKey(selectionDiscussionID: nil))
+        let subscription = appModel.store.subscribeChat(key: key)
+        defer { subscription.resync() }
+        guard case .snapshot(let rows, let phase, _, _, _, _) = try await subscription.nextUpdate() else {
+            return XCTFail("Expected a snapshot")
+        }
+        // No stray bubble, and no notice repeating the error card.
+        XCTAssertTrue(rows.isEmpty, "\(rows.map(\.id))")
+        XCTAssertFalse(phase.isActive)
+    }
+
+    func testChatPhaseWatchSkipsTextDeltas() {
+        XCTAssertNil(CourseExperienceStore.chatPhaseWatchSignal(
+            for: .textAppended(rowId: "a1", text: "token", digest: 0, seq: 2)
+        ))
+        XCTAssertEqual(
+            CourseExperienceStore.chatPhaseWatchSignal(
+                for: .phaseChanged(phase: .awaitingInput, progressLabel: nil, activeTurnStartedAtMs: nil, seq: 3)
+            ),
+            .some(.awaitingInput)
+        )
+        XCTAssertEqual(
+            CourseExperienceStore.chatPhaseWatchSignal(
+                for: .rowsChanged(upserts: [], removals: [], order: [], seq: 4)
+            ),
+            .some(nil)
+        )
+    }
+
+    func testQuestionOptionQueuesWhileOnlyTheTurnIsWindingDown() {
+        XCTAssertEqual(
+            CourseChatSendGate.optionDisposition(canSendNow: true, canTakeMessageWhenFree: true),
+            .send
+        )
+        XCTAssertEqual(
+            CourseChatSendGate.optionDisposition(canSendNow: false, canTakeMessageWhenFree: true),
+            .queue
+        )
+        XCTAssertEqual(
+            CourseChatSendGate.optionDisposition(canSendNow: false, canTakeMessageWhenFree: false),
+            .refuse
+        )
+        XCTAssertFalse(CourseChatSendGate.canTakeMessageWhenFree(
+            isAgentReady: false, isPreparing: false, blocksNewSubmission: false
+        ))
+        XCTAssertFalse(CourseChatSendGate.canTakeMessageWhenFree(
+            isAgentReady: true, isPreparing: false, blocksNewSubmission: true
+        ))
+        XCTAssertTrue(CourseChatSendGate.canTakeMessageWhenFree(
+            isAgentReady: true, isPreparing: false, blocksNewSubmission: false
+        ))
+    }
+
     func testQueuedNonHermesReceiptRemainsAcceptanceUnknownAndDurable() async throws {
         let defaults = try makeDefaults()
         let coursesRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -7549,17 +7629,11 @@ final class CourseExperienceStoreTests: XCTestCase {
         let depthTwoChildren = try XCTUnwrap(
             depthTwoProperties["children"] as? [String: Any]
         )
+        // Levels 3 and 4 are described rather than nested so the schema stays
+        // under hosted providers' nesting limit; CoursePlanHierarchyPolicy
+        // validates them when the plan is presented.
         let depthThree = try XCTUnwrap(depthTwoChildren["items"] as? [String: Any])
-        let depthThreeProperties = try XCTUnwrap(depthThree["properties"] as? [String: Any])
-        let depthThreeChildren = try XCTUnwrap(
-            depthThreeProperties["children"] as? [String: Any]
-        )
-        let depthFour = try XCTUnwrap(depthThreeChildren["items"] as? [String: Any])
-        let depthFourProperties = try XCTUnwrap(depthFour["properties"] as? [String: Any])
-        let depthFourRole = try XCTUnwrap(depthFourProperties["role"] as? [String: Any])
-        let depthFourChildren = try XCTUnwrap(
-            depthFourProperties["children"] as? [String: Any]
-        )
+        let depthThreeDescription = try XCTUnwrap(depthThree["description"] as? String)
         let required = try XCTUnwrap(schema["required"] as? [String])
 
         XCTAssertEqual(spec.name, "present_course_plan")
@@ -7599,10 +7673,13 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
         XCTAssertEqual(depthOneChildren["minItems"] as? Int, 1)
         XCTAssertEqual(subchapterChildren["minItems"] as? Int, 1)
-        XCTAssertFalse(
-            (depthFourRole["enum"] as? [String])?.contains("subchapter") == true
+        XCTAssertNil(depthThree["properties"])
+        XCTAssertTrue(depthThreeDescription.contains("only a subchapter has children"))
+        XCTAssertTrue(
+            depthThreeDescription.contains(
+                "level-\(CoursePlanHierarchyPolicy.maximumDepth) pages are lesson, module, or explainer with children []"
+            )
         )
-        XCTAssertEqual(depthFourChildren["maxItems"] as? Int, 0)
         XCTAssertTrue(required.contains("plan_id"))
         XCTAssertTrue(required.contains("chapters"))
     }
@@ -18518,6 +18595,9 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
     func remove(sessionID: UUID, workspaceID: String) {}
 }
 
+/// Backs chat subscriptions for the no-handle `AppStore` mocks below.
+private let chatBackingStore = AppStore()
+
 private final class HermesSnapshotAppStore: AppStore, @unchecked Sendable {
     private let snapshotRecord: AppSnapshotRecord
     private let startTurnBarrier: ContinuationHermesRecoveryBarrier?
@@ -18584,6 +18664,19 @@ private final class HermesSnapshotAppStore: AppStore, @unchecked Sendable {
 
     required init(unsafeFromHandle handle: UInt64) {
         fatalError("HermesSnapshotAppStore must be created with a test snapshot")
+    }
+
+    // Chat subscriptions need a real Rust store; this mock has no handle.
+    override func subscribeChat(key: ThreadKey) -> ChatSubscription {
+        chatBackingStore.subscribeChat(key: key)
+    }
+
+    override func subscribeChatWithOptions(key: ThreadKey, options: ChatViewOptions) -> ChatSubscription {
+        chatBackingStore.subscribeChatWithOptions(key: key, options: options)
+    }
+
+    override func ingestSourceEvents(key: ThreadKey, source: SourceKind, events: [ExternalSourceEvent]) {
+        chatBackingStore.ingestSourceEvents(key: key, source: source, events: events)
     }
 
     override func snapshot() async throws -> AppSnapshotRecord {
@@ -18681,6 +18774,19 @@ private final class QueuedTurnAppStore: AppStore, @unchecked Sendable {
 
     required init(unsafeFromHandle handle: UInt64) {
         fatalError("QueuedTurnAppStore must be created with a test snapshot")
+    }
+
+    // Chat subscriptions need a real Rust store; this mock has no handle.
+    override func subscribeChat(key: ThreadKey) -> ChatSubscription {
+        chatBackingStore.subscribeChat(key: key)
+    }
+
+    override func subscribeChatWithOptions(key: ThreadKey, options: ChatViewOptions) -> ChatSubscription {
+        chatBackingStore.subscribeChatWithOptions(key: key, options: options)
+    }
+
+    override func ingestSourceEvents(key: ThreadKey, source: SourceKind, events: [ExternalSourceEvent]) {
+        chatBackingStore.ingestSourceEvents(key: key, source: source, events: events)
     }
 
     override func snapshot() async throws -> AppSnapshotRecord {
@@ -19361,6 +19467,40 @@ final class HostedCourseTranscriptTests: XCTestCase {
         XCTAssertNil(store.hostedReplyProgress[.main])
     }
 
+    func testHostedSendUsesTheOptimisticIDAndAFailedSendWithdrawsItsBubble() async throws {
+        runtime.finalResponse = nil
+        runtime.sendError = NSError(
+            domain: "HostedTest",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Hosted is unreachable"]
+        )
+        XCTAssertTrue(store.sendMessage("Withdraw me", appModel: appModel, appState: AppState()))
+        await runtime.waitForSend()
+        let optimisticID = try XCTUnwrap(store.messages.first?.id)
+        XCTAssertEqual(runtime.lastMessageID, optimisticID)
+
+        // What `HostedAgentClient.send` stages in Rust for this message.
+        let key = try XCTUnwrap(store.chatThreadKey(selectionDiscussionID: nil))
+        let clientID = optimisticID.uuidString.lowercased()
+        appModel.store.ingestSourceEvents(key: key, source: .hosted, events: [
+            .userMessage(clientMsgId: clientID, text: "Withdraw me"),
+            .turnAccepted(clientMsgId: clientID, turnId: clientID),
+            .turnStarted(turnId: clientID),
+            .turnSettled(outcome: .failed(message: "Hosted is unreachable")),
+        ])
+
+        runtime.finishSend()
+        try await waitForTurn()
+        XCTAssertEqual(store.courseChatDraft, "Withdraw me")
+
+        let subscription = appModel.store.subscribeChat(key: key)
+        defer { subscription.resync() }
+        guard case .snapshot(let rows, _, _, _, _, _) = try await subscription.nextUpdate() else {
+            return XCTFail("Expected a snapshot")
+        }
+        XCTAssertTrue(rows.isEmpty, "\(rows.map(\.id))")
+    }
+
     func testHostedProgressExplainsLongWaitWithoutClaimingFailure() {
         let start = Date(timeIntervalSince1970: 1_000)
         var progress = HostedReplyProgress(lastProgressAt: start)
@@ -19733,6 +19873,7 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
     var finalResponse: String? = "Let's start with percentages."
     private(set) var restoreCount = 0
     private(set) var lastCourseDirectory: URL?
+    private(set) var lastMessageID: UUID?
     private var restoreContinuation: CheckedContinuation<Void, Never>?
     private var sendContinuation: CheckedContinuation<Void, Never>?
     private var restoreWaiter: CheckedContinuation<Void, Never>?
@@ -19762,11 +19903,13 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
         workspaceID: String,
         courseDirectory: URL,
         prompt: String,
+        messageID: UUID?,
         onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
         lastCourseDirectory = courseDirectory
+        lastMessageID = messageID
         recoveryChanged = onRecoveringChanged
         partialResponse = onPartialResponse
         defer { partialResponse = nil }
